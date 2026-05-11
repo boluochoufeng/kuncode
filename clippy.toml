@@ -1,0 +1,2 @@
+# Workspace-wide clippy configuration.
+doc-valid-idents = ["KunCode", "DeepSeek", "JSONL", "KUNCODE", ".."]
