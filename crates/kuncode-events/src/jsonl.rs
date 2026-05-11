@@ -112,6 +112,10 @@ async fn writer_loop(
 ) {
     let mut pending_error = None;
 
+    // TODO(durability): add configurable periodic fsync using both
+    // fsync_every_n and fsync_every_ms thresholds, and force fsync after
+    // terminal events such as run.completed/run.failed. Shutdown still drains
+    // the queue and performs the final fsync.
     while let Some(message) = receiver.recv().await {
         match message {
             WriterMessage::Event(envelope) => {
@@ -120,6 +124,16 @@ async fn writer_loop(
                 }
             }
             WriterMessage::Shutdown(reply) => {
+                // Close the channel so cloned handles can no longer send, then
+                // drain every message already queued before flushing.
+                receiver.close();
+                while let Some(message) = receiver.recv().await {
+                    if let WriterMessage::Event(envelope) = message
+                        && pending_error.is_none()
+                    {
+                        pending_error = write_event(&mut file, &path, &envelope).await.err();
+                    }
+                }
                 let result = if let Some(error) = pending_error.take() {
                     Err(error)
                 } else {
@@ -240,4 +254,55 @@ fn parse_event_line(offset: u64, line: &str) -> Result<EventEnvelope, EventLogEr
         line: line.to_owned(),
         cause: source.to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kuncode_core::RunId;
+    use serde_json::json;
+    use tempfile::tempdir;
+    use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn shutdown_drains_events_queued_after_shutdown_message() {
+        let temp = tempdir().expect("tempdir");
+        let path = temp.path().join("test.jsonl");
+        let file =
+            OpenOptions::new().create(true).append(true).open(&path).await.expect("create file");
+
+        let (sender, receiver) = mpsc::channel(128);
+        let run_id = RunId::new();
+        let first = EventEnvelope::new(run_id, EventKind::RunStarted, json!({ "seq": 1 }));
+        let second = EventEnvelope::new(run_id, EventKind::RunCompleted, json!({ "seq": 2 }));
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+
+        // Directly construct the queue order: Event, Shutdown, Event.
+        // The second Event sits after Shutdown in the channel — exactly the
+        // scenario the old code dropped and the drain fix must preserve.
+        sender.send(WriterMessage::Event(first.clone())).await.expect("send first");
+        sender.send(WriterMessage::Shutdown(reply_tx)).await.expect("send shutdown");
+        sender.send(WriterMessage::Event(second.clone())).await.expect("send second");
+        // Drop the sender so the drain loop terminates after close.
+        drop(sender);
+
+        writer_loop(file, path.clone(), receiver).await;
+
+        // Shutdown must have flushed successfully.
+        reply_rx.await.expect("reply").expect("flush");
+
+        // Both events must be on disk.
+        let mut buf = Vec::new();
+        fs::File::open(&path).await.expect("open").read_to_end(&mut buf).await.expect("read");
+
+        let content = String::from_utf8(buf).expect("utf8");
+        let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 2, "expected 2 events, got: {content}");
+
+        let parsed_first: EventEnvelope = serde_json::from_str(lines[0]).expect("parse first");
+        let parsed_second: EventEnvelope = serde_json::from_str(lines[1]).expect("parse second");
+        assert_eq!(parsed_first.event_id, first.event_id);
+        assert_eq!(parsed_second.event_id, second.event_id);
+    }
 }
