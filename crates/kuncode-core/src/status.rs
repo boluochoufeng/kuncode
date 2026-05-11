@@ -19,8 +19,10 @@ impl RunStatus {
     /// Returns `true` when the run has reached a terminal state and the agent
     /// loop should not be re-entered.
     pub const fn is_terminal(self) -> bool {
-        matches!(self, Self::Completed | Self::Failed | Self::Cancelled | Self::BudgetExceeded)
-        // `Blocked` is non-terminal: it can resume once the blocker clears.
+        matches!(
+            self,
+            Self::Completed | Self::Failed | Self::Blocked | Self::Cancelled | Self::BudgetExceeded
+        )
     }
 }
 
@@ -31,9 +33,9 @@ mod tests {
     #[test]
     fn terminal_truth_table() {
         assert!(!Running.is_terminal());
-        assert!(!Blocked.is_terminal());
         assert!(Completed.is_terminal());
         assert!(Failed.is_terminal());
+        assert!(Blocked.is_terminal());
         assert!(Cancelled.is_terminal());
         assert!(BudgetExceeded.is_terminal());
     }
