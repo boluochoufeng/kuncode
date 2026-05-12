@@ -4,7 +4,7 @@
 //! field selects the closed `EventKind` enum; `payload` carries the
 //! kind-specific JSON.
 
-use kuncode_core::{AgentId, EventId, RunId, TurnId};
+use kuncode_core::{AgentId, ArtifactId, EventId, RiskFlag, RunId, ToolEffect, ToolErrorKind, ToolRequestId, TurnId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use time::OffsetDateTime;
@@ -74,6 +74,14 @@ pub enum EventKind {
     RunFailed,
     #[serde(rename = "artifact.created")]
     ArtifactCreated,
+    #[serde(rename = "tool.started")]
+    ToolStarted,
+    #[serde(rename = "tool.completed")]
+    ToolCompleted,
+    #[serde(rename = "tool.failed")]
+    ToolFailed,
+    #[serde(rename = "tool.cancelled")]
+    ToolCancelled,
 }
 
 impl EventKind {
@@ -84,6 +92,10 @@ impl EventKind {
             Self::RunCompleted => "run.completed",
             Self::RunFailed => "run.failed",
             Self::ArtifactCreated => "artifact.created",
+            Self::ToolStarted => "tool.started",
+            Self::ToolCompleted => "tool.completed",
+            Self::ToolFailed => "tool.failed",
+            Self::ToolCancelled => "tool.cancelled",
         }
     }
 
@@ -95,7 +107,191 @@ impl EventKind {
             "run.completed" => Some(Self::RunCompleted),
             "run.failed" => Some(Self::RunFailed),
             "artifact.created" => Some(Self::ArtifactCreated),
+            "tool.started" => Some(Self::ToolStarted),
+            "tool.completed" => Some(Self::ToolCompleted),
+            "tool.failed" => Some(Self::ToolFailed),
+            "tool.cancelled" => Some(Self::ToolCancelled),
             _ => None,
         }
+    }
+}
+
+/// Payload of `tool.started`. See Phase 2 plan §6.1.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ToolStarted {
+    pub tool_request_id: ToolRequestId,
+    pub tool_name: String,
+    pub effects: Vec<ToolEffect>,
+    pub risk_flags: Vec<RiskFlag>,
+}
+
+/// Payload of `tool.completed`. See Phase 2 plan §6.1.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ToolCompleted {
+    pub tool_request_id: ToolRequestId,
+    pub tool_name: String,
+    pub summary: String,
+    pub content_ref: Option<ArtifactId>,
+}
+
+/// Payload of `tool.failed`. See Phase 2 plan §6.1.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ToolFailed {
+    pub tool_request_id: ToolRequestId,
+    pub tool_name: String,
+    pub error_kind: ToolErrorKind,
+    pub summary: String,
+}
+
+/// Payload of `tool.cancelled`. See Phase 2 plan §6.1.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ToolCancelled {
+    pub tool_request_id: ToolRequestId,
+    pub tool_name: String,
+    pub summary: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kuncode_core::RiskFlag;
+    use serde_json::json;
+
+    #[test]
+    fn event_kind_as_str_covers_every_variant() {
+        let cases = [
+            (EventKind::RunStarted, "run.started"),
+            (EventKind::RunCompleted, "run.completed"),
+            (EventKind::RunFailed, "run.failed"),
+            (EventKind::ArtifactCreated, "artifact.created"),
+            (EventKind::ToolStarted, "tool.started"),
+            (EventKind::ToolCompleted, "tool.completed"),
+            (EventKind::ToolFailed, "tool.failed"),
+            (EventKind::ToolCancelled, "tool.cancelled"),
+        ];
+        for (kind, wire) in cases {
+            assert_eq!(kind.as_str(), wire);
+        }
+    }
+
+    #[test]
+    fn event_kind_from_wire_roundtrips_every_variant() {
+        let cases = [
+            EventKind::RunStarted,
+            EventKind::RunCompleted,
+            EventKind::RunFailed,
+            EventKind::ArtifactCreated,
+            EventKind::ToolStarted,
+            EventKind::ToolCompleted,
+            EventKind::ToolFailed,
+            EventKind::ToolCancelled,
+        ];
+        for kind in cases {
+            assert_eq!(EventKind::from_wire(kind.as_str()), Some(kind));
+        }
+    }
+
+    #[test]
+    fn event_kind_from_wire_rejects_unknown() {
+        assert_eq!(EventKind::from_wire("tool.queued"), None);
+        assert_eq!(EventKind::from_wire(""), None);
+        // PascalCase is not the wire format.
+        assert_eq!(EventKind::from_wire("ToolStarted"), None);
+    }
+
+    #[test]
+    fn event_kind_serde_uses_wire_string() {
+        let value = serde_json::to_value(EventKind::ToolStarted).expect("serialize");
+        assert_eq!(value, json!("tool.started"));
+        let parsed: EventKind = serde_json::from_value(json!("tool.cancelled")).expect("parse");
+        assert_eq!(parsed, EventKind::ToolCancelled);
+    }
+
+    #[test]
+    fn tool_started_payload_matches_wire_format() {
+        let request_id = ToolRequestId::new();
+        let payload = ToolStarted {
+            tool_request_id: request_id,
+            tool_name: "read_file".to_owned(),
+            effects: vec![ToolEffect::ReadWorkspace],
+            risk_flags: vec![RiskFlag::MutatesWorkspace],
+        };
+
+        let value = serde_json::to_value(&payload).expect("serialize");
+        assert_eq!(value["tool_name"], "read_file");
+        assert_eq!(value["effects"], json!(["read_workspace"]));
+        assert_eq!(value["risk_flags"], json!(["mutates_workspace"]));
+        let parsed: ToolStarted = serde_json::from_value(value).expect("parse");
+        assert_eq!(parsed, payload);
+    }
+
+    #[test]
+    fn tool_completed_payload_serializes_null_content_ref() {
+        let payload = ToolCompleted {
+            tool_request_id: ToolRequestId::new(),
+            tool_name: "read_file".to_owned(),
+            summary: "read src/lib.rs (1024 bytes)".to_owned(),
+            content_ref: None,
+        };
+        let value = serde_json::to_value(&payload).expect("serialize");
+        assert!(value["content_ref"].is_null());
+        let parsed: ToolCompleted = serde_json::from_value(value).expect("parse");
+        assert_eq!(parsed, payload);
+    }
+
+    #[test]
+    fn tool_completed_payload_carries_artifact_id() {
+        let artifact = ArtifactId::new();
+        let payload = ToolCompleted {
+            tool_request_id: ToolRequestId::new(),
+            tool_name: "git_diff".to_owned(),
+            summary: "diff src/lib.rs (640 bytes, artifact)".to_owned(),
+            content_ref: Some(artifact),
+        };
+        let value = serde_json::to_value(&payload).expect("serialize");
+        assert_eq!(value["content_ref"], json!(artifact.to_string()));
+        let parsed: ToolCompleted = serde_json::from_value(value).expect("parse");
+        assert_eq!(parsed.content_ref, Some(artifact));
+    }
+
+    #[test]
+    fn tool_failed_payload_round_trips() {
+        let payload = ToolFailed {
+            tool_request_id: ToolRequestId::new(),
+            tool_name: "read_file".to_owned(),
+            error_kind: ToolErrorKind::Workspace,
+            summary: "path escapes workspace root".to_owned(),
+        };
+        let value = serde_json::to_value(&payload).expect("serialize");
+        assert_eq!(value["error_kind"], "workspace");
+        let parsed: ToolFailed = serde_json::from_value(value).expect("parse");
+        assert_eq!(parsed, payload);
+    }
+
+    #[test]
+    fn tool_failed_payload_serializes_compound_error_kind() {
+        let payload = ToolFailed {
+            tool_request_id: ToolRequestId::new(),
+            tool_name: "exec_argv".to_owned(),
+            error_kind: ToolErrorKind::ResultTooLarge,
+            summary: "stdout exceeded inline cap".to_owned(),
+        };
+        let value = serde_json::to_value(&payload).expect("serialize");
+        assert_eq!(value["error_kind"], "result_too_large");
+        let parsed: ToolFailed = serde_json::from_value(value).expect("parse");
+        assert_eq!(parsed, payload);
+    }
+
+    #[test]
+    fn tool_cancelled_payload_round_trips() {
+        let payload = ToolCancelled {
+            tool_request_id: ToolRequestId::new(),
+            tool_name: "exec_argv".to_owned(),
+            summary: "cancelled".to_owned(),
+        };
+        let value = serde_json::to_value(&payload).expect("serialize");
+        assert_eq!(value["summary"], "cancelled");
+        let parsed: ToolCancelled = serde_json::from_value(value).expect("parse");
+        assert_eq!(parsed, payload);
     }
 }

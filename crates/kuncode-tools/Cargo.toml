@@ -8,3 +8,22 @@ authors.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+async-trait.workspace = true
+ignore.workspace = true
+jsonschema.workspace = true
+kuncode-core = { version = "0.1.0", path = "../kuncode-core" }
+kuncode-events = { version = "0.1.0", path = "../kuncode-events" }
+kuncode-workspace = { version = "0.1.0", path = "../kuncode-workspace" }
+patch.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+
+[dev-dependencies]
+futures-util.workspace = true

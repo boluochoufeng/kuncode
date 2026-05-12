@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::{
     fs::{self, OpenOptions},
-    io::AsyncWriteExt,
+    io::{AsyncReadExt, AsyncWriteExt},
 };
 
 use crate::{ArtifactError, RunDir};
@@ -27,6 +27,15 @@ pub trait ArtifactStore {
         kind: String,
         source_event_id: EventId,
         content: &[u8],
+    ) -> Result<ArtifactRecord, ArtifactError>;
+
+    /// Stream bytes from an existing file into the artifact store, returning
+    /// the `ArtifactRecord` also appended to `artifacts.jsonl`.
+    async fn save_file(
+        &self,
+        kind: String,
+        source_event_id: EventId,
+        source_path: &Path,
     ) -> Result<ArtifactRecord, ArtifactError>;
 }
 
@@ -51,23 +60,60 @@ impl ArtifactStore for FileArtifactStore {
         content: &[u8],
     ) -> Result<ArtifactRecord, ArtifactError> {
         let artifact_id = ArtifactId::new();
-        let size = u64::try_from(content.len())
-            .map_err(|_| ArtifactError::SizeOverflow { size: content.len() })?;
+        let size = u64::try_from(content.len()).map_err(|_| ArtifactError::SizeOverflow { size: content.len() })?;
         let mut hasher = Sha256::new();
         hasher.update(content);
         let sha256 = hex_lower(&hasher.finalize());
         let path = self.run_dir.artifacts_dir().join(format!("{artifact_id}.bin"));
 
-        fs::write(&path, content)
+        fs::write(&path, content).await.map_err(|source| ArtifactError::Io { path: path.clone(), source })?;
+
+        let record = ArtifactRecord { artifact_id, run_id: self.run_dir.run_id(), kind, size, sha256, source_event_id };
+        append_artifact_record(self.run_dir.artifacts_index_path(), &record).await?;
+        Ok(record)
+    }
+
+    async fn save_file(
+        &self,
+        kind: String,
+        source_event_id: EventId,
+        source_path: &Path,
+    ) -> Result<ArtifactRecord, ArtifactError> {
+        let artifact_id = ArtifactId::new();
+        let path = self.run_dir.artifacts_dir().join(format!("{artifact_id}.bin"));
+        let mut source = fs::File::open(source_path)
             .await
-            .map_err(|source| ArtifactError::Io { path: path.clone(), source })?;
+            .map_err(|source| ArtifactError::Io { path: source_path.to_path_buf(), source })?;
+        let mut target =
+            fs::File::create(&path).await.map_err(|source| ArtifactError::Io { path: path.clone(), source })?;
+        let mut hasher = Sha256::new();
+        let mut size = 0_u64;
+        let mut buffer = [0_u8; 8192];
+
+        loop {
+            let read = source
+                .read(&mut buffer)
+                .await
+                .map_err(|source| ArtifactError::Io { path: source_path.to_path_buf(), source })?;
+            if read == 0 {
+                break;
+            }
+            let read_u64 = u64::try_from(read).map_err(|_| ArtifactError::SizeOverflow { size: read })?;
+            size = size.checked_add(read_u64).ok_or(ArtifactError::SizeOverflow { size: usize::MAX })?;
+            hasher.update(&buffer[..read]);
+            target
+                .write_all(&buffer[..read])
+                .await
+                .map_err(|source| ArtifactError::Io { path: path.clone(), source })?;
+        }
+        target.flush().await.map_err(|source| ArtifactError::Io { path: path.clone(), source })?;
 
         let record = ArtifactRecord {
             artifact_id,
             run_id: self.run_dir.run_id(),
             kind,
             size,
-            sha256,
+            sha256: hex_lower(&hasher.finalize()),
             source_event_id,
         };
         append_artifact_record(self.run_dir.artifacts_index_path(), &record).await?;
@@ -94,12 +140,8 @@ async fn append_artifact_record(path: &Path, record: &ArtifactRecord) -> Result<
         .await
         .map_err(|source| ArtifactError::Io { path: path.to_path_buf(), source })?;
     let json = serde_json::to_vec(record).map_err(|source| ArtifactError::Encode { source })?;
-    file.write_all(&json)
-        .await
-        .map_err(|source| ArtifactError::Io { path: path.to_path_buf(), source })?;
-    file.write_all(b"\n")
-        .await
-        .map_err(|source| ArtifactError::Io { path: path.to_path_buf(), source })?;
+    file.write_all(&json).await.map_err(|source| ArtifactError::Io { path: path.to_path_buf(), source })?;
+    file.write_all(b"\n").await.map_err(|source| ArtifactError::Io { path: path.to_path_buf(), source })?;
     file.flush().await.map_err(|source| ArtifactError::Io { path: path.to_path_buf(), source })
 }
 

@@ -7,7 +7,7 @@
 //!
 //! MVP supports only the `MainWorkspace` lane; the `Worktree` lane is deferred.
 //!
-//! See `docs/specs/kuncode-mvp-development-plan.md` §4.4.
+//! See `docs/plans/kuncode-mvp-development-plan.md` §4.4.
 
 use std::{
     ffi::OsStr,
@@ -44,10 +44,7 @@ pub struct Workspace {
 impl Workspace {
     /// Open a workspace at `root`. The path is canonicalized immediately, so
     /// the caller must ensure the directory exists.
-    pub async fn open(
-        root: impl AsRef<Path>,
-        config: WorkspaceConfig,
-    ) -> Result<Self, WorkspaceError> {
+    pub async fn open(root: impl AsRef<Path>, config: WorkspaceConfig) -> Result<Self, WorkspaceError> {
         let root = root.as_ref();
         let canonical_root = fs::canonicalize(root)
             .await
@@ -60,8 +57,21 @@ impl Workspace {
         &self.root
     }
 
+    /// Returns the workspace configuration used by read/write resolution.
     pub fn config(&self) -> &WorkspaceConfig {
         &self.config
+    }
+
+    /// Resolve an existing file or directory inside the workspace.
+    ///
+    /// This is the general-purpose resolver for tools that need a safe path
+    /// but do not require read-file validation, such as search roots, git
+    /// pathspecs, or subprocess working directories.
+    pub async fn resolve_existing_path(&self, path: impl AsRef<Path>) -> Result<WorkspacePath, WorkspaceError> {
+        let candidate = self.candidate(path.as_ref());
+        let canonical = Self::canonicalize_existing(&candidate).await?;
+        self.ensure_within_root(&candidate, &canonical).await?;
+        self.workspace_path(canonical)
     }
 
     /// Resolve `path` for a read operation.
@@ -69,10 +79,7 @@ impl Workspace {
     /// Enforces: canonical path is inside root, target is a regular file,
     /// size within `max_file_size`, and — if `reject_binary` — content is
     /// valid UTF-8 without null bytes.
-    pub async fn resolve_read_file(
-        &self,
-        path: impl AsRef<Path>,
-    ) -> Result<WorkspacePath, WorkspaceError> {
+    pub async fn resolve_read_file(&self, path: impl AsRef<Path>) -> Result<WorkspacePath, WorkspaceError> {
         let candidate = self.candidate(path.as_ref());
         let canonical = Self::canonicalize_existing(&candidate).await?;
         self.ensure_within_root(&candidate, &canonical).await?;
@@ -109,10 +116,7 @@ impl Workspace {
     /// If the file already exists, its canonical location is verified against
     /// the root. If it does not yet exist, the *parent* directory is
     /// canonicalized and checked instead.
-    pub async fn resolve_write_path(
-        &self,
-        path: impl AsRef<Path>,
-    ) -> Result<WorkspacePath, WorkspaceError> {
+    pub async fn resolve_write_path(&self, path: impl AsRef<Path>) -> Result<WorkspacePath, WorkspaceError> {
         let candidate = self.candidate(path.as_ref());
 
         match fs::symlink_metadata(&candidate).await {
@@ -127,15 +131,11 @@ impl Workspace {
             }
         }
 
-        let parent = candidate
-            .parent()
-            .ok_or_else(|| WorkspaceError::NotFound { path: candidate.clone() })?;
+        let parent = candidate.parent().ok_or_else(|| WorkspaceError::NotFound { path: candidate.clone() })?;
         let parent_canonical = Self::canonicalize_existing(parent).await?;
         self.ensure_within_root(parent, &parent_canonical).await?;
 
-        let file_name = candidate
-            .file_name()
-            .ok_or_else(|| WorkspaceError::NotFound { path: candidate.clone() })?;
+        let file_name = candidate.file_name().ok_or_else(|| WorkspaceError::NotFound { path: candidate.clone() })?;
         self.workspace_path(parent_canonical.join(file_name))
     }
 
@@ -164,11 +164,7 @@ impl Workspace {
         })
     }
 
-    async fn ensure_within_root(
-        &self,
-        original: &Path,
-        canonical: &Path,
-    ) -> Result<(), WorkspaceError> {
+    async fn ensure_within_root(&self, original: &Path, canonical: &Path) -> Result<(), WorkspaceError> {
         if canonical.starts_with(&self.root) {
             return Ok(());
         }
@@ -187,10 +183,7 @@ impl Workspace {
     fn workspace_path(&self, absolute: PathBuf) -> Result<WorkspacePath, WorkspaceError> {
         let relative = absolute
             .strip_prefix(&self.root)
-            .map_err(|_| WorkspaceError::PathEscape {
-                path: absolute.clone(),
-                root: self.root.clone(),
-            })?
+            .map_err(|_| WorkspaceError::PathEscape { path: absolute.clone(), root: self.root.clone() })?
             .to_path_buf();
 
         Ok(WorkspacePath { absolute, relative })
@@ -208,10 +201,12 @@ pub struct WorkspacePath {
 }
 
 impl WorkspacePath {
+    /// Absolute canonical filesystem path for the workspace entry.
     pub fn as_path(&self) -> &Path {
         &self.absolute
     }
 
+    /// Path relative to the workspace root, suitable for metadata and output.
     pub fn relative_path(&self) -> &Path {
         &self.relative
     }
@@ -227,14 +222,17 @@ pub struct ExecutionLane {
 }
 
 impl ExecutionLane {
+    /// Build the MVP lane that points at the main workspace root.
     pub fn main(workspace: &Workspace) -> Self {
         Self { kind: LaneKind::MainWorkspace, root_path: workspace.root().to_path_buf() }
     }
 
+    /// Returns the lane kind. MVP only exposes `MainWorkspace`.
     pub fn kind(&self) -> LaneKind {
         self.kind
     }
 
+    /// Root directory commands in this lane may use as their upper boundary.
     pub fn root_path(&self) -> &Path {
         &self.root_path
     }
@@ -277,10 +275,7 @@ async fn has_symlink_component(path: &Path) -> bool {
 
     for component in path.components() {
         current.push(component.as_os_str());
-        if fs::symlink_metadata(&current)
-            .await
-            .is_ok_and(|metadata| metadata.file_type().is_symlink())
-        {
+        if fs::symlink_metadata(&current).await.is_ok_and(|metadata| metadata.file_type().is_symlink()) {
             return true;
         }
     }

@@ -15,7 +15,7 @@
 //! └── metadata.json          ← run metadata
 //! ```
 //!
-//! See `docs/specs/kuncode-mvp-development-plan.md` §4.3 and §6.
+//! See `docs/plans/kuncode-mvp-development-plan.md` §4.3 and §6.
 
 mod artifact;
 mod envelope;
@@ -24,7 +24,9 @@ mod jsonl;
 mod run_dir;
 
 pub use artifact::{ArtifactRecord, ArtifactStore, FileArtifactStore};
-pub use envelope::{EVENT_SCHEMA_VERSION, EventEnvelope, EventKind};
+pub use envelope::{
+    EVENT_SCHEMA_VERSION, EventEnvelope, EventKind, ToolCancelled, ToolCompleted, ToolFailed, ToolStarted,
+};
 pub use error::{ArtifactError, EventLogError};
 pub use jsonl::{EventLogReader, EventSink, EventSinkHandle, JsonlEventSink};
 pub use run_dir::RunDir;

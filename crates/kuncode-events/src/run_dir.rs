@@ -53,15 +53,7 @@ impl RunDir {
         touch_file(&artifacts_index_path).await?;
         create_metadata(&metadata_path).await?;
 
-        Ok(Self {
-            home,
-            run_id,
-            path,
-            events_path,
-            artifacts_index_path,
-            artifacts_dir,
-            metadata_path,
-        })
+        Ok(Self { home, run_id, path, events_path, artifacts_index_path, artifacts_dir, metadata_path })
     }
 
     pub fn home(&self) -> &Path {
@@ -106,9 +98,9 @@ async fn touch_file(path: &Path) -> Result<(), EventLogError> {
 async fn create_metadata(path: &Path) -> Result<(), EventLogError> {
     match fs::metadata(path).await {
         Ok(_) => Ok(()),
-        Err(source) if source.kind() == io::ErrorKind::NotFound => fs::write(path, b"{}")
-            .await
-            .map_err(|source| EventLogError::Io { path: path.to_path_buf(), source }),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            fs::write(path, b"{}").await.map_err(|source| EventLogError::Io { path: path.to_path_buf(), source })
+        }
         Err(source) => Err(EventLogError::Io { path: path.to_path_buf(), source }),
     }
 }

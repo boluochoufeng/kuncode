@@ -19,10 +19,7 @@ impl RunStatus {
     /// Returns `true` when the run has reached a terminal state and the agent
     /// loop should not be re-entered.
     pub const fn is_terminal(self) -> bool {
-        matches!(
-            self,
-            Self::Completed | Self::Failed | Self::Blocked | Self::Cancelled | Self::BudgetExceeded
-        )
+        matches!(self, Self::Completed | Self::Failed | Self::Blocked | Self::Cancelled | Self::BudgetExceeded)
     }
 }
 

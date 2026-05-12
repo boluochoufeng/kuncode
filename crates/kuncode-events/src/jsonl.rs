@@ -89,10 +89,7 @@ impl JsonlEventSink {
     /// Must be called before dropping to guarantee durability.
     pub async fn shutdown(self) -> Result<(), EventLogError> {
         let (reply, result) = oneshot::channel();
-        self.sender
-            .send(WriterMessage::Shutdown(reply))
-            .await
-            .map_err(|_| EventLogError::Closed)?;
+        self.sender.send(WriterMessage::Shutdown(reply)).await.map_err(|_| EventLogError::Closed)?;
 
         let writer_result = result.await.map_err(|_| EventLogError::Closed)?;
         self.join.await.map_err(|source| EventLogError::Join { cause: source.to_string() })?;
@@ -105,11 +102,7 @@ enum WriterMessage {
     Shutdown(oneshot::Sender<Result<(), EventLogError>>),
 }
 
-async fn writer_loop(
-    mut file: fs::File,
-    path: PathBuf,
-    mut receiver: mpsc::Receiver<WriterMessage>,
-) {
+async fn writer_loop(mut file: fs::File, path: PathBuf, mut receiver: mpsc::Receiver<WriterMessage>) {
     let mut pending_error = None;
 
     // TODO(durability): add configurable periodic fsync using both
@@ -148,18 +141,10 @@ async fn writer_loop(
     let _ = flush_and_sync(&mut file, &path).await;
 }
 
-async fn write_event(
-    file: &mut fs::File,
-    path: &Path,
-    envelope: &EventEnvelope,
-) -> Result<(), EventLogError> {
+async fn write_event(file: &mut fs::File, path: &Path, envelope: &EventEnvelope) -> Result<(), EventLogError> {
     let json = serde_json::to_vec(envelope).map_err(|source| EventLogError::Encode { source })?;
-    file.write_all(&json)
-        .await
-        .map_err(|source| EventLogError::Io { path: path.to_path_buf(), source })?;
-    file.write_all(b"\n")
-        .await
-        .map_err(|source| EventLogError::Io { path: path.to_path_buf(), source })?;
+    file.write_all(&json).await.map_err(|source| EventLogError::Io { path: path.to_path_buf(), source })?;
+    file.write_all(b"\n").await.map_err(|source| EventLogError::Io { path: path.to_path_buf(), source })?;
     Ok(())
 }
 
@@ -234,19 +219,14 @@ fn parse_event_line(offset: u64, line: &str) -> Result<EventEnvelope, EventLogEr
         cause: source.to_string(),
     })?;
 
-    let kind =
-        value.get("kind").and_then(Value::as_str).ok_or_else(|| EventLogError::Corrupted {
-            offset,
-            line: line.to_owned(),
-            cause: "missing string field `kind`".to_owned(),
-        })?;
+    let kind = value.get("kind").and_then(Value::as_str).ok_or_else(|| EventLogError::Corrupted {
+        offset,
+        line: line.to_owned(),
+        cause: "missing string field `kind`".to_owned(),
+    })?;
 
     if EventKind::from_wire(kind).is_none() {
-        return Err(EventLogError::UnknownKind {
-            offset,
-            line: line.to_owned(),
-            kind: kind.to_owned(),
-        });
+        return Err(EventLogError::UnknownKind { offset, line: line.to_owned(), kind: kind.to_owned() });
     }
 
     serde_json::from_value(value).map_err(|source| EventLogError::Corrupted {
@@ -268,8 +248,7 @@ mod tests {
     async fn shutdown_drains_events_queued_after_shutdown_message() {
         let temp = tempdir().expect("tempdir");
         let path = temp.path().join("test.jsonl");
-        let file =
-            OpenOptions::new().create(true).append(true).open(&path).await.expect("create file");
+        let file = OpenOptions::new().create(true).append(true).open(&path).await.expect("create file");
 
         let (sender, receiver) = mpsc::channel(128);
         let run_id = RunId::new();

@@ -2,4 +2,4 @@
 //!
 //! Will host `ContextBlock`, `ContextSet`, `ContextBuilder`, `MicroCompact`
 //! and `RenderMeta`. See
-//! `docs/specs/kuncode-mvp-development-plan.md` §4.7.
+//! `docs/plans/kuncode-mvp-development-plan.md` §4.7.

@@ -2,4 +2,4 @@
 //!
 //! Will host `PolicyEngine`, `PolicyInput`, `PolicyDecision`, `RunMode` and
 //! the `UserInteraction` trait. See
-//! `docs/specs/kuncode-mvp-development-plan.md` §4.6.
+//! `docs/plans/kuncode-mvp-development-plan.md` §4.6.

@@ -28,8 +28,7 @@ async fn parent_components_cannot_escape_root() {
     fs::write(outside.join("secret.txt"), "secret").expect("write outside");
 
     let workspace = workspace_at(&root).await;
-    let err =
-        workspace.resolve_read_file("../outside/secret.txt").await.expect_err("escape rejected");
+    let err = workspace.resolve_read_file("../outside/secret.txt").await.expect_err("escape rejected");
 
     assert!(matches!(err, WorkspaceError::PathEscape { .. }));
 }
@@ -45,8 +44,7 @@ async fn absolute_paths_outside_root_are_rejected() {
     fs::write(&outside_file, "secret").expect("write outside");
 
     let workspace = workspace_at(&root).await;
-    let err =
-        workspace.resolve_read_file(&outside_file).await.expect_err("absolute escape rejected");
+    let err = workspace.resolve_read_file(&outside_file).await.expect_err("absolute escape rejected");
 
     assert!(matches!(err, WorkspaceError::PathEscape { .. }));
 }
@@ -86,6 +84,19 @@ async fn valid_workspace_file_resolves_to_workspace_path() {
 }
 
 #[tokio::test]
+async fn existing_directory_resolves_to_workspace_path() {
+    let temp = tempdir().expect("tempdir");
+    let root = temp.path().join("root");
+    fs::create_dir(&root).expect("create root");
+    fs::create_dir(root.join("src")).expect("create src");
+
+    let workspace = workspace_at(&root).await;
+    let path = workspace.resolve_existing_path("src").await.expect("resolve dir");
+
+    assert_eq!(path.relative_path(), Path::new("src"));
+}
+
+#[tokio::test]
 async fn write_path_allows_new_file_with_safe_parent() {
     let temp = tempdir().expect("tempdir");
     let root = temp.path().join("root");
@@ -119,10 +130,9 @@ async fn oversized_files_are_rejected() {
     fs::create_dir(&root).expect("create root");
     fs::write(root.join("large.txt"), "abcd").expect("write file");
 
-    let workspace =
-        Workspace::open(&root, WorkspaceConfig { max_file_size: 3, reject_binary: true })
-            .await
-            .expect("open workspace");
+    let workspace = Workspace::open(&root, WorkspaceConfig { max_file_size: 3, reject_binary: true })
+        .await
+        .expect("open workspace");
     let err = workspace.resolve_read_file("large.txt").await.expect_err("too large rejected");
 
     assert!(matches!(err, WorkspaceError::TooLarge { size: 4, max: 3, .. }));
