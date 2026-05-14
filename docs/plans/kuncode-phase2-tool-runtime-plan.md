@@ -405,6 +405,8 @@ Phase 2 不新增完整 `ToolRequest` 领域模型；`ToolInput` 先作为 runti
 10. 成功 emit `tool.completed`。
 11. 返回 `ToolResult` 或 `ToolError`。
 
+如果工具返回 `Ok(result)` 时 cancel token 已触发，runtime 有意丢弃成功 payload，返回 `ToolError::Cancelled` 并记录 `tool.cancelled`。如果 terminal lifecycle event emit 失败，返回的 internal error 必须保留原始工具错误摘要，避免排查时只看到 emit 失败。
+
 ### 11.3 Capability Gate
 
 Phase 2 的 gate 规则：
@@ -444,9 +446,9 @@ ToolRuntime::execute(input, ctx, granted_capabilities)
 结果：
 
 1. 全文件读取 `summary = "read <relative-path> (<bytes> bytes)"`。
-2. 范围读取 `summary = "read <relative-path> lines <start>-<end> of <total> (<bytes> bytes)"`；空范围使用 `read <path> from line <offset> (0 lines of <total>)`。
+2. 范围读取 `summary = "read <relative-path> lines <start>-<end> of <total> (<selected_bytes> selected bytes, <bytes> file bytes)"`；空范围使用 `read <path> from line <offset> (0 lines of <total>)`。
 3. `inline_content = Some(text_or_truncated_text)`。
-4. metadata 包含 relative path、bytes、truncated、range_truncated、line_numbered、start_line、end_line、returned_lines、total_lines。
+4. metadata 包含 relative path、bytes、selected_bytes、truncated、range_truncated、line_numbered、start_line、end_line、returned_lines、total_lines。
 
 ### 12.2 search
 
@@ -469,7 +471,7 @@ ToolRuntime::execute(input, ctx, granted_capabilities)
 5. 必须跳过 `.git`、`target`、`node_modules`、`.venv`。
 6. 超过 `max_results` 后停止收集并终止 `rg`。
 7. 达到 `ToolLimits.max_inline_output_bytes` 后停止收集并终止 `rg`。
-8. fallback 后端按行读取文件，不把整个文件读入内存。
+8. fallback 后端在 blocking task 中按行读取文件，不把整个文件读入内存，也不阻塞 async executor worker。
 9. 单条 snippet UTF-8 安全截断；metadata 记录 `snippet_truncated`。
 10. search artifact 只保存已选中的结果列表，不保存整个仓库的无限匹配集合。
 
@@ -494,12 +496,13 @@ ToolRuntime::execute(input, ctx, granted_capabilities)
 3. 使用 `ToolLimits.default_timeout_ms`。
 4. 不接受任意 git 参数。
 5. stdout/stderr 使用 bounded streaming capture。
+6. `changed_files` 从完整 captured stdout 统计，即使 inline 已截断也必须准确。
 
 结果：
 
 1. summary 记录 changed file count。
 2. inline content 是原始 short status，必要时截断。
-3. metadata 记录 `stdout_bytes`、`truncated`、`duration_ms`。
+3. metadata 记录 `changed_files`、`stdout_bytes`、`truncated`、`duration_ms`。
 
 ### 12.4 git_diff
 
@@ -567,6 +570,9 @@ ToolRuntime::execute(input, ctx, granted_capabilities)
 8. 两阶段执行：先解析、规范化路径、读取当前内容并计算所有目标的新内容；全部验证通过后才写入。
 9. 验证阶段任何错误不得修改 workspace。
 10. 写入阶段如果发生 IO 错误，尽力 rollback 已写文件：已有文件写回原内容，新建文件删除；rollback 失败返回带诊断的 internal/io 错误。
+11. 修改已有文件时保留原有行尾；CRLF 或混合行尾不得被静默规范化为 LF。
+12. hunk 必须按 old range 升序且不能重叠；倒序或重叠 hunk 返回 `ToolError::InvalidInput`。
+13. context mismatch、duplicate target、new-file patch 中出现 context/remove 等 patch 语义错误返回 `ToolError::InvalidInput`。
 
 结果：
 
@@ -602,6 +608,7 @@ ToolRuntime::execute(input, ctx, granted_capabilities)
 1. summary 记录 exit status、stdout/stderr 大小、是否 artifact。
 2. inline content 包含短 stdout/stderr。
 3. metadata 记录 argv、cwd、exit code、duration、真实 stdout/stderr byte count、truncated、trusted_command、artifact。
+4. `stdout_truncated` / `stderr_truncated` 只表示对应 stream 被截断；combined inline 被截断时用 `inline_truncated` 表示，不把两个 stream 同时标为 truncated。
 
 ## 13. 测试计划
 
@@ -659,17 +666,21 @@ crates/kuncode-tools/tests/git.rs
 1. 单条超长匹配被 snippet cap 截断。
 2. 多条匹配导致总 inline 超限时设置 `inline_truncated`，并生成有效 artifact 引用。
 3. `rg` 后端达到 `max_results` 或 inline 限制后停止读取并终止进程。
+4. fallback 后端在 async 工具中不会直接跑同步文件 IO。
 
 ### 13.7 apply_patch 额外测试
 
 1. 多文件 patch 中后续 hunk context mismatch 时，前面文件保持原样。
 2. duplicate target 在任何写入前失败。
 3. 新建文件 + 后续失败时不留下新文件。
+4. CRLF 文件应用 patch 后保留 CRLF。
+5. 倒序 hunk 被拒绝且不写入。
 
 ### 13.8 read_file 额外测试
 
 1. `offset` 超过 EOF 返回空 inline、`end_line: null`、`returned_lines: 0`。
 2. 空范围 summary 不出现倒置行号。
+3. 范围读取 metadata 记录 `selected_bytes`，summary 不把整文件大小伪装成切片大小。
 
 ## 14. 实施顺序
 

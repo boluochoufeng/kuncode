@@ -92,8 +92,6 @@ async fn file_artifact_store_writes_bytes_and_metadata() {
     assert_eq!(record.sha256, "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824");
     assert_eq!(record.source_event_id, source_event_id);
 
-
-
     assert_eq!(parsed, record);
 }
 

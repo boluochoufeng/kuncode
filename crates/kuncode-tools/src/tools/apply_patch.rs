@@ -56,13 +56,13 @@ impl Tool for ApplyPatchTool {
         for patch in patches {
             let target = patch_target(&patch, &self.descriptor.name)?;
             if !seen.insert(target.path.clone()) {
-                return Err(ToolError::Process { message: format!("duplicate patch target `{}`", target.path) });
+                return Err(patch_invalid(format!("duplicate patch target `{}`", target.path)));
             }
 
             if target.create {
                 let path = ctx.workspace.resolve_write_path(&target.path).await.map_err(workspace_error)?;
                 if fs::metadata(path.as_path()).await.is_ok() {
-                    return Err(ToolError::Process { message: format!("new file `{}` already exists", target.path) });
+                    return Err(patch_invalid(format!("new file `{}` already exists", target.path)));
                 }
                 let new_content = apply_new_file(&patch)?;
                 changes.push(PreparedPatch {
@@ -120,6 +120,9 @@ async fn write_prepared_changes(changes: &[PreparedPatch]) -> Result<Vec<String>
         let write_result = fs::write(&change.path, &change.new_content).await;
         written.push(change);
         if let Err(source) = write_result {
+            // Validation is already complete by this point. If actual writes
+            // fail, best-effort rollback keeps the workspace from being left in
+            // a partially-applied state.
             if let Err(rollback) = rollback_changes(&written).await {
                 return Err(ToolError::Internal {
                     tool: "apply_patch".to_owned(),
@@ -139,6 +142,8 @@ async fn write_prepared_changes(changes: &[PreparedPatch]) -> Result<Vec<String>
 
 async fn rollback_changes(changes: &[&PreparedPatch]) -> Result<(), ToolError> {
     for change in changes.iter().rev() {
+        // Reverse order matters for create-then-modify style batches: undo the
+        // most recent visible write first.
         if let Some(original) = &change.original {
             fs::write(&change.path, original)
                 .await
@@ -203,82 +208,176 @@ fn normalize_patch_path(path: &str, side: PatchSide, tool: &str) -> Result<Optio
 }
 
 fn apply_existing_file(patch: &Patch<'_>, current: &str) -> Result<String, ToolError> {
-    let old_lines: Vec<&str> = current.lines().collect();
+    let old_lines = split_preserving_line_endings(current);
+    let default_line_ending = default_line_ending(&old_lines);
     let mut out = Vec::new();
     let mut old_idx = 0_usize;
 
     for hunk in &patch.hunks {
-        let hunk_start = usize::try_from(hunk.old_range.start)
-            .map_err(|_| ToolError::Process { message: "patch hunk start is too large".to_owned() })?;
+        let hunk_start =
+            usize::try_from(hunk.old_range.start).map_err(|_| patch_invalid("patch hunk start is too large"))?;
         let target_idx = hunk_start.saturating_sub(1);
+        if target_idx < old_idx {
+            return Err(patch_invalid("patch hunks must be sorted by old range and must not overlap"));
+        }
+        // Copy untouched source lines up to the hunk. Existing source lines
+        // carry their original line endings so patches do not reformat CRLF or
+        // mixed-ending files as a side effect.
         while old_idx < target_idx {
-            let line = old_lines
-                .get(old_idx)
-                .ok_or_else(|| ToolError::Process { message: "patch hunk starts past end of file".to_owned() })?;
-            out.push((*line).to_owned());
+            let line = old_lines.get(old_idx).ok_or_else(|| patch_invalid("patch hunk starts past end of file"))?;
+            out.push((*line).into());
             old_idx += 1;
         }
 
         for line in &hunk.lines {
             match line {
                 Line::Context(expected) => {
-                    ensure_old_line(&old_lines, old_idx, expected)?;
-                    out.push((*expected).to_owned());
+                    let line = ensure_old_line(&old_lines, old_idx, expected)?;
+                    out.push(line.into());
                     old_idx += 1;
                 }
                 Line::Remove(expected) => {
                     ensure_old_line(&old_lines, old_idx, expected)?;
                     old_idx += 1;
                 }
-                Line::Add(added) => out.push((*added).to_owned()),
+                Line::Add(added) => {
+                    out.push(PatchedLine { text: (*added).to_owned(), line_ending: default_line_ending });
+                }
             }
         }
     }
 
     while old_idx < old_lines.len() {
-        out.push(old_lines[old_idx].to_owned());
+        out.push(old_lines[old_idx].into());
         old_idx += 1;
     }
 
-    Ok(join_patch_lines(&out, patch.end_newline))
+    Ok(render_patched_lines(out, patch.end_newline, default_line_ending))
 }
 
 fn apply_new_file(patch: &Patch<'_>) -> Result<String, ToolError> {
     let mut out = Vec::new();
+    let mut previous_new_start = None;
     for hunk in &patch.hunks {
+        if let Some(previous) = previous_new_start
+            && hunk.new_range.start < previous
+        {
+            return Err(patch_invalid("patch hunks must be sorted by new range"));
+        }
+        previous_new_start = Some(hunk.new_range.start);
         for line in &hunk.lines {
             match line {
-                Line::Add(added) => out.push((*added).to_owned()),
+                Line::Add(added) => out.push(PatchedLine { text: (*added).to_owned(), line_ending: "\n" }),
                 Line::Context(_) | Line::Remove(_) => {
-                    return Err(ToolError::Process {
-                        message: "new-file patches may only contain added lines".to_owned(),
-                    });
+                    return Err(patch_invalid("new-file patches may only contain added lines"));
                 }
             }
         }
     }
-    Ok(join_patch_lines(&out, patch.end_newline))
+    Ok(render_patched_lines(out, patch.end_newline, "\n"))
 }
 
-fn ensure_old_line(old_lines: &[&str], old_idx: usize, expected: &str) -> Result<(), ToolError> {
-    let actual = old_lines
-        .get(old_idx)
-        .ok_or_else(|| ToolError::Process { message: format!("patch expected `{expected}` past end of file") })?;
-    if *actual == expected {
-        Ok(())
-    } else {
-        Err(ToolError::Process {
-            message: format!("patch context mismatch at line {}: expected `{expected}`, found `{actual}`", old_idx + 1),
-        })
+#[derive(Clone, Copy)]
+struct SourceLine<'a> {
+    text: &'a str,
+    line_ending: &'static str,
+}
+
+struct PatchedLine {
+    text: String,
+    line_ending: &'static str,
+}
+
+impl From<SourceLine<'_>> for PatchedLine {
+    fn from(line: SourceLine<'_>) -> Self {
+        Self { text: line.text.to_owned(), line_ending: line.line_ending }
     }
 }
 
-fn join_patch_lines(lines: &[String], end_newline: bool) -> String {
-    let mut out = lines.join("\n");
-    if end_newline {
-        out.push('\n');
+fn split_preserving_line_endings(content: &str) -> Vec<SourceLine<'_>> {
+    // `str::lines()` intentionally drops terminators, which would silently
+    // normalize CRLF/mixed-ending files when rendering the patched file. Keep
+    // line text and terminator separate so context matching ignores terminators
+    // but output preserves them.
+    let bytes = content.as_bytes();
+    let mut lines = Vec::new();
+    let mut start = 0_usize;
+    let mut idx = 0_usize;
+
+    while idx < bytes.len() {
+        match bytes[idx] {
+            b'\n' => {
+                let is_crlf = idx > start && bytes[idx - 1] == b'\r';
+                let text_end = if is_crlf { idx - 1 } else { idx };
+                lines.push(SourceLine {
+                    text: &content[start..text_end],
+                    line_ending: if is_crlf { "\r\n" } else { "\n" },
+                });
+                idx += 1;
+                start = idx;
+            }
+            b'\r' if idx + 1 == bytes.len() || bytes[idx + 1] != b'\n' => {
+                lines.push(SourceLine { text: &content[start..idx], line_ending: "\r" });
+                idx += 1;
+                start = idx;
+            }
+            _ => {
+                idx += 1;
+            }
+        }
+    }
+
+    if start < content.len() {
+        lines.push(SourceLine { text: &content[start..], line_ending: "" });
+    }
+
+    lines
+}
+
+fn default_line_ending(lines: &[SourceLine<'_>]) -> &'static str {
+    lines.iter().find_map(|line| (!line.line_ending.is_empty()).then_some(line.line_ending)).unwrap_or("\n")
+}
+
+fn ensure_old_line<'a>(
+    old_lines: &'a [SourceLine<'a>],
+    old_idx: usize,
+    expected: &str,
+) -> Result<SourceLine<'a>, ToolError> {
+    let actual =
+        old_lines.get(old_idx).ok_or_else(|| patch_invalid(format!("patch expected `{expected}` past end of file")))?;
+    if actual.text == expected {
+        Ok(*actual)
+    } else {
+        Err(patch_invalid(format!(
+            "patch context mismatch at line {}: expected `{expected}`, found `{}`",
+            old_idx + 1,
+            actual.text
+        )))
+    }
+}
+
+fn render_patched_lines(mut lines: Vec<PatchedLine>, end_newline: bool, default_line_ending: &'static str) -> String {
+    // The patch crate exposes only final-file newline presence, not a per-added
+    // line ending. Added lines therefore use the file's first observed line
+    // ending, while untouched/context lines keep their original terminators.
+    if let Some(last) = lines.last_mut() {
+        if end_newline && last.line_ending.is_empty() {
+            last.line_ending = default_line_ending;
+        } else if !end_newline {
+            last.line_ending = "";
+        }
+    }
+
+    let mut out = String::new();
+    for line in lines {
+        out.push_str(&line.text);
+        out.push_str(line.line_ending);
     }
     out
+}
+
+fn patch_invalid(message: impl Into<String>) -> ToolError {
+    ToolError::InvalidInput { tool: "apply_patch".to_owned(), message: message.into() }
 }
 
 fn descriptor() -> ToolDescriptor {

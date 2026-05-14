@@ -59,6 +59,7 @@ impl Tool for ReadFileTool {
         } else {
             SelectedContent {
                 content: content.clone(),
+                selected_bytes: bytes,
                 start_line: u64::from(total_lines != 0),
                 end_line: Some(u64::try_from(total_lines).map_err(|_| ToolError::InvalidInput {
                     tool: self.descriptor.name.clone(),
@@ -85,10 +86,11 @@ impl Tool for ReadFileTool {
             ))
         } else if requested_range.is_some() {
             cap_summary(format!(
-                "read {relative} lines {}-{} of {} ({bytes} bytes)",
+                "read {relative} lines {}-{} of {} ({} selected bytes, {bytes} file bytes)",
                 selected.start_line,
                 selected.end_line.unwrap_or(selected.start_line),
-                selected.total_lines
+                selected.total_lines,
+                selected.selected_bytes,
             ))
         } else {
             cap_summary(format!("read {relative} ({bytes} bytes)"))
@@ -102,6 +104,7 @@ impl Tool for ReadFileTool {
             json!({
                 "path": relative,
                 "bytes": bytes,
+                "selected_bytes": selected.selected_bytes,
                 "truncated": truncated,
                 "range_truncated": selected.range_truncated,
                 "line_numbered": selected.line_numbered,
@@ -122,6 +125,7 @@ struct ReadRange {
 
 struct SelectedContent {
     content: String,
+    selected_bytes: usize,
     start_line: u64,
     end_line: Option<u64>,
     returned_lines: u64,
@@ -171,11 +175,13 @@ fn select_numbered_lines(content: &str, range: ReadRange) -> Result<SelectedCont
     let start = start_index.min(total_lines);
     let end = start.saturating_add(limit).min(total_lines);
     let returned_lines = end.saturating_sub(start);
+    let selected_bytes = lines[start..end].iter().map(|line| line.len()).sum();
     let start_line = if returned_lines == 0 { range.offset } else { usize_to_u64(start + 1)? };
     let end_line = if returned_lines == 0 { None } else { Some(usize_to_u64(end)?) };
 
     Ok(SelectedContent {
         content: numbered_lines(&lines[start..end], start + 1),
+        selected_bytes,
         start_line,
         end_line,
         returned_lines: usize_to_u64(returned_lines)?,

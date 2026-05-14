@@ -31,6 +31,31 @@ async fn git_status_happy_path() {
 }
 
 #[tokio::test]
+async fn git_status_counts_changed_files_from_full_output_when_inline_is_truncated() {
+    let f = ToolFixture::new().await;
+    git(f.root(), &["init"]);
+    for idx in 0..5 {
+        fs::write(f.root().join(format!("new-{idx}.txt")), "new\n").await.expect("write");
+    }
+    let limits = ToolLimits { max_inline_output_bytes: 8, ..ToolLimits::default() };
+
+    let result = f
+        .run_tool(
+            GitStatusTool::new(),
+            ToolInput::new("git_status", json!({})),
+            &[ToolCapability::Explore],
+            limits,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("status");
+
+    assert_eq!(result.metadata["changed_files"], 5);
+    assert_eq!(result.metadata["truncated"], true);
+    assert!(result.inline_content.as_deref().expect("inline").len() <= limits.max_inline_output_bytes);
+}
+
+#[tokio::test]
 async fn git_diff_happy_path() {
     let f = ToolFixture::new().await;
     init_repo_with_file(&f).await;

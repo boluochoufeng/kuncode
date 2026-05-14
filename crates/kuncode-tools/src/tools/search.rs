@@ -5,6 +5,7 @@ use std::{io::BufRead, path::Path, process::Stdio, time::Duration};
 use async_trait::async_trait;
 use ignore::WalkBuilder;
 use kuncode_core::{ToolCapability, ToolEffect};
+use kuncode_workspace::{Workspace, WorkspacePath};
 use regex::Regex;
 use serde_json::json;
 use tokio::{
@@ -64,6 +65,8 @@ impl Tool for SearchTool {
 
     async fn execute(&self, input: ToolInput, ctx: ToolContext<'_>) -> Result<ToolResult, ToolError> {
         let query = required_str(&input.payload, &self.descriptor.name, "query")?;
+        // Compile up front so invalid regexes are always `InvalidInput`,
+        // regardless of whether the rg backend is available.
         let regex = Regex::new(query).map_err(|err| ToolError::InvalidInput {
             tool: self.descriptor.name.clone(),
             message: format!("invalid regex `{query}`: {err}"),
@@ -93,10 +96,28 @@ impl Tool for SearchTool {
             .await?
             {
                 Some(found) => found,
-                None => rust_search(&regex, &search_path, ctx.workspace.root(), max_results, &ctx)?,
+                None => {
+                    rust_search(
+                        regex.clone(),
+                        search_path.clone(),
+                        ctx.workspace.clone(),
+                        max_results,
+                        ctx.limits.max_inline_output_bytes,
+                        ctx.cancel_token.clone(),
+                    )
+                    .await?
+                }
             }
         } else {
-            rust_search(&regex, &search_path, ctx.workspace.root(), max_results, &ctx)?
+            rust_search(
+                regex,
+                search_path.clone(),
+                ctx.workspace.clone(),
+                max_results,
+                ctx.limits.max_inline_output_bytes,
+                ctx.cancel_token.clone(),
+            )
+            .await?
         };
 
         let (inline, inline_truncated) = truncate_utf8(&search.selected, ctx.limits.max_inline_output_bytes);
@@ -199,7 +220,7 @@ impl SearchCollector {
 
 async fn rg_search(
     query: &str,
-    search_path: &kuncode_workspace::WorkspacePath,
+    search_path: &WorkspacePath,
     workspace_root: &Path,
     max_results: usize,
     max_inline_bytes: usize,
@@ -316,25 +337,55 @@ where
     Ok(out)
 }
 
-fn rust_search(
+async fn rust_search(
+    regex: Regex,
+    search_path: WorkspacePath,
+    workspace: Workspace,
+    max_results: usize,
+    max_inline_bytes: usize,
+    cancel_token: CancellationToken,
+) -> Result<SearchOutput, ToolError> {
+    let workspace_root = workspace.root().to_path_buf();
+    // Keep the fallback aligned with ripgrep-style walking via `ignore::WalkBuilder`.
+    // Tokio has async directory primitives, but not an async WalkBuilder with the
+    // same ignore semantics; wrapping the synchronous walk/read loop keeps blocking
+    // filesystem work off the async executor workers.
+    tokio::task::spawn_blocking(move || {
+        rust_search_blocking(
+            &regex,
+            &search_path,
+            &workspace_root,
+            max_results,
+            max_inline_bytes,
+            &workspace,
+            &cancel_token,
+        )
+    })
+    .await
+    .map_err(|err| ToolError::Process { message: format!("failed to join fallback search task: {err}") })?
+}
+
+fn rust_search_blocking(
     regex: &Regex,
-    search_path: &kuncode_workspace::WorkspacePath,
+    search_path: &WorkspacePath,
     workspace_root: &Path,
     max_results: usize,
-    ctx: &ToolContext<'_>,
+    max_inline_bytes: usize,
+    workspace: &Workspace,
+    cancel_token: &CancellationToken,
 ) -> Result<SearchOutput, ToolError> {
-    let mut collector = SearchCollector::new(max_results, ctx.limits.max_inline_output_bytes);
+    let mut collector = SearchCollector::new(max_results, max_inline_bytes);
     let walker = WalkBuilder::new(search_path.as_path()).build();
 
     for entry in walker {
-        if ctx.cancel_token.is_cancelled() {
+        if cancel_token.is_cancelled() {
             return Err(ToolError::Cancelled { tool: "search".to_owned() });
         }
 
         let entry = entry.map_err(|err| ToolError::Process { message: format!("search walk failed: {err}") })?;
         let path = entry.path();
         let relative = path.strip_prefix(workspace_root).unwrap_or(path);
-        if ctx.workspace.is_default_ignored(relative) {
+        if workspace.is_default_ignored(relative) {
             continue;
         }
         if !entry.file_type().is_some_and(|file_type| file_type.is_file()) {

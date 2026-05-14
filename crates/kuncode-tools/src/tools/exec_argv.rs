@@ -100,8 +100,8 @@ impl Tool for ExecArgvTool {
 
         let stdout_text = String::from_utf8_lossy(&output.stdout.inline);
         let stderr_text = String::from_utf8_lossy(&output.stderr.inline);
-        let (stdout_inline, _) = truncate_utf8(&stdout_text, ctx.limits.max_inline_output_bytes);
-        let (stderr_inline, _) = truncate_utf8(&stderr_text, ctx.limits.max_inline_output_bytes);
+        let (stdout_inline, stdout_inline_truncated) = truncate_utf8(&stdout_text, ctx.limits.max_inline_output_bytes);
+        let (stderr_inline, stderr_inline_truncated) = truncate_utf8(&stderr_text, ctx.limits.max_inline_output_bytes);
         let inline_candidate = format!("stdout:\n{stdout_inline}\nstderr:\n{stderr_inline}");
         let (inline, inline_truncated) = truncate_utf8(&inline_candidate, ctx.limits.max_inline_output_bytes);
         let exit_code = output.status.code();
@@ -125,8 +125,9 @@ impl Tool for ExecArgvTool {
                 "duration_ms": output.duration_ms,
                 "stdout_bytes": output.stdout.bytes,
                 "stderr_bytes": output.stderr.bytes,
-                "stdout_truncated": stdout_truncated || inline_truncated,
-                "stderr_truncated": stderr_truncated || inline_truncated,
+                "stdout_truncated": stdout_truncated || stdout_inline_truncated,
+                "stderr_truncated": stderr_truncated || stderr_inline_truncated,
+                "inline_truncated": inline_truncated,
                 "trusted_command": is_trusted_argv_value(&input.payload),
                 "artifact": needs_artifact,
             }),

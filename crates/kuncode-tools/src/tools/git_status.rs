@@ -6,7 +6,7 @@ use serde_json::json;
 
 use crate::{
     Tool, ToolContext, ToolDescriptor, ToolError, ToolInput, ToolResult,
-    tools::common::{CaptureLimits, cap_summary, run_capture, tool_result, truncate_utf8},
+    tools::common::{CaptureLimits, cap_summary, count_non_empty_lines, run_capture, tool_result, truncate_utf8},
 };
 
 /// Runs `git status --short` in the workspace root.
@@ -56,7 +56,9 @@ impl Tool for GitStatusTool {
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout.inline);
-        let changed_files = stdout.lines().filter(|line| !line.trim().is_empty()).count();
+        // `stdout.inline` may be only a prefix; count from the full captured
+        // stream so metadata stays correct when inline output is truncated.
+        let changed_files = count_non_empty_lines(&output.stdout, &self.descriptor.name).await?;
         let (inline, truncated) = truncate_utf8(&stdout, ctx.limits.max_inline_output_bytes);
         let summary = cap_summary(format!("git status ({changed_files} changed files)"));
 

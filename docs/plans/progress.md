@@ -14,12 +14,12 @@ Phase 0 和 Phase 1 已完成。Phase 2 的 Tool Runtime、基础工具主体和
 4. 增加 `Workspace::resolve_existing_path`，用于需要校验已存在路径的工具。
 5. 补齐关键结构体字段和函数的 doc 注释，覆盖工具 descriptor、runtime、workspace path helper、内建工具入口等公共 API。
 6. `ToolRuntime` 内部改为私有 `ToolRegistry`，用注册顺序 `Vec<Entry>` 加名称索引 `HashMap<String, usize>`，保持 descriptor 输出顺序稳定。
-7. `read_file` 支持 `offset` / `limit` 范围读取，并修复 offset 超过 EOF 时的空结果 metadata。
-8. `exec_argv`、`git_diff`、`git_status` 使用 bounded streaming capture；`exec_argv` 长 stdout/stderr 生成完整 combined artifact，`git_diff` 长 stdout 生成 artifact，`git_status` 只返回受限 inline 和真实 byte metadata。
+7. `read_file` 支持 `offset` / `limit` 范围读取，并修复 offset 超过 EOF 时的空结果 metadata；范围 summary 区分 selected bytes 和 file bytes。
+8. `exec_argv`、`git_diff`、`git_status` 使用 bounded streaming capture；`exec_argv` 长 stdout/stderr 生成完整 combined artifact，`git_diff` 长 stdout 生成 artifact，`git_status` 只返回受限 inline 并从完整 capture 统计 changed file count。
 9. Unix 下 timeout/cancel 使用 process group 回收进程树；Windows 暂保留 direct-child kill fallback。
-10. `search` 对 `rg` 和 Rust fallback 都做 streaming/line-by-line 边界控制，snippet、inline、artifact 都只保存已选结果集合。
-11. `apply_patch` 改为两阶段验证和写入，验证失败零写入，写入失败尽力 rollback。
-12. 增加工具集成测试和共享测试 fixture，覆盖 capability deny、路径越界、截断、artifact、timeout、cancel、进程树回收、search 边界、apply_patch 原子性、git 非仓库错误、动态风险标记等 Phase 2 行为。
+10. `search` 对 `rg` 和 Rust fallback 都做 streaming/line-by-line 边界控制，fallback 同步 IO 放入 blocking task，snippet、inline、artifact 都只保存已选结果集合。
+11. `apply_patch` 改为两阶段验证和写入，验证失败零写入，写入失败尽力 rollback；已有文件保留原行尾，hunk 顺序倒置、context mismatch 等 patch 语义错误归类为 `InvalidInput`。
+12. 增加工具集成测试和共享测试 fixture，覆盖 capability deny、路径越界、截断、artifact、timeout、cancel、进程树回收、search 边界、apply_patch 原子性/行尾保留/倒序 hunk、git 非仓库错误、动态风险标记、内建 descriptor truth table 等 Phase 2 行为。
 
 ## 已验证
 

@@ -63,9 +63,9 @@ mod tests {
         use ToolCapability::*;
         use ToolEffect::*;
 
-        // TODO(phase-2): once built-in ToolDescriptor implementations exist,
-        // assert this table against the registered descriptors so
-        // effect/capability drift is caught by tests.
+        // The concrete built-in descriptors live in `kuncode-tools`, which
+        // depends on this crate. Descriptor drift is checked from that crate's
+        // integration tests to avoid a core -> tools dependency cycle.
         let table: &[(&str, &[ToolEffect], &[ToolCapability])] = &[
             ("read_file", &[ReadWorkspace], &[Explore, Edit]),
             ("search", &[ReadWorkspace], &[Explore, Edit]),

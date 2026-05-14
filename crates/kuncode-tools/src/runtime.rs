@@ -164,14 +164,21 @@ impl ToolRuntime {
         )?;
         let source_event_id = started.event_id;
         lifecycle.emit(started, &tool_name).await?;
+        // Artifacts created by the tool should point back to this exact
+        // `tool.started` envelope, not the caller's placeholder context id.
         ctx.source_event_id = source_event_id;
 
         let execution = entry.tool.execute(input, ctx).await;
 
         match execution {
             Ok(_result) if cancel_token.is_cancelled() => {
+                // Cancellation wins intentionally: if a tool races and returns
+                // a successful payload after cancellation was requested, that
+                // payload is discarded and the lifecycle records cancellation.
                 let err = ToolError::Cancelled { tool: tool_name.clone() };
-                emit_cancelled(&lifecycle, request_id, &tool_name, err.summary()).await?;
+                emit_cancelled(&lifecycle, request_id, &tool_name, err.summary())
+                    .await
+                    .map_err(|emit| emit_after_original_error(&tool_name, &err, &emit))?;
                 Err(err)
             }
             Ok(result) if result.summary.chars().count() > SUMMARY_MAX_CHARS => {
@@ -182,7 +189,9 @@ impl ToolRuntime {
                         result.summary.chars().count()
                     ),
                 };
-                emit_failed(&lifecycle, request_id, &tool_name, &err).await?;
+                emit_failed(&lifecycle, request_id, &tool_name, &err)
+                    .await
+                    .map_err(|emit| emit_after_original_error(&tool_name, &err, &emit))?;
                 Err(err)
             }
             Ok(result) => {
@@ -190,11 +199,15 @@ impl ToolRuntime {
                 Ok(result)
             }
             Err(err) if matches!(err, ToolError::Cancelled { .. }) || cancel_token.is_cancelled() => {
-                emit_cancelled(&lifecycle, request_id, &tool_name, err.summary()).await?;
+                emit_cancelled(&lifecycle, request_id, &tool_name, err.summary())
+                    .await
+                    .map_err(|emit| emit_after_original_error(&tool_name, &err, &emit))?;
                 Err(err)
             }
             Err(err) => {
-                emit_failed(&lifecycle, request_id, &tool_name, &err).await?;
+                emit_failed(&lifecycle, request_id, &tool_name, &err)
+                    .await
+                    .map_err(|emit| emit_after_original_error(&tool_name, &err, &emit))?;
                 Err(err)
             }
         }
@@ -306,6 +319,16 @@ async fn emit_cancelled(
 
 fn emit_error(tool_name: &str, err: &EventLogError) -> ToolError {
     ToolError::Internal { tool: tool_name.to_owned(), message: format!("failed to emit lifecycle event: {err}") }
+}
+
+fn emit_after_original_error(tool_name: &str, original: &ToolError, emit: &ToolError) -> ToolError {
+    // Once `tool.started` is in the log, terminal event emission is part of the
+    // contract. If that emission fails, return the emit failure but keep the
+    // original tool failure in the diagnostic string for debuggability.
+    ToolError::Internal {
+        tool: tool_name.to_owned(),
+        message: format!("{}; original {:?}: {}", emit.summary(), original.kind(), original.summary()),
+    }
 }
 
 impl Default for ToolRuntime {

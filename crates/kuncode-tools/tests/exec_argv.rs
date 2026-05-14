@@ -150,6 +150,28 @@ async fn exec_argv_long_stderr_writes_artifact() {
     assert_eq!(f.artifact_records().await.len(), 1);
 }
 
+#[tokio::test]
+async fn exec_argv_combined_inline_truncation_does_not_mark_both_streams_truncated() {
+    let f = ToolFixture::new().await;
+    let limits = ToolLimits { max_inline_output_bytes: 12, ..ToolLimits::default() };
+
+    let result = f
+        .run_tool(
+            ExecArgvTool::new(),
+            ToolInput::new("exec_argv", json!({ "argv": ["sh", "-c", "printf abcdef; printf xy >&2"] })),
+            &[ToolCapability::Verify],
+            limits,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("exec");
+
+    assert_eq!(result.metadata["stdout_truncated"], false);
+    assert_eq!(result.metadata["stderr_truncated"], false);
+    assert_eq!(result.metadata["inline_truncated"], true);
+    assert_eq!(result.metadata["artifact"], false);
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn exec_argv_timeout_kills_process_group_children() {

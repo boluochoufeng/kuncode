@@ -76,9 +76,12 @@ async fn read_file_can_return_line_range_with_line_numbers() {
     assert_eq!(result.metadata["end_line"], 3);
     assert_eq!(result.metadata["returned_lines"], 2);
     assert_eq!(result.metadata["total_lines"], 4);
+    assert_eq!(result.metadata["bytes"], 23);
+    assert_eq!(result.metadata["selected_bytes"], 11);
     assert_eq!(result.metadata["range_truncated"], true);
     assert_eq!(result.metadata["line_numbered"], true);
     assert_eq!(result.metadata["truncated"], false);
+    assert_eq!(result.summary, "read notes.txt lines 2-3 of 4 (11 selected bytes, 23 file bytes)");
 }
 
 #[tokio::test]

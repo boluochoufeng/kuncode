@@ -130,9 +130,64 @@ async fn apply_patch_rejects_context_mismatch() {
         .await
         .expect_err("mismatch");
 
-    assert!(matches!(err, ToolError::Process { .. }));
+    assert!(matches!(err, ToolError::InvalidInput { .. }));
     let events = f.drain().await;
     assert_eq!(tool_kinds(&events), vec![EventKind::ToolStarted, EventKind::ToolFailed]);
+}
+
+#[tokio::test]
+async fn apply_patch_preserves_existing_crlf_line_endings() {
+    let f = ToolFixture::new().await;
+    fs::write(f.root().join("a.txt"), b"one\r\ntwo\r\nthree\r\n").await.expect("write");
+    let patch = "\
+--- a/a.txt
++++ b/a.txt
+@@ -2 +2 @@
+-two
++TWO
+";
+
+    f.run_tool(
+        ApplyPatchTool::new(),
+        ToolInput::new("apply_patch", json!({ "patch": patch })),
+        &[ToolCapability::Edit],
+        ToolLimits::default(),
+        CancellationToken::new(),
+    )
+    .await
+    .expect("apply");
+
+    assert_eq!(fs::read(f.root().join("a.txt")).await.expect("read"), b"one\r\nTWO\r\nthree\r\n");
+}
+
+#[tokio::test]
+async fn apply_patch_rejects_out_of_order_hunks_without_writing() {
+    let f = ToolFixture::new().await;
+    fs::write(f.root().join("a.txt"), "one\ntwo\nthree\n").await.expect("write");
+    let patch = "\
+--- a/a.txt
++++ b/a.txt
+@@ -3 +3 @@
+-three
++THREE
+@@ -1 +1 @@
+-one
++ONE
+";
+
+    let err = f
+        .run_tool(
+            ApplyPatchTool::new(),
+            ToolInput::new("apply_patch", json!({ "patch": patch })),
+            &[ToolCapability::Edit],
+            ToolLimits::default(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("hunk order rejected");
+
+    assert!(matches!(err, ToolError::InvalidInput { .. }));
+    assert_eq!(fs::read_to_string(f.root().join("a.txt")).await.expect("read"), "one\ntwo\nthree\n");
 }
 
 #[tokio::test]
@@ -164,7 +219,7 @@ async fn apply_patch_does_not_partially_write_when_later_file_fails_validation()
         .await
         .expect_err("mismatch");
 
-    assert!(matches!(err, ToolError::Process { .. }));
+    assert!(matches!(err, ToolError::InvalidInput { .. }));
     assert_eq!(fs::read_to_string(f.root().join("a.txt")).await.expect("read a"), "old a\n");
     assert_eq!(fs::read_to_string(f.root().join("b.txt")).await.expect("read b"), "actual b\n");
 }
@@ -199,7 +254,7 @@ async fn apply_patch_duplicate_target_does_not_write_first_change() {
         .await
         .expect_err("duplicate");
 
-    assert!(matches!(err, ToolError::Process { .. }));
+    assert!(matches!(err, ToolError::InvalidInput { .. }));
     assert_eq!(fs::read_to_string(f.root().join("a.txt")).await.expect("read"), "one\ntwo\n");
 }
 
@@ -230,7 +285,7 @@ async fn apply_patch_new_file_is_not_left_when_later_patch_fails() {
         .await
         .expect_err("mismatch");
 
-    assert!(matches!(err, ToolError::Process { .. }));
+    assert!(matches!(err, ToolError::InvalidInput { .. }));
     assert!(!f.root().join("new.txt").exists());
     assert_eq!(fs::read_to_string(f.root().join("existing.txt")).await.expect("read existing"), "actual\n");
 }

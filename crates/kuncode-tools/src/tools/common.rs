@@ -13,7 +13,7 @@ use serde_json::Value;
 use tempfile::NamedTempFile;
 use tokio::{
     fs::OpenOptions,
-    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
+    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader},
     process::Command,
 };
 use tokio_util::sync::CancellationToken;
@@ -215,6 +215,8 @@ pub(crate) async fn run_capture(
     let stderr_task = tokio::spawn(read_bounded(stderr, limits.stderr));
     let started = Instant::now();
 
+    // The read tasks run concurrently with `wait()` so a verbose child cannot
+    // block forever on a full stdout/stderr pipe while the parent is waiting.
     let status = tokio::select! {
         status = child.wait() => status.map_err(|source| ToolError::Process {
             message: format!("failed to wait for `{program}`: {source}"),
@@ -242,6 +244,9 @@ async fn read_bounded<R>(mut reader: R, limit: usize) -> std::io::Result<Capture
 where
     R: AsyncRead + Unpin,
 {
+    // Capture keeps only a prefix in memory. Once the prefix budget is full we
+    // create a temp spill file and copy the already-captured prefix into it, so
+    // later artifact creation can still persist the complete stream.
     let mut inline = Vec::with_capacity(limit.min(8192));
     let mut bytes = 0_u64;
     let mut spill = None::<NamedTempFile>;
@@ -267,6 +272,8 @@ where
             continue;
         }
 
+        // First overflow: `inline` becomes the stable model-facing prefix;
+        // `spill` becomes the full stream, starting with that same prefix.
         inline.extend_from_slice(&chunk[..remaining]);
         let named = named_tempfile()?;
         let mut file = OpenOptions::new().write(true).truncate(true).open(named.path()).await?;
@@ -307,12 +314,41 @@ pub(crate) async fn save_captured_stream_artifact(
     }
 }
 
+pub(crate) async fn count_non_empty_lines(stream: &CapturedStream, tool: &str) -> Result<usize, ToolError> {
+    if let Some(path) = stream.full_path() {
+        // Do not derive counts from the truncated inline prefix. Tools like
+        // git_status need metadata based on the complete captured stream.
+        let file = tokio::fs::File::open(path).await.map_err(|err| ToolError::Process {
+            message: format!("failed to open captured output for `{tool}`: {err}"),
+        })?;
+        let mut reader = BufReader::new(file);
+        let mut line = Vec::new();
+        let mut count = 0_usize;
+        loop {
+            line.clear();
+            let read = reader.read_until(b'\n', &mut line).await.map_err(|err| ToolError::Process {
+                message: format!("failed to read captured output for `{tool}`: {err}"),
+            })?;
+            if read == 0 {
+                break;
+            }
+            count += usize::from(non_empty_line_bytes(&line));
+        }
+        Ok(count)
+    } else {
+        Ok(stream.inline.split(|byte| *byte == b'\n').filter(|line| non_empty_line_bytes(line)).count())
+    }
+}
+
 pub(crate) async fn save_combined_output_artifact(
     ctx: &ToolContext<'_>,
     kind: &str,
     stdout: &CapturedStream,
     stderr: &CapturedStream,
 ) -> Result<ArtifactId, ToolError> {
+    // exec_argv exposes one content_ref for the whole process transcript. The
+    // streams may individually live in memory or spill files; this helper
+    // normalizes both cases into the stable stdout/stderr artifact format.
     let combined = named_tempfile().map_err(|err| ToolError::Artifact { message: err.to_string() })?;
     {
         let mut file = OpenOptions::new()
@@ -341,6 +377,10 @@ async fn write_stream_to_file(stream: &CapturedStream, file: &mut tokio::fs::Fil
     Ok(())
 }
 
+fn non_empty_line_bytes(line: &[u8]) -> bool {
+    line.iter().any(|byte| !matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+}
+
 fn named_tempfile() -> std::io::Result<NamedTempFile> {
     let mut file = NamedTempFile::new()?;
     file.flush()?;
@@ -349,6 +389,9 @@ fn named_tempfile() -> std::io::Result<NamedTempFile> {
 
 #[cfg(unix)]
 fn configure_process_group(command: &mut Command) {
+    // Create a fresh process group before exec. Timeout/cancel then target the
+    // group instead of only the direct child, which covers shell-spawned
+    // grandchildren on Unix.
     unsafe {
         command.pre_exec(|| {
             // SAFETY: `setpgid(0, 0)` runs in the child process immediately
@@ -380,6 +423,8 @@ async fn kill_child_tree(child: &mut tokio::process::Child) {
 
     #[cfg(not(unix))]
     {
+        // Windows process-tree management needs Job Objects; Phase 2 keeps the
+        // documented direct-child fallback there.
         let _ = child.start_kill();
     }
 
