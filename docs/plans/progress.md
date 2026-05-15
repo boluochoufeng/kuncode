@@ -4,7 +4,7 @@
 
 ## 当前阶段
 
-Phase 0 和 Phase 1 已完成。Phase 2 的 Tool Runtime、基础工具主体和 review 修复已实现，下一步可以进入 Phase 3 的 Provider Adapter 与 FakeProvider。
+Phase 0 和 Phase 1 已完成。Phase 2 的 Tool Runtime、基础工具主体和 review 修复已实现。Phase 3 的 Provider Adapter 详细计划已落地，下一步可以开始实现 `kuncode-provider`。
 
 ## Phase 2已完成
 
@@ -42,7 +42,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 1. `docs/plans/kuncode-mvp-development-plan.md`
 2. `docs/plans/kuncode-phase2-tool-runtime-plan.md`
-3. `docs/plans/progress.md`
+3. `docs/plans/kuncode-phase3-provider-adapter-plan.md`
+4. `docs/plans/progress.md`
 
 设计和取舍类文档保留在 `docs/specs`：
 
@@ -51,6 +52,6 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 ## 后续入口
 
-1. Phase 3：实现 `ProviderAdapter`、`FakeProvider` 与 DeepSeek/OpenAI-compatible fixture。
+1. Phase 3：按 `docs/plans/kuncode-phase3-provider-adapter-plan.md` 实现 `ProviderAdapter`、一等 `DeepSeekProvider` 和通用 `OpenAiCompatibleProvider`，测试使用 wiremock fixture。
 2. Phase 4：接入 ContextBuilder 与最小 agent loop。
 3. Phase 2 后续如有行为变更，先同步 `docs/plans/kuncode-phase2-tool-runtime-plan.md` 和本进度文件，再改代码。

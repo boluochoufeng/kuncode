@@ -88,7 +88,7 @@ MVP 期实现保留了 id-only 约束（见开发计划 §6.3），但 rationale
 
 位置：[kuncode-agent-harness-design.md L373](kuncode-agent-harness-design.md#L373), [L799](kuncode-agent-harness-design.md#L799)
 
-MVP 选择见 [kuncode-mvp-development-plan.md §10](../plans/kuncode-mvp-development-plan.md)：默认不落盘；提供 `--debug-dump-provider-request` 显式打开，dump 写到 `runs/<id>/debug/` 并在日志中警告该 run 不应分享。
+MVP 选择见 [kuncode-mvp-development-plan.md §10](../plans/kuncode-mvp-development-plan.md)：provider secret 可来自环境变量或配置文件，但默认不落盘；提供 `--debug-dump-provider-request` 显式打开，dump 写到 `runs/<id>/debug/` 并在日志中警告该 run 不应分享。
 
 长期未决：是否要把 redaction 后的"安全 dump"作为常态选项，便于 bug repro 而不需要 debug flag。
 
@@ -244,7 +244,7 @@ MVP 进一步冻结为 Tokio（见 [kuncode-mvp-development-plan.md §2.4](../pl
 
 MVP 选择见 [kuncode-mvp-development-plan.md §11](../plans/kuncode-mvp-development-plan.md)：仅记录到 `ModelRequestMeta`，不进入独立事件。Phase 7 真实 smoke 后回头确认是否需要 first-class 事件。
 
-风险点：如果接入的 provider（MVP 为 DeepSeek，未来可能扩展到 reasoner / extended thinking 形态）发现 token usage 或 budget 语义需要 reasoning 独立计费，MVP 期会被迫加事件 schema。建议 Phase 7 完成立刻 review 该项。
+风险点：MVP 中 DeepSeekProvider 已涉及 thinking/reasoning metadata，后续其他 reasoner / extended thinking 形态也可能有独立计费字段。如果真实 smoke 发现 token usage 或 budget 语义需要 reasoning 独立计费，MVP 期会被迫加事件 schema。建议 Phase 7 完成立刻 review 该项。
 
 ### 19. Streaming 暂缓但 cancel token 必须支持
 
