@@ -1,0 +1,10 @@
+[package]
+name = "kuncode-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "kuncode"
+path = "src/main.rs"
+
+[dependencies]
