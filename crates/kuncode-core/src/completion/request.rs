@@ -8,7 +8,9 @@ use crate::{
     completion::{
         CompletionError,
         message::{AssistantContent, Message, ToolChoice},
+        streaming::CompletionStream,
     },
+    json_utils,
     non_empty_vec::NonEmptyVec,
 };
 
@@ -26,12 +28,47 @@ pub struct CompletionRequest {
     /// Tools the model may call. An empty list disables tool calling.
     pub tools: Vec<ToolDescriptor>,
     pub temperature: Option<f64>,
+    /// Nucleus sampling cutoff; an alternative to `temperature`.
+    pub top_p: Option<f64>,
     pub max_tokens: Option<u64>,
+    /// Sequences that halt generation when produced. `None` or an empty list
+    /// disables custom stop sequences.
+    pub stop: Option<Vec<String>>,
+    /// How hard the model should reason before answering. `None` follows the
+    /// model's default (which may be adaptive); see [`ReasoningEffort`].
+    pub reasoning: Option<ReasoningEffort>,
     pub tool_choice: Option<ToolChoice>,
     /// Provider-specific parameters merged into the outgoing payload.
-    pub additional_parmas: Option<serde_json::Value>,
+    pub additional_params: Option<serde_json::Value>,
     /// JSON Schema describing the desired structured output, if any.
     pub output_schema: Option<serde_json::Value>,
+}
+
+/// Cross-provider reasoning/thinking effort, normalized to a qualitative
+/// level.
+///
+/// The vocabulary mirrors OpenAI's effort scale, which is the most granular
+/// and which DeepSeek explicitly accepts (mapping unsupported levels onto its
+/// own). Providers approximate when their native scale is coarser — e.g.
+/// DeepSeek collapses `Minimal`/`Low`/`Medium`/`High` to `high` and `Xhigh`
+/// to `max`. Budget-based providers (Anthropic, Gemini) translate the level to
+/// an approximate token budget. Callers needing exact native control should
+/// use [`CompletionRequest::additional_params`] instead.
+///
+/// A `None` `reasoning` on the request means "use the model default"; `Off` is
+/// an explicit request to disable thinking on models that reason by default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffort {
+    /// Disable thinking entirely.
+    Off,
+    /// Emit very few or no reasoning tokens; fastest time-to-first-token.
+    Minimal,
+    Low,
+    Medium,
+    High,
+    /// Maximum reasoning depth.
+    Xhigh,
 }
 
 /// The decoded result of a completion call.
@@ -80,7 +117,7 @@ pub struct Usage {
     pub output_tokens: u64,
     pub total_tokens: u64,
     pub cached_input_tokens: u64,
-    pub cached_output_tokens: u64,
+    pub cache_creation_input_tokens: u64,
     pub reasoning_tokens: u64,
 }
 
@@ -93,7 +130,8 @@ impl Add for Usage {
             output_tokens: self.output_tokens + rhs.output_tokens,
             total_tokens: self.total_tokens + rhs.total_tokens,
             cached_input_tokens: self.cached_input_tokens + rhs.cached_input_tokens,
-            cached_output_tokens: self.cached_output_tokens + rhs.cached_output_tokens,
+            cache_creation_input_tokens: self.cache_creation_input_tokens
+                + rhs.cache_creation_input_tokens,
             reasoning_tokens: self.reasoning_tokens + rhs.reasoning_tokens,
         }
     }
@@ -105,7 +143,7 @@ impl AddAssign for Usage {
         self.output_tokens += rhs.output_tokens;
         self.total_tokens += rhs.total_tokens;
         self.cached_input_tokens += rhs.cached_input_tokens;
-        self.cached_output_tokens += rhs.cached_output_tokens;
+        self.cache_creation_input_tokens += rhs.cache_creation_input_tokens;
         self.reasoning_tokens += rhs.reasoning_tokens;
     }
 }
@@ -123,11 +161,23 @@ pub trait CompletionModel: Clone + Send + Sync {
     /// identifier.
     fn make(client: &Self::Client, model: impl Into<String>) -> Self;
 
-    /// Performs a single completion call.
+    /// Performs a single completion call, returning the whole answer at once.
     fn completion(
         &self,
         request: CompletionRequest,
-    ) -> impl std::future::Future<Output = Result<CompletionResponse<Self::Response>, CompletionError>>;
+    ) -> impl std::future::Future<
+        Output = Result<CompletionResponse<Self::Response>, CompletionError>,
+    > + Send;
+
+    /// Performs a streaming completion call.
+    ///
+    /// The returned future resolves once the connection is established (and may
+    /// fail there); the [`CompletionStream`] then yields events as tokens
+    /// arrive, ending with [`StreamEvent::Completed`](crate::completion::StreamEvent::Completed).
+    fn stream(
+        &self,
+        request: CompletionRequest,
+    ) -> impl std::future::Future<Output = Result<CompletionStream, CompletionError>> + Send;
 }
 
 /// Fluent builder for [`CompletionRequest`].
@@ -141,7 +191,10 @@ pub struct CompletionRequestBuilder {
     chat_history: Vec<Message>,
     tools: Vec<ToolDescriptor>,
     temperature: Option<f64>,
+    top_p: Option<f64>,
     max_tokens: Option<u64>,
+    stop: Option<Vec<String>>,
+    reasoning: Option<ReasoningEffort>,
     tool_choice: Option<ToolChoice>,
     additional_params: Option<serde_json::Value>,
     output_schema: Option<serde_json::Value>,
@@ -156,7 +209,10 @@ impl CompletionRequestBuilder {
             chat_history: Vec::new(),
             tools: Vec::new(),
             temperature: None,
+            top_p: None,
             max_tokens: None,
+            stop: None,
+            reasoning: None,
             tool_choice: None,
             additional_params: None,
             output_schema: None,
@@ -198,8 +254,23 @@ impl CompletionRequestBuilder {
         self
     }
 
+    pub fn top_p(mut self, top_p: Option<f64>) -> Self {
+        self.top_p = top_p;
+        self
+    }
+
     pub fn max_tokens(mut self, max_tokens: Option<u64>) -> Self {
         self.max_tokens = max_tokens;
+        self
+    }
+
+    pub fn stop(mut self, stop: Option<Vec<String>>) -> Self {
+        self.stop = stop;
+        self
+    }
+
+    pub fn reasoning(mut self, reasoning: Option<ReasoningEffort>) -> Self {
+        self.reasoning = reasoning;
         self
     }
 
@@ -214,7 +285,9 @@ impl CompletionRequestBuilder {
     /// the left-hand side (see [`merge`]).
     pub fn additional_params_merge(mut self, additional_params: serde_json::Value) -> Self {
         match self.additional_params {
-            Some(params) => self.additional_params = Some(merge(params, additional_params)),
+            Some(params) => {
+                self.additional_params = Some(json_utils::merge(params, additional_params))
+            }
             None => self.additional_params = Some(additional_params),
         }
         self
@@ -252,25 +325,13 @@ impl CompletionRequestBuilder {
             chat_history,
             tools: self.tools,
             temperature: self.temperature,
+            top_p: self.top_p,
             max_tokens: self.max_tokens,
+            stop: self.stop,
+            reasoning: self.reasoning,
             tool_choice: self.tool_choice,
-            additional_parmas: self.additional_params,
+            additional_params: self.additional_params,
             output_schema: self.output_schema,
         }
-    }
-}
-
-/// Shallow-merges JSON object `b` into `a`, with `b`'s keys taking precedence
-/// on collision. If either side is not an object the left-hand `a` is
-/// returned unchanged.
-pub fn merge(a: serde_json::Value, b: serde_json::Value) -> serde_json::Value {
-    match (a, b) {
-        (serde_json::Value::Object(mut a_map), serde_json::Value::Object(b_map)) => {
-            b_map.into_iter().for_each(|(key, value)| {
-                a_map.insert(key, value);
-            });
-            serde_json::Value::Object(a_map)
-        }
-        (a, _) => a,
     }
 }

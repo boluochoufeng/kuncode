@@ -10,3 +10,15 @@ path = "src/lib.rs"
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
+futures-core = { workspace = true }
+reqwest = { workspace = true, features = [
+    "json",
+    "stream",
+    "rustls",
+    "http2",
+] }
+
+[dev-dependencies]
+tokio = { workspace = true }
+dotenvy = { workspace = true }
