@@ -63,8 +63,7 @@
 
 仓库是一个 Cargo workspace，三个 crate 分工如下，新增代码必须落到正确的位置：
 
-- **`kuncode-core`** —— provider 无关的领域模型与抽象（消息、completion 请求/响应、trait 定义、纯数据类型）。
-  - 不做 IO、不引入具体 HTTP 客户端、不依赖任何 provider SDK。
+- **`kuncode-core`** —— 领域模型与抽象（消息、completion 请求/响应、trait 定义、纯数据类型）。HTTP 客户端、provider实现等核心能力。
   - 不依赖 `kuncode-agent` 或 `kuncode-cli`。
 - **`kuncode-agent`** —— agent 运行时与编排逻辑（循环、工具调度、与具体 LLM provider 的对接）。
   - 依赖 `kuncode-core`，可以引入 `reqwest`、`tokio` 等运行时依赖。

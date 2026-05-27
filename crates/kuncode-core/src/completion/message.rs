@@ -119,8 +119,8 @@ pub enum ToolChoice {
     None,
     /// The model must call at least one tool.
     Required,
-    /// The model must call one of the named tools.
-    Specific { function_names: Vec<String> },
+    /// The model must call one of the named tool.
+    Specific { function_name: String },
 }
 
 /// Content blocks that may appear inside an assistant-role message.
@@ -192,8 +192,12 @@ pub struct Text(String);
 
 impl Text {
     /// Returns the wrapped text as a string slice.
-    pub fn text(&self) -> &str {
+    pub fn text_ref(&self) -> &str {
         &self.0
+    }
+
+    pub fn text(self) -> String {
+        self.0
     }
 }
 
@@ -218,7 +222,7 @@ pub struct ToolCall {
     /// tampered with on resubmission.
     pub signature: Option<String>,
     /// Catch-all for provider-specific fields not modeled directly.
-    pub additional_parmas: Option<serde_json::Value>,
+    pub additional_params: Option<serde_json::Value>,
 }
 
 impl ToolCall {
@@ -229,7 +233,7 @@ impl ToolCall {
             call_id: None,
             function,
             signature: None,
-            additional_parmas: None,
+            additional_params: None,
         }
     }
 

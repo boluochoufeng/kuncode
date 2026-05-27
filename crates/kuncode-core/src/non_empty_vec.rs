@@ -52,6 +52,10 @@ impl<T: Clone> NonEmptyVec<T> {
     pub fn into_vec(self) -> Vec<T> {
         self.inner
     }
+
+    pub fn first(&self) -> &T {
+        self.inner.first().unwrap()
+    }
 }
 
 impl<T: Clone> Deref for NonEmptyVec<T> {

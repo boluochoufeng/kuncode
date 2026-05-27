@@ -8,3 +8,4 @@ name = "kuncode"
 path = "src/main.rs"
 
 [dependencies]
+kuncode-core = { path="../kuncode-core" }
