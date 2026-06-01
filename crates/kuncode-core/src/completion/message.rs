@@ -16,14 +16,21 @@ use crate::non_empty_vec::NonEmptyVec;
 #[serde(tag = "role", rename_all = "lowercase")]
 pub enum Message {
     /// System prompt that sets instructions or persona for the model.
-    System { content: String },
+    System {
+        /// System instructions sent before user turns.
+        content: String,
+    },
     /// Input from the human (or a tool result acting on the user's behalf).
-    User { content: NonEmptyVec<UserContent> },
+    User {
+        /// User-role content blocks, guaranteed non-empty.
+        content: NonEmptyVec<UserContent>,
+    },
     /// Output produced by the model.
     Assistant {
         /// Provider-assigned identifier for the assistant message, when
         /// returned. Used to correlate streaming chunks or follow-up edits.
         id: Option<String>,
+        /// Assistant-role content blocks, guaranteed non-empty.
         content: NonEmptyVec<AssistantContent>,
     },
 }
@@ -71,7 +78,9 @@ impl Message {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum UserContent {
+    /// Plain user-authored text.
     Text(Text),
+    /// Result from a tool call requested by the assistant.
     ToolResult(ToolResult),
 }
 
@@ -91,6 +100,7 @@ pub struct ToolResult {
     /// because not every provider distinguishes `id` from `call_id`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub call_id: Option<String>,
+    /// Result payload, guaranteed to contain at least one content block.
     pub content: NonEmptyVec<ToolResultContent>,
 }
 
@@ -98,6 +108,7 @@ pub struct ToolResult {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ToolResultContent {
+    /// Textual tool output.
     Text(Text),
 }
 
@@ -119,8 +130,11 @@ pub enum ToolChoice {
     None,
     /// The model must call at least one tool.
     Required,
-    /// The model must call one of the named tool.
-    Specific { function_name: String },
+    /// The model must call the named tool.
+    Specific {
+        /// Function name that must be called.
+        function_name: String,
+    },
 }
 
 /// Content blocks that may appear inside an assistant-role message.
@@ -130,8 +144,11 @@ pub enum ToolChoice {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(untagged)]
 pub enum AssistantContent {
+    /// Visible assistant answer text.
     Text(Text),
+    /// Tool call request emitted by the assistant.
     ToolCall(ToolCall),
+    /// Reasoning/thinking content returned by reasoning-capable models.
     Reasoning(Reasoning),
 }
 
@@ -196,6 +213,7 @@ impl Text {
         &self.0
     }
 
+    /// Consumes the block and returns the wrapped text.
     pub fn text(self) -> String {
         self.0
     }
@@ -217,6 +235,7 @@ pub struct ToolCall {
     pub id: String,
     /// Provider-specific secondary identifier, when the API exposes one.
     pub call_id: Option<String>,
+    /// Function name and arguments requested by the model.
     pub function: ToolFunction,
     /// Provider-issued signature used to verify the call has not been
     /// tampered with on resubmission.
@@ -247,11 +266,14 @@ impl ToolCall {
 /// The function name and JSON arguments of a [`ToolCall`].
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct ToolFunction {
+    /// Function name as declared in the matching tool descriptor.
     pub name: String,
+    /// JSON argument object produced by the model.
     pub arguments: serde_json::Value,
 }
 
 impl ToolFunction {
+    /// Creates a function call payload.
     pub fn new(name: String, arguments: serde_json::Value) -> Self {
         Self { name, arguments }
     }
@@ -262,6 +284,7 @@ impl ToolFunction {
 pub struct Reasoning {
     /// Provider-assigned identifier, when supplied.
     pub id: Option<String>,
+    /// Reasoning fragments preserved for replay to providers that require it.
     pub content: Vec<ReasoningContent>,
 }
 
@@ -337,7 +360,9 @@ impl Reasoning {
 pub enum ReasoningContent {
     /// Plain reasoning text, optionally accompanied by a provider signature.
     Text {
+        /// Plain reasoning text.
         text: String,
+        /// Provider signature that must be replayed verbatim when present.
         #[serde(skip_serializing_if = "Option::is_none")]
         signature: Option<String>,
     },
@@ -345,7 +370,10 @@ pub enum ReasoningContent {
     Encrypted(String),
     /// Reasoning the provider has redacted; the `data` blob must still be
     /// preserved and replayed.
-    Redacted { data: String },
+    Redacted {
+        /// Opaque redacted payload to preserve across turns.
+        data: String,
+    },
     /// A short summary of a longer hidden reasoning trace.
     Summary(String),
 }

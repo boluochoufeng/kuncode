@@ -1,9 +1,10 @@
-//! kuncode 的领域模型与 provider 抽象层。
+//! Domain models and provider abstractions for kuncode.
 //!
-//! [`completion`] 定义 provider 无关的对话 / 请求 / 响应类型与
-//! [`completion::CompletionModel`] trait；[`providers`] 下是具体 provider 实现
-//! （当前 DeepSeek），负责把这些类型映射到 provider 的 HTTP JSON。
-//! [`non_empty_vec`] 与 [`json_utils`] 是支撑工具。
+//! [`completion`] defines provider-agnostic conversation, request, and
+//! response types plus the [`completion::CompletionModel`] trait. [`providers`]
+//! contains concrete integrations that map those domain types to each
+//! provider's HTTP JSON. [`non_empty_vec`] and [`json_utils`] provide shared
+//! support types used by those mappings.
 
 pub mod completion;
 pub mod json_utils;

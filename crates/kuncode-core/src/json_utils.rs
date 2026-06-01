@@ -1,14 +1,16 @@
-//! 与 serde / [`serde_json::Value`] 打交道的小工具，provider 映射层反复用到。
+//! Small serde helpers reused by provider protocol mappings.
 
-/// serde `with` 适配器：把一个 [`serde_json::Value`] 当作**字符串化的 JSON**
-/// 来(反)序列化。
+/// serde `with` adapter for a [`serde_json::Value`] transported as
+/// stringified JSON.
 ///
-/// 某些 provider（如 DeepSeek 的 `function.arguments`）在 wire 上把一段 JSON 作为
-/// 字符串字段传输，而领域侧想要结构化的 [`serde_json::Value`]。用法：
-/// `#[serde(with = "json_utils::stringified_json")]`。
+/// Some providers, including DeepSeek's `function.arguments`, put JSON inside
+/// a string field on the wire while the domain layer wants structured
+/// [`serde_json::Value`]. Use as
+/// `#[serde(with = "json_utils::stringified_json")]`.
 pub mod stringified_json {
     use serde::{Deserialize, Deserializer, Serializer};
 
+    /// Serializes structured JSON as one string field.
     pub fn serialize<S>(value: &serde_json::Value, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -17,6 +19,10 @@ pub mod stringified_json {
         serializer.serialize_str(&s)
     }
 
+    /// Deserializes one string field as structured JSON.
+    ///
+    /// Empty or whitespace-only strings are treated as an empty object because
+    /// some providers emit empty argument strings for no-argument tool calls.
     pub fn deserialize<'de, D>(deserializer: D) -> Result<serde_json::Value, D::Error>
     where
         D: Deserializer<'de>,
@@ -45,12 +51,12 @@ pub fn merge(a: serde_json::Value, b: serde_json::Value) -> serde_json::Value {
     }
 }
 
-/// 反序列化一个 provider 可能发成 JSON `null`（而非数组）的 `Vec<T>`：
-/// `null` 归一成空 vec。
+/// Deserializes a `Vec<T>` from a field that providers may send as JSON
+/// `null`.
 ///
-/// 搭配字段上的 `#[serde(default)]` 使用——本函数处理「键在但为 null」，
-/// `default` 处理「键缺失」（键缺失时 serde 根本不会调用 `deserialize_with`）。
-/// 两者一起才同时覆盖这两种形态。
+/// Pair this with `#[serde(default)]` on the field: this function handles "key
+/// present but null", while `default` handles "key missing" because serde does
+/// not call `deserialize_with` for absent fields.
 pub fn null_or_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
 where
     D: serde::Deserializer<'de>,

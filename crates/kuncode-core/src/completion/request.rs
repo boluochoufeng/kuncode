@@ -27,9 +27,11 @@ pub struct CompletionRequest {
     pub chat_history: NonEmptyVec<Message>,
     /// Tools the model may call. An empty list disables tool calling.
     pub tools: Vec<ToolDescriptor>,
+    /// Sampling temperature, when the provider supports it.
     pub temperature: Option<f64>,
     /// Nucleus sampling cutoff; an alternative to `temperature`.
     pub top_p: Option<f64>,
+    /// Maximum number of output tokens to generate.
     pub max_tokens: Option<u64>,
     /// Sequences that halt generation when produced. `None` or an empty list
     /// disables custom stop sequences.
@@ -37,6 +39,7 @@ pub struct CompletionRequest {
     /// How hard the model should reason before answering. `None` follows the
     /// model's default (which may be adaptive); see [`ReasoningEffort`].
     pub reasoning: Option<ReasoningEffort>,
+    /// Tool-call policy for this request; `None` lets the provider default.
     pub tool_choice: Option<ToolChoice>,
     /// Provider-specific parameters merged into the outgoing payload.
     pub additional_params: Option<serde_json::Value>,
@@ -49,7 +52,7 @@ pub struct CompletionRequest {
 ///
 /// The vocabulary mirrors OpenAI's effort scale, which is the most granular
 /// and which DeepSeek explicitly accepts (mapping unsupported levels onto its
-/// own). Providers approximate when their native scale is coarser — e.g.
+/// own). Providers approximate when their native scale is coarser; e.g.
 /// DeepSeek collapses `Minimal`/`Low`/`Medium`/`High` to `high` and `Xhigh`
 /// to `max`. Budget-based providers (Anthropic, Gemini) translate the level to
 /// an approximate token budget. Callers needing exact native control should
@@ -64,8 +67,11 @@ pub enum ReasoningEffort {
     Off,
     /// Emit very few or no reasoning tokens; fastest time-to-first-token.
     Minimal,
+    /// Spend a small amount of effort on reasoning.
     Low,
+    /// Balanced reasoning effort.
     Medium,
+    /// Strong reasoning effort.
     High,
     /// Maximum reasoning depth.
     Xhigh,
@@ -79,16 +85,21 @@ pub enum ReasoningEffort {
 pub struct CompletionResponse<T> {
     /// Content blocks produced by the model, guaranteed non-empty.
     pub choice: NonEmptyVec<AssistantContent>,
+    /// Token accounting returned by the provider, normalized across models.
     pub usage: Usage,
     /// Untouched provider response for escape-hatch access.
     pub raw_response: T,
+    /// Provider message id, when the API exposes one distinct from the
+    /// completion-call id.
     pub message_id: Option<String>,
 }
 
 /// Function-style tool the model can call.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct ToolDescriptor {
+    /// Function name exposed to the model.
     pub name: String,
+    /// Human-readable guidance the model uses to decide when to call the tool.
     pub description: String,
     /// JSON Schema describing the tool's argument object.
     pub parameters: serde_json::Value,
@@ -113,11 +124,17 @@ pub struct ProviderToolDescriptor {
 /// streaming chunks or agentic loops) can be aggregated ergonomically.
 #[derive(Default, Debug, PartialEq, Eq, Clone, Copy, Serialize, Deserialize)]
 pub struct Usage {
+    /// Tokens consumed by prompt/context input.
     pub input_tokens: u64,
+    /// Tokens generated for the assistant response.
     pub output_tokens: u64,
+    /// Provider-reported total tokens for the request.
     pub total_tokens: u64,
+    /// Input tokens served from provider context cache.
     pub cached_input_tokens: u64,
+    /// Input tokens written into provider context cache.
     pub cache_creation_input_tokens: u64,
+    /// Output tokens spent on reasoning/thinking.
     pub reasoning_tokens: u64,
 }
 
@@ -154,7 +171,9 @@ impl AddAssign for Usage {
 /// serializable so callers can persist or replay it. `Client` is the
 /// provider-specific HTTP/SDK client used to construct model instances.
 pub trait CompletionModel: Clone + Send + Sync {
+    /// Provider-native response payload retained in [`CompletionResponse`].
     type Response: Send + Sync + Serialize + DeserializeOwned;
+    /// Provider-specific client type used to construct model handles.
     type Client;
 
     /// Constructs a model handle bound to `client` and the given model
@@ -249,31 +268,37 @@ impl CompletionRequestBuilder {
         self
     }
 
+    /// Sets sampling temperature for this request.
     pub fn temperature(mut self, temperature: Option<f64>) -> Self {
         self.temperature = temperature;
         self
     }
 
+    /// Sets nucleus sampling cutoff for this request.
     pub fn top_p(mut self, top_p: Option<f64>) -> Self {
         self.top_p = top_p;
         self
     }
 
+    /// Sets the maximum number of output tokens for this request.
     pub fn max_tokens(mut self, max_tokens: Option<u64>) -> Self {
         self.max_tokens = max_tokens;
         self
     }
 
+    /// Sets stop sequences; an empty vector is treated as unset by providers.
     pub fn stop(mut self, stop: Option<Vec<String>>) -> Self {
         self.stop = stop;
         self
     }
 
+    /// Sets cross-provider reasoning effort for this request.
     pub fn reasoning(mut self, reasoning: Option<ReasoningEffort>) -> Self {
         self.reasoning = reasoning;
         self
     }
 
+    /// Sets tool-call policy for this request.
     pub fn tool_choice(mut self, tool_choice: Option<ToolChoice>) -> Self {
         self.tool_choice = tool_choice;
         self
