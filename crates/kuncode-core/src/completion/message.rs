@@ -266,7 +266,7 @@ impl ToolCall {
 /// The function name and JSON arguments of a [`ToolCall`].
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct ToolFunction {
-    /// Function name as declared in the matching tool descriptor.
+    /// Function name as declared in the matching tool definition.
     pub name: String,
     /// JSON argument object produced by the model.
     pub arguments: serde_json::Value,

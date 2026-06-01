@@ -16,7 +16,7 @@ pub use message::{
 
 pub use request::{
     CompletionModel, CompletionRequest, CompletionRequestBuilder, CompletionResponse,
-    ProviderToolDescriptor, ReasoningEffort, ToolDescriptor, Usage,
+    ProviderToolDefinition, ReasoningEffort, ToolDefinition, Usage,
 };
 
 pub use streaming::{CompletionStream, FinishReason, StreamEvent};

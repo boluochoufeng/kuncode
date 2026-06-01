@@ -249,18 +249,18 @@ pub struct Function {
 
 /// Function-style tool exposed to the model in a request.
 ///
-/// The wire object wraps the domain descriptor as
+/// The wire object wraps the domain definition as
 /// `{ "type": "function", "function": { name, description, parameters } }`.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ToolDescriptor {
+pub struct ToolDefinition {
     /// Wire discriminator required by the OpenAI-compatible schema.
     pub r#type: String,
     /// Domain-level function metadata.
-    pub function: completion::ToolDescriptor,
+    pub function: completion::ToolDefinition,
 }
 
-impl From<completion::ToolDescriptor> for ToolDescriptor {
-    fn from(value: completion::ToolDescriptor) -> Self {
+impl From<completion::ToolDefinition> for ToolDefinition {
+    fn from(value: completion::ToolDefinition) -> Self {
         Self {
             r#type: "function".to_string(),
             function: value,
@@ -472,7 +472,7 @@ pub struct DeepSeekCompletionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     stop: Option<Stop>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    tools: Vec<ToolDescriptor>,
+    tools: Vec<ToolDefinition>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<ToolChoice>,
     // Split from the neutral reasoning effort in TryFrom.
@@ -548,7 +548,7 @@ impl TryFrom<completion::CompletionRequest> for DeepSeekCompletionRequest {
             top_p,
             // Treat an empty list as unset to avoid sending "stop": [].
             stop: req.stop.filter(|s| !s.is_empty()).map(Stop::Multi),
-            tools: req.tools.into_iter().map(ToolDescriptor::from).collect(),
+            tools: req.tools.into_iter().map(ToolDefinition::from).collect(),
             tool_choice,
             stream: None,
             stream_options: None,
