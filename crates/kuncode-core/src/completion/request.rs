@@ -26,7 +26,7 @@ pub struct CompletionRequest {
     /// Full conversation context, guaranteed to contain at least one message.
     pub chat_history: NonEmptyVec<Message>,
     /// Tools the model may call. An empty list disables tool calling.
-    pub tools: Vec<ToolDescriptor>,
+    pub tools: Vec<ToolDefinition>,
     /// Sampling temperature, when the provider supports it.
     pub temperature: Option<f64>,
     /// Nucleus sampling cutoff; an alternative to `temperature`.
@@ -96,7 +96,7 @@ pub struct CompletionResponse<T> {
 
 /// Function-style tool the model can call.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-pub struct ToolDescriptor {
+pub struct ToolDefinition {
     /// Function name exposed to the model.
     pub name: String,
     /// Human-readable guidance the model uses to decide when to call the tool.
@@ -108,7 +108,7 @@ pub struct ToolDescriptor {
 /// Provider-defined builtin tool (e.g. web search, code interpreter) that is
 /// configured rather than implemented locally.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-pub struct ProviderToolDescriptor {
+pub struct ProviderToolDefinition {
     /// Provider-specific tool kind, serialized as the `type` field.
     #[serde(rename = "type")]
     pub kind: String,
@@ -208,7 +208,7 @@ pub struct CompletionRequestBuilder {
     prompt: Message,
     request_model: Option<String>,
     chat_history: Vec<Message>,
-    tools: Vec<ToolDescriptor>,
+    tools: Vec<ToolDefinition>,
     temperature: Option<f64>,
     top_p: Option<f64>,
     max_tokens: Option<u64>,
@@ -257,13 +257,13 @@ impl CompletionRequestBuilder {
     }
 
     /// Registers a single tool the model may call.
-    pub fn tool(mut self, tool: ToolDescriptor) -> Self {
+    pub fn tool(mut self, tool: ToolDefinition) -> Self {
         self.tools.push(tool);
         self
     }
 
     /// Registers multiple tools the model may call.
-    pub fn tools(mut self, tools: impl IntoIterator<Item = ToolDescriptor>) -> Self {
+    pub fn tools(mut self, tools: impl IntoIterator<Item = ToolDefinition>) -> Self {
         self.tools.extend(tools);
         self
     }

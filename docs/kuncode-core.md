@@ -68,7 +68,7 @@ pub enum Message {
 pub struct CompletionRequest {
     pub model: Option<String>,            // None → 用模型自身的 id
     pub chat_history: NonEmptyVec<Message>,
-    pub tools: Vec<ToolDescriptor>,
+    pub tools: Vec<ToolDefinition>,
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
     pub max_tokens: Option<u64>,
@@ -109,7 +109,7 @@ pub trait CompletionModel: Clone + Send + Sync {
 }
 ```
 
-`ToolDescriptor { name, description, parameters }` 是函数式工具（本地工具）；`ProviderToolDescriptor { kind, config }` 是 provider 内置工具（如 web_search），形状由 provider 定。
+`ToolDefinition { name, description, parameters }` 是函数式工具（本地工具）；`ProviderToolDefinition { kind, config }` 是 provider 内置工具（如 web_search），形状由 provider 定。
 
 ### streaming.rs —— 流式事件
 
@@ -174,7 +174,7 @@ pub enum CompletionError {
 
 DeepSeek / OpenAI-compatible 的线上结构与 core 类型之间的双向映射：
 
-- **出站**：`From<message::Message> for Vec<Message>`（单条领域消息可拆成多条 wire 消息——user 里夹带的 tool 结果拆出来；assistant 多 content-block 合并成单条，**reasoning 拼回 `reasoning_content` 并回传**——见下方 reasoning 回传规则）、`From<completion::ToolDescriptor>`、`TryFrom<CompletionRequest> for DeepSeekCompletionRequest`。
+- **出站**：`From<message::Message> for Vec<Message>`（单条领域消息可拆成多条 wire 消息——user 里夹带的 tool 结果拆出来；assistant 多 content-block 合并成单条，**reasoning 拼回 `reasoning_content` 并回传**——见下方 reasoning 回传规则）、`From<completion::ToolDefinition>`、`TryFrom<CompletionRequest> for DeepSeekCompletionRequest`。
 - **入站**：`TryFrom<DeepSeekCompletionResponse>`（取 `choices[0]`，把 content / tool_calls / reasoning_content 还原成 `AssistantContent`）。
 - `tool_calls` 字段用 `default + deserialize_with = "null_or_vec" + skip_serializing_if`，容忍「缺失 / null / 数组」三态。
 - `function.arguments` 用 `stringified_json` 解回 `Value`。

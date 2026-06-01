@@ -161,7 +161,7 @@ impl CompletionModel for DeepSeekCompletionModel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::completion::{AssistantContent, CompletionRequestBuilder, Message, ToolDescriptor};
+    use crate::completion::{AssistantContent, CompletionRequestBuilder, Message, ToolDefinition};
 
     #[tokio::test]
     #[ignore = "hits the real DeepSeek API; requires DEEPSEEK_API_KEY"]
@@ -204,7 +204,7 @@ mod tests {
         let model = DeepSeekCompletionModel::make(&client, DEEPSEEK_V4_FLASH);
 
         // A function the model cannot answer from context alone.
-        let weather_tool = ToolDescriptor {
+        let weather_tool = ToolDefinition {
             name: "get_weather".to_string(),
             description: "Look up the current weather for a city".to_string(),
             parameters: serde_json::json!({

@@ -8,4 +8,10 @@ name = "kuncode"
 path = "src/main.rs"
 
 [dependencies]
-kuncode-core = { path="../kuncode-core" }
+kuncode-core = { path = "../kuncode-core" }
+kuncode-agent = { path = "../kuncode-agent" }
+tokio = { workspace = true, features = ["full"] }
+dotenvy = { workspace = true }
+
+[dev-dependencies]
+
