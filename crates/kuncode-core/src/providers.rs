@@ -1,6 +1,7 @@
-//! 具体 LLM provider 的实现。
+//! Concrete LLM provider integrations.
 //!
-//! 每个 provider 一个子模块，负责把 [`crate::completion`] 的 provider 无关类型
-//! 映射到该 provider 的 HTTP API。当前只有 [`deepseek`]。
+//! Each provider owns the mapping from the provider-agnostic
+//! [`crate::completion`] types to that provider's HTTP API. Currently this
+//! crate ships the [`deepseek`] integration.
 
 pub mod deepseek;

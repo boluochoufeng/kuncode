@@ -53,7 +53,10 @@ impl<T: Clone> NonEmptyVec<T> {
         self.inner
     }
 
+    /// Returns the first element.
     pub fn first(&self) -> &T {
+        // Safe by construction: every constructor and deserializer preserves
+        // the non-empty invariant.
         self.inner.first().unwrap()
     }
 }

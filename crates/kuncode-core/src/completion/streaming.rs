@@ -23,8 +23,8 @@ use crate::{
 
 /// Why the model stopped generating.
 ///
-/// The agent loop branches on this: `ToolCalls` → execute the calls and
-/// continue the turn; `Stop` → the turn is finished; `Length` → the output was
+/// The agent loop branches on this: `ToolCalls` executes the calls and
+/// continues the turn; `Stop` ends the turn; `Length` means the output was
 /// truncated at the token limit (the caller may want to continue or warn).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FinishReason {
@@ -45,7 +45,7 @@ pub enum FinishReason {
 /// The deltas (`TextDelta` / `ReasoningDelta`) are for live rendering only and
 /// carry just the newly-produced text. [`StreamEvent::Completed`] is always the
 /// final event of a successful stream and carries the **fully-assembled**
-/// message — identical in shape to what the non-streaming path returns — so the
+/// message, identical in shape to what the non-streaming path returns, so the
 /// caller never has to stitch together partial tool-call argument fragments
 /// itself.
 #[derive(Clone, Debug)]
@@ -56,20 +56,26 @@ pub enum StreamEvent {
     /// (e.g. DeepSeek's `reasoning_content`). Render in a distinct channel.
     ReasoningDelta(String),
     /// A tool call has started: its `id` and `name` are known before the
-    /// arguments finish streaming. Useful for an immediate "🔧 calling X" hint;
+    /// arguments finish streaming. Useful for an immediate "calling X" hint;
     /// the complete call (with assembled arguments) arrives in
     /// [`StreamEvent::Completed`]. `index` disambiguates parallel tool calls.
     ToolCallStart {
+        /// Position among parallel tool calls in this assistant turn.
         index: usize,
+        /// Provider tool-call identifier.
         id: String,
+        /// Function name selected by the model.
         name: String,
     },
     /// Terminal event: the stream finished successfully. Carries the assembled
     /// assistant content (text + complete tool calls + reasoning), token usage,
     /// and the stop reason.
     Completed {
+        /// Fully assembled assistant content for the turn.
         content: NonEmptyVec<AssistantContent>,
+        /// Token accounting accumulated across the stream.
         usage: Usage,
+        /// Provider stop reason normalized for agent-loop control flow.
         finish_reason: FinishReason,
     },
 }

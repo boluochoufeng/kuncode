@@ -1,14 +1,15 @@
-//! DeepSeek `/chat/completions` 的线上协议层（DeepSeek / OpenAI-compatible JSON）。
+//! DeepSeek `/chat/completions` wire protocol (DeepSeek / OpenAI-compatible JSON).
 //!
-//! 本模块的类型是 **wire DTO**，负责在 [`crate::completion`] 里 provider 无关的
-//! 领域类型与 DeepSeek 的 HTTP JSON 之间双向映射。整体形状——消息按 `role` 标签、
-//! tool-use 的建模方式、reasoning 字段、`function.arguments` 用 stringified JSON
-//! 等——**参考 `rig-core` 的 DeepSeek provider 设计**。
+//! These types are **wire DTOs** that translate between the
+//! provider-agnostic domain types in [`crate::completion`] and DeepSeek's HTTP
+//! JSON. The overall shape - role-tagged messages, tool-use modeling,
+//! reasoning fields, and stringified JSON in `function.arguments` - follows
+//! the design used by `rig-core`'s DeepSeek provider.
 //!
-//! 映射方向：
-//! - 出站：[`completion::CompletionRequest`] → [`DeepSeekCompletionRequest`]；
-//!   [`message::Message`] → `Vec<Message>`。
-//! - 入站：[`DeepSeekCompletionResponse`] → [`completion::CompletionResponse`]。
+//! Mapping directions:
+//! - outbound: [`completion::CompletionRequest`] -> [`DeepSeekCompletionRequest`];
+//!   [`message::Message`] -> `Vec<Message>`.
+//! - inbound: [`DeepSeekCompletionResponse`] -> [`completion::CompletionResponse`].
 
 use serde::{Deserialize, Serialize};
 
@@ -18,67 +19,80 @@ use crate::{
     non_empty_vec::NonEmptyVec,
 };
 
-/// 一条 DeepSeek wire 消息，按 `role` 标签序列化（`system` / `user` / `assistant` / `tool`）。
+/// DeepSeek wire message serialized by `role`.
 ///
-/// 与领域侧 [`message::Message`] 的关键区别是**结构更扁**：`content` 是纯 `String`、
-/// 工具调用平铺在 assistant 上、工具结果是独立的 `tool` 角色消息。领域侧那套
-/// 「一条消息含多个 content block」的模型由 [`From<message::Message>`](Self) 在出站时
-/// 拍扁成这套形状。
+/// This is flatter than the domain-side [`message::Message`]: `content` is a
+/// plain `String`, tool calls live directly on assistant messages, and tool
+/// results are standalone `tool` role messages. The outbound conversion from
+/// [`message::Message`] performs that flattening.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 #[serde(tag = "role", rename_all = "lowercase")]
 pub enum Message {
-    /// 系统提示。
+    /// System prompt.
     System {
+        /// Prompt text.
         content: String,
+        /// Optional speaker name accepted by OpenAI-compatible APIs.
         #[serde(skip_serializing_if = "Option::is_none")]
         name: Option<String>,
     },
 
-    /// 用户输入。工具结果不走这里，而是独立的 [`Message::ToolResult`]。
+    /// User input; tool results are represented by [`Message::ToolResult`].
     User {
+        /// User text content.
         content: String,
+        /// Optional speaker name accepted by OpenAI-compatible APIs.
         #[serde(skip_serializing_if = "Option::is_none")]
         name: Option<String>,
     },
 
-    /// 模型输出：文本 + 可选的并行 `tool_calls` + 可选 `reasoning_content`。
+    /// Assistant output: visible text plus optional tool calls and reasoning.
     Assistant {
+        /// Visible assistant text.
         content: String,
+        /// Optional speaker name accepted by OpenAI-compatible APIs.
         #[serde(skip_serializing_if = "Option::is_none")]
         name: Option<String>,
-        // DeepSeek beta「续写」：让 assistant 从给定前缀继续生成。
+        // DeepSeek beta prefix-completion mode continues generation from the
+        // supplied assistant prefix.
         #[serde(skip_serializing_if = "Option::is_none")]
         prefix: Option<bool>,
-        // DeepSeek 在无工具调用时可能省略该字段、也可能发成 null：
-        // default 兜「键缺失」，null_or_vec 兜「值为 null」，二者都归一成空 vec。
-        // skip_serializing_if 只管出站（不发空数组），与入站容错互不影响。
+        // DeepSeek may omit this field or send null when no tool call exists.
+        // `default` covers missing keys, `null_or_vec` covers explicit null,
+        // and both normalize to an empty Vec. `skip_serializing_if` is outbound
+        // only, avoiding empty arrays without weakening inbound tolerance.
         #[serde(
             default,
             deserialize_with = "json_utils::null_or_vec",
             skip_serializing_if = "Vec::is_empty"
         )]
         tool_calls: Vec<ToolCall>,
-        // 入站(解析响应)有值；出站也保留——v4 thinking mode 在工具调用的后续轮要求
-        // 把 reasoning_content 原样回传，否则 400（非工具调用轮回传则被忽略）。
+        // Present when parsing responses and intentionally preserved outbound:
+        // v4 thinking mode requires replaying reasoning_content verbatim after
+        // tool calls, otherwise the API returns 400. Non-tool follow-up turns
+        // ignore it.
         #[serde(skip_serializing_if = "Option::is_none")]
         reasoning_content: Option<String>,
     },
 
-    /// 工具执行结果。wire 上是 `role: "tool"`，靠 `tool_call_id` 关联发起它的调用。
+    /// Tool execution result correlated by `tool_call_id`.
     #[serde(rename = "tool")]
     ToolResult {
+        /// Identifier of the assistant tool call this result answers.
         tool_call_id: String,
+        /// Tool output text.
         content: String,
     },
 }
 
 impl From<message::Message> for Vec<Message> {
-    /// 把一条领域消息拍扁成若干条 wire 消息。
+    /// Flattens one domain message into one or more wire messages.
     ///
-    /// 返回 `Vec` 是因为单条领域消息可能展开成多条：user 消息里夹带的工具结果会被
-    /// 拆成独立的 `tool` 角色消息。assistant 则相反——多个 content block 合并成单条：
-    /// 文本拼接、reasoning 拼接进 `reasoning_content`、tool_calls 平铺。领域侧 assistant
-    /// 的 `id` 对 DeepSeek 无意义（它没有消息级 id），丢弃。
+    /// A user message may expand because embedded tool results must become
+    /// standalone `tool` role messages. Assistant content is merged in the
+    /// opposite direction: text blocks are concatenated, reasoning is replayed
+    /// through `reasoning_content`, and tool calls are flattened. DeepSeek has
+    /// no message-level id, so the domain assistant `id` is discarded.
     fn from(value: message::Message) -> Self {
         match value {
             message::Message::System { content } => vec![Message::System {
@@ -156,7 +170,7 @@ impl From<message::Message> for Vec<Message> {
                     content: text_content,
                     name: None,
                     prefix: None,
-                    tool_calls: tool_calls,
+                    tool_calls,
                     reasoning_content: reasoning,
                 }]
             }
@@ -166,7 +180,7 @@ impl From<message::Message> for Vec<Message> {
 
 impl From<message::ToolResult> for Message {
     fn from(value: message::ToolResult) -> Self {
-        // 拼接所有内容块（旧实现只取首块，多块时丢后续）。
+        // Join every result block so multi-block tool output is not truncated.
         let content = value
             .content
             .iter()
@@ -183,14 +197,18 @@ impl From<message::ToolResult> for Message {
     }
 }
 
-/// assistant 发起的工具调用（wire 形状）。
+/// Tool call emitted by an assistant message in DeepSeek's wire shape.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct ToolCall {
+    /// Provider tool-call identifier used by subsequent tool results.
     pub id: String,
-    // 并行调用里的序号。DeepSeek 响应/流式里带它；回传请求时并不被 schema 使用
-    // （位置靠数组顺序表达），故出站固定填 0。入站解析也不读它。
+    // Position within parallel calls. DeepSeek includes it in responses and
+    // streaming chunks; request replay uses array order instead, so outbound
+    // conversion fills 0 and inbound projection does not read it.
     pub index: usize,
+    /// Tool-call kind; currently always [`ToolType::Function`].
     pub r#type: ToolType,
+    /// Function name and arguments.
     pub function: Function,
 }
 
@@ -208,32 +226,36 @@ impl From<message::ToolCall> for ToolCall {
     }
 }
 
-/// 工具类型。DeepSeek 目前只有 `function` 一种。
+/// Tool kind; DeepSeek currently exposes only `function`.
 #[derive(Debug, Default, Serialize, Deserialize, PartialEq, Clone)]
 #[serde(rename_all = "lowercase")]
 pub enum ToolType {
+    /// Function-style tool call.
     #[default]
     Function,
 }
 
-/// 被调用的函数名与参数。
+/// Function name and arguments in a DeepSeek tool call.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct Function {
+    /// Function name selected by the model.
     pub name: String,
-    // arguments 在 wire 上是一段 **stringified JSON**（字符串里再套 JSON），用
-    // stringified_json 在序列化/反序列化时转换；领域侧 ToolFunction.arguments 是
-    // 直接的 serde_json::Value，两边字段类型对齐靠这层转换桥接。
+    // Wire arguments are stringified JSON. The domain-side
+    // ToolFunction::arguments is a structured serde_json::Value, so this
+    // adapter bridges the two field types at the protocol boundary.
     #[serde(with = "json_utils::stringified_json")]
     pub arguments: serde_json::Value,
 }
 
-/// 请求里提供给模型的函数式工具。
+/// Function-style tool exposed to the model in a request.
 ///
-/// wire 上包成 `{ "type": "function", "function": { name, description, parameters } }`，
-/// 内层直接复用领域 [`completion::ToolDescriptor`]。
+/// The wire object wraps the domain descriptor as
+/// `{ "type": "function", "function": { name, description, parameters } }`.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ToolDescriptor {
+    /// Wire discriminator required by the OpenAI-compatible schema.
     pub r#type: String,
+    /// Domain-level function metadata.
     pub function: completion::ToolDescriptor,
 }
 
@@ -246,49 +268,60 @@ impl From<completion::ToolDescriptor> for ToolDescriptor {
     }
 }
 
-/// DeepSeek 的 token 用量。
+/// DeepSeek token usage payload.
 ///
-/// 除 OpenAI 通用字段外，带 DeepSeek 专有的 `prompt_cache_hit_tokens` /
-/// `prompt_cache_miss_tokens`（缓存命中/未命中的输入 token）。
+/// In addition to OpenAI-compatible fields, DeepSeek reports cache hit/miss
+/// prompt tokens.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Usage {
+    /// Generated output tokens.
     pub completion_tokens: u32,
+    /// Prompt/context input tokens.
     pub prompt_tokens: u32,
+    /// Prompt tokens served from context cache.
     pub prompt_cache_hit_tokens: u32,
+    /// Prompt tokens not served from context cache.
     pub prompt_cache_miss_tokens: u32,
+    /// Provider-reported total token count.
     pub total_tokens: u32,
+    /// Optional output-token breakdown.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completion_tokens_details: Option<CompletionTokenDetails>,
+    /// Optional prompt-token breakdown.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_tokens_details: Option<PromptTokensDetails>,
 }
 
-/// completion 用量细分；`reasoning_tokens` 为思考阶段消耗的 token。
+/// Output-token breakdown.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CompletionTokenDetails {
+    /// Tokens spent in the model's reasoning/thinking phase.
     pub reasoning_tokens: u32,
 }
 
-/// prompt 用量细分；`cached_tokens` 为命中上下文缓存的输入 token。
+/// Prompt-token breakdown.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PromptTokensDetails {
+    /// Input tokens served from context cache.
     pub cached_tokens: u32,
 }
 
-impl Into<completion::Usage> for Usage {
-    /// 收敛成领域 [`completion::Usage`]。DeepSeek 无 Anthropic 那种 "cache creation"
-    /// 概念，故 `cache_creation_input_tokens` 恒为 0。
-    fn into(self) -> completion::Usage {
+impl From<Usage> for completion::Usage {
+    /// Projects DeepSeek usage into domain [`completion::Usage`].
+    ///
+    /// DeepSeek has no Anthropic-style "cache creation" accounting, so
+    /// `cache_creation_input_tokens` is always zero.
+    fn from(value: Usage) -> Self {
         completion::Usage {
-            input_tokens: self.prompt_tokens as u64,
-            output_tokens: self.completion_tokens as u64,
-            total_tokens: self.total_tokens as u64,
-            cached_input_tokens: self
+            input_tokens: value.prompt_tokens as u64,
+            output_tokens: value.completion_tokens as u64,
+            total_tokens: value.total_tokens as u64,
+            cached_input_tokens: value
                 .prompt_tokens_details
                 .map(|p| p.cached_tokens)
                 .unwrap_or(0) as u64,
             cache_creation_input_tokens: 0,
-            reasoning_tokens: self
+            reasoning_tokens: value
                 .completion_tokens_details
                 .map(|d| d.reasoning_tokens)
                 .unwrap_or(0) as u64,
@@ -296,31 +329,46 @@ impl Into<completion::Usage> for Usage {
     }
 }
 
-/// 一个候选回复。DeepSeek 只返回一个（n=1）。
+/// One candidate response.
 ///
-/// `finish_reason` 暂不映射到领域层——agent loop 靠 `choice` 里有没有 tool_call 来
-/// 决定是否继续，截断等情况需要时从原始响应取（见 [`DeepSeekCompletionResponse`]）。
+/// DeepSeek currently returns one candidate (`n = 1`). `finish_reason` is not
+/// normalized yet; the agent loop can branch on whether the projected choice
+/// contains tool calls, and callers that care about truncation can inspect the
+/// raw [`DeepSeekCompletionResponse`].
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Choice {
+    /// Provider stop reason string.
     pub finish_reason: String,
+    /// Candidate index in the provider response.
     pub index: usize,
+    /// Assistant message payload.
     pub message: Message,
+    /// Optional logprob data when requested through provider-specific params.
     pub logprobs: Option<serde_json::Value>,
 }
 
-/// DeepSeek `/chat/completions` 的响应体。
+/// DeepSeek `/chat/completions` response body.
 ///
-/// `id` 是**这次 completion 调用**的 id（`chatcmpl-…` 那类），不是消息级 id，故
-/// **不**映射到领域 [`completion::CompletionResponse::message_id`]（那个表示 OpenAI
-/// Responses 风格的逐消息 id）；需要这个调用 id 时从 `raw_response` 取。
+/// `id` identifies the completion call itself (the `chatcmpl-...` style id),
+/// not a message. It is therefore not mapped to
+/// [`completion::CompletionResponse::message_id`], which represents
+/// OpenAI-Responses-style message ids. Callers that need this call id can read
+/// it from `raw_response`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DeepSeekCompletionResponse {
+    /// Provider completion-call id.
     pub id: String,
+    /// Candidate responses; DeepSeek normally returns one.
     pub choices: Vec<Choice>,
+    /// Provider creation timestamp.
     pub created: u64,
+    /// Model id that served the request.
     pub model: String,
+    /// Provider backend fingerprint.
     pub system_fingerprint: String,
+    /// OpenAI-compatible object type.
     pub object: String,
+    /// Token accounting for the call.
     pub usage: Usage,
 }
 
@@ -329,15 +377,15 @@ impl TryFrom<DeepSeekCompletionResponse>
 {
     type Error = completion::CompletionError;
 
-    /// 取唯一 choice（DeepSeek n=1），把 assistant 的 content / tool_calls /
-    /// reasoning_content 还原成领域 [`AssistantContent`]。
+    /// Projects the first DeepSeek choice into domain assistant content.
     ///
     /// # Errors
     ///
-    /// 响应没有 choice、choice 不是 assistant 消息，或还原后内容为空（被
-    /// [`NonEmptyVec`] 拒绝）时返回 [`CompletionError::ResponseError`]。
+    /// Returns [`CompletionError::ResponseError`] if the response has no
+    /// choices, the first choice is not an assistant message, or the projected
+    /// assistant content is empty and rejected by [`NonEmptyVec`].
     fn try_from(response: DeepSeekCompletionResponse) -> Result<Self, Self::Error> {
-        // 当前DeepSeek 仅支持 n=1，也就是返回一个choice
+        // DeepSeek currently supports n=1, so the first choice is the only one.
         let choice = response.choices.first().ok_or_else(|| {
             CompletionError::ResponseError("Response didn't contain any choice".to_string())
         })?;
@@ -355,7 +403,7 @@ impl TryFrom<DeepSeekCompletionResponse>
                 } else {
                     vec![completion::AssistantContent::text(content)]
                 };
-                content.extend(tool_calls.into_iter().map(|tool_call| {
+                content.extend(tool_calls.iter().map(|tool_call| {
                     completion::AssistantContent::tool_call(
                         &tool_call.id,
                         &tool_call.function.name,
@@ -376,7 +424,7 @@ impl TryFrom<DeepSeekCompletionResponse>
         let choice = NonEmptyVec::<AssistantContent>::try_from(content).map_err(|err| {
             CompletionError::ResponseError(format!(
                 "Response didn't contain any assistant message: {}",
-                err.to_string()
+                err
             ))
         })?;
 
@@ -389,27 +437,30 @@ impl TryFrom<DeepSeekCompletionResponse>
     }
 }
 
-/// DeepSeek `/chat/completions` 的请求体。
+/// DeepSeek `/chat/completions` request body.
 ///
-/// **注意：本结构体不是 DeepSeek 线上格式的完整契约，这是有意取舍。** 它只建模
-/// 两类字段：
+/// This intentionally is not the full DeepSeek wire contract. It models only
+/// two groups of fields:
 ///
-/// - **映射组**：由 `TryFrom<CompletionRequest>` 从通用一等字段填入。其中
-///   `thinking` + `reasoning_effort` 由中立的 `reasoning` 档位一拆为二而来。
-/// - **控制组**：由调用的是 `completion()` 还是流式方法决定，不接受外部传入。
+/// - **mapped fields** populated from provider-agnostic request fields by
+///   `TryFrom<CompletionRequest>`. `thinking` and `reasoning_effort` are split
+///   from the neutral `reasoning` effort.
+/// - **control fields** chosen by whether the caller invokes `completion()` or
+///   the streaming path, not by external input.
 ///
-/// 其余 DeepSeek 专有且少用的参数（如 `logprobs`、`top_logprobs`、`user_id`）
-/// **刻意不在此声明**；要用它们，由调用方塞进 `CompletionRequest::additional_params`，
-/// 在 `completion()` 把本结构体序列化成 JSON 后用 `json_utils::merge` 叠加进去
-/// （用户提供的同名键会覆盖这里的值）抵达 API。
+/// Less common DeepSeek-specific parameters such as `logprobs`,
+/// `top_logprobs`, or `user_id` are intentionally left out. Callers can place
+/// them in [`completion::CompletionRequest::additional_params`], which is
+/// shallow-merged into the serialized request body before dispatch; caller
+/// keys win on collision.
 ///
-/// 因此放弃了两点“struct 即 wire 契约”的好处：
-/// - 仅看本 struct **无法**得知 DeepSeek 支持的全部参数；
-/// - **无法**仅凭本类型对“发出去的精确 JSON”做强类型断言——真正的请求体是
-///   序列化结果再 merge 之后的 `serde_json::Value`。
+/// This trades away two conveniences: the struct alone does not reveal every
+/// DeepSeek parameter, and the exact outgoing JSON cannot be asserted solely
+/// from this type because the final payload is the serialized value after
+/// `additional_params` are merged in.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DeepSeekCompletionRequest {
-    // —— 映射组：从 CompletionRequest 的一等字段而来 ——
+    // Mapped fields from CompletionRequest.
     model: String,
     messages: Vec<Message>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -424,15 +475,15 @@ pub struct DeepSeekCompletionRequest {
     tools: Vec<ToolDescriptor>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<ToolChoice>,
-    // thinking + reasoning_effort：由中立 reasoning 档位拆出（见 TryFrom）。
+    // Split from the neutral reasoning effort in TryFrom.
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<Thinking>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<ReasoningEffort>,
-    // response_format：DeepSeek 仅支持 json_object，不支持传 schema；可考虑从 output_schema 派生。
+    // DeepSeek supports only json_object, not full schema transport.
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<ResponseFormat>,
-    // —— 控制组：由调用方法（completion / stream）决定，不接受外部传入 ——
+    // Control fields chosen by the calling method (completion / stream).
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -453,7 +504,7 @@ impl TryFrom<completion::CompletionRequest> for DeepSeekCompletionRequest {
         let chat_history: Vec<Message> = req
             .chat_history
             .into_iter()
-            .map(|msg| Vec::<Message>::from(msg))
+            .map(Vec::<Message>::from)
             .collect::<Vec<Vec<Message>>>()
             .into_iter()
             .flatten()
@@ -461,9 +512,10 @@ impl TryFrom<completion::CompletionRequest> for DeepSeekCompletionRequest {
 
         let tool_choice = req.tool_choice.map(ToolChoice::from);
 
-        // 把reasoning 档位拆成 DeepSeek 的两个 wire 字段：
-        // thinking 开关 + reasoning_effort 强度。DeepSeek 只有 high/max 两档，
-        // minimal/low/medium/high 一律塌缩到 high，xhigh→max。
+        // Split the neutral reasoning effort into DeepSeek's two wire fields:
+        // the thinking toggle and reasoning_effort strength. DeepSeek exposes
+        // only high/max, so minimal/low/medium/high collapse to high and xhigh
+        // maps to max.
         use completion::ReasoningEffort as Eff;
         let (thinking, reasoning_effort) = match req.reasoning {
             None => (None, None),
@@ -474,9 +526,9 @@ impl TryFrom<completion::CompletionRequest> for DeepSeekCompletionRequest {
             Some(Eff::Xhigh) => (Some(Thinking::Enabled), Some(ReasoningEffort::Max)),
         };
 
-        // 思考模式下 DeepSeek 会忽略 temperature/top_p（设了也不生效）。这里主动
-        // 清掉它们，与将来 OpenAI/Anthropic（设了会直接报错）保持同一处理范式：
-        // “开启思考即清采样参数”，差别只在别家不清会 400。
+        // DeepSeek ignores temperature/top_p when thinking is enabled. Dropping
+        // them here keeps the provider behavior aligned with APIs that reject
+        // sampling parameters in reasoning mode.
         let (temperature, top_p) = if matches!(thinking, Some(Thinking::Enabled)) {
             if req.temperature.is_some() || req.top_p.is_some() {
                 tracing::warn!(
@@ -494,7 +546,7 @@ impl TryFrom<completion::CompletionRequest> for DeepSeekCompletionRequest {
             max_tokens: req.max_tokens.map(|t| t as u32),
             temperature,
             top_p,
-            // 空列表视作未设置，避免发出 "stop": []
+            // Treat an empty list as unset to avoid sending "stop": [].
             stop: req.stop.filter(|s| !s.is_empty()).map(Stop::Multi),
             tools: req.tools.into_iter().map(ToolDescriptor::from).collect(),
             tool_choice,
@@ -507,64 +559,87 @@ impl TryFrom<completion::CompletionRequest> for DeepSeekCompletionRequest {
     }
 }
 
-/// 思考开关（wire 上是 `thinking.type`）。
+/// Thinking toggle serialized as `thinking.type`.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Thinking {
+    /// Enable DeepSeek thinking mode.
     Enabled,
+    /// Disable DeepSeek thinking mode.
     Disabled,
 }
 
-/// DeepSeek 的思考强度，只有两档；中立的 [`completion::ReasoningEffort`] 会塌缩到这里。
+/// DeepSeek reasoning strength after neutral effort levels are collapsed.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningEffort {
+    /// DeepSeek's lower available reasoning strength.
     High,
+    /// DeepSeek's maximum reasoning strength.
     Max,
 }
 
-/// 输出格式。DeepSeek 仅支持 `text` / `json_object`（不支持传 JSON Schema）。
+/// Output format accepted by DeepSeek.
+///
+/// DeepSeek supports `text` and `json_object`; it does not accept a JSON
+/// Schema payload.
 #[derive(Debug, Serialize, Deserialize, Default)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseFormat {
+    /// Plain text output.
     #[default]
     Text,
+    /// JSON object mode.
     JsonObject,
 }
 
-/// 停止序列：单个字符串或一组字符串。`untagged` 让两种形态都能直接序列化。
+/// Stop sequence, either a single string or multiple strings.
+///
+/// `untagged` preserves the two DeepSeek-supported wire shapes.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Stop {
+    /// One stop sequence.
     Single(String),
+    /// Multiple stop sequences.
     Multi(Vec<String>),
 }
 
-/// 流式选项；`include_usage` 让流的最后一帧带上 usage 统计。
+/// Streaming options.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StreamOptions {
+    /// Include usage accounting in the final stream frame.
     include_usage: bool,
 }
 
-/// 工具调用策略。
+/// Tool-call policy.
 ///
-/// `Function` 变体 `untagged` 成 `{ "type": "function", "function": { "name": ... } }`，
-/// 其余三个简单变体序列化成字符串 `"none"` / `"auto"` / `"required"`。
+/// The `Function` variant serializes as
+/// `{ "type": "function", "function": { "name": ... } }`; the other variants
+/// serialize as `"none"`, `"auto"`, or `"required"`.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ToolChoice {
+    /// Disable tool calls.
     None,
+    /// Let the model decide whether to call tools.
     Auto,
+    /// Require at least one tool call.
     Required,
+    /// Require a specific function.
     #[serde(untagged)]
     Function(ToolChoiceFunction),
 }
 
-/// 指定模型必须调用的具体函数。
+/// Specific function the model must call.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", content = "function", rename_all = "lowercase")]
 pub enum ToolChoiceFunction {
-    Function { name: String },
+    /// Function constraint payload.
+    Function {
+        /// Required function name.
+        name: String,
+    },
 }
 
 impl From<message::ToolChoice> for ToolChoice {
@@ -588,9 +663,10 @@ mod tests {
     use crate::completion::message as dm;
     use crate::non_empty_vec::NonEmptyVec;
 
-    /// 一条 user 消息混含 Text / ToolResult 时：tool 结果**排在前**（wire 要求 tool
-    /// 消息紧跟带 tool_calls 的 assistant 之后，中间不能插 user 文本），user 文本合并
-    /// 后随其后。
+    /// A mixed user message emits tool results first, then merged user text.
+    ///
+    /// DeepSeek requires `tool` messages to immediately follow the assistant
+    /// message that contained `tool_calls`; user text cannot sit in between.
     #[test]
     fn user_message_emits_tool_results_before_merged_text() {
         let domain = dm::Message::User {
@@ -609,7 +685,7 @@ mod tests {
 
         let wire = Vec::<Message>::from(domain);
 
-        assert_eq!(wire.len(), 2, "tool 一条 + 合并文本一条");
+        assert_eq!(wire.len(), 2, "one tool message plus one merged user text");
         match &wire[0] {
             Message::ToolResult {
                 tool_call_id,
@@ -618,16 +694,17 @@ mod tests {
                 assert_eq!(tool_call_id.as_str(), "call_1");
                 assert_eq!(content.as_str(), "r");
             }
-            other => panic!("[0] 期望 ToolResult，得到 {other:?}"),
+            other => panic!("[0] expected ToolResult, got {other:?}"),
         }
         match &wire[1] {
-            // 文本块按出现次序合并（"a" 与 "b" 之间隔着 tool 结果，仍合并成一条）
+            // Text blocks are merged in their original order, even when a tool
+            // result sits between them in the domain message.
             Message::User { content, .. } => assert_eq!(content.as_str(), "a\nb"),
-            other => panic!("[1] 期望 User，得到 {other:?}"),
+            other => panic!("[1] expected User, got {other:?}"),
         }
     }
 
-    /// ToolResult 含多个内容块时，出站应拼接**全部**块，而非只取首块。
+    /// Multi-block tool results are fully joined, not truncated to the first block.
     #[test]
     fn tool_result_joins_all_content_blocks() {
         let domain = dm::ToolResult {
@@ -647,11 +724,11 @@ mod tests {
                 assert_eq!(tool_call_id.as_str(), "call_1");
                 assert_eq!(content.as_str(), "line1\nline2");
             }
-            other => panic!("期望 ToolResult，得到 {other:?}"),
+            other => panic!("expected ToolResult, got {other:?}"),
         }
     }
 
-    /// assistant 的 reasoning 出站应拼回 `reasoning_content`（v4 工具轮要求回传）。
+    /// Assistant reasoning is replayed through `reasoning_content`.
     #[test]
     fn assistant_reasoning_is_sent_back() {
         let domain = dm::Message::Assistant {
@@ -674,7 +751,7 @@ mod tests {
                 assert_eq!(content.as_str(), "answer");
                 assert_eq!(reasoning_content.as_deref(), Some("my thoughts"));
             }
-            other => panic!("期望 Assistant，得到 {other:?}"),
+            other => panic!("expected Assistant, got {other:?}"),
         }
     }
 }
