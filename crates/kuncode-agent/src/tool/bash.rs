@@ -100,8 +100,8 @@ impl TypedTool for Bash {
             }
         };
 
-        let (stdout, stdout_truncated) = output_text(&output.stdout);
-        let (stderr, stderr_truncated) = output_text(&output.stderr);
+        let (stdout, stdout_truncated) = output_text("stdout", &output.stdout);
+        let (stderr, stderr_truncated) = output_text("stderr", &output.stderr);
         let truncated = stdout_truncated || stderr_truncated;
         let ok = output.status.success();
         let exit_code = output.status.code();
@@ -130,15 +130,27 @@ impl TypedTool for Bash {
     }
 }
 
-fn output_text(bytes: &[u8]) -> (String, bool) {
-    let truncated = bytes.len() > OUTPUT_LIMIT_BYTES;
-    let bytes = if truncated {
-        &bytes[..OUTPUT_LIMIT_BYTES]
-    } else {
-        bytes
-    };
+/// Decodes a captured stream, capping it at `OUTPUT_LIMIT_BYTES`. Bash output
+/// may not be valid UTF-8, so decoding is intentionally lossy (`from_utf8_lossy`).
+///
+/// When the cap trips, a visible marker is appended naming the stream and the
+/// byte scale, so the model knows it holds only the head of the stream and must
+/// not assume it saw everything. How to get the rest (filter, redirect, re-run)
+/// is left to the model — bash is a general shell.
+fn output_text(stream: &str, bytes: &[u8]) -> (String, bool) {
+    if bytes.len() <= OUTPUT_LIMIT_BYTES {
+        return (String::from_utf8_lossy(bytes).into_owned(), false);
+    }
 
-    (String::from_utf8_lossy(bytes).into_owned(), truncated)
+    // Slicing a byte slice at an arbitrary index never splits a `char` (that is
+    // a `str` concern); `from_utf8_lossy` turns any partial trailing sequence
+    // into U+FFFD, so the result is always valid UTF-8.
+    let mut text = String::from_utf8_lossy(&bytes[..OUTPUT_LIMIT_BYTES]).into_owned();
+    text.push_str(&format!(
+        "\n…⟨kuncode: {stream} truncated — showed first {OUTPUT_LIMIT_BYTES} of {total} bytes⟩",
+        total = bytes.len(),
+    ));
+    (text, true)
 }
 
 fn blocked_pattern(cmd: &str) -> Option<&'static str> {
@@ -227,6 +239,28 @@ mod tests {
                 "expected `{cmd}` to be allowed"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn truncates_oversized_output_with_a_visible_marker() {
+        let workspace = Workspace::new(std::env::current_dir().expect("current directory exists"))
+            .await
+            .expect("workspace should be valid");
+        // Emit well over OUTPUT_LIMIT_BYTES of pure `x` on stdout.
+        let out = Bash::new(workspace)
+            .call(serde_json::json!({ "cmd": "printf 'x%.0s' {1..30000}" }))
+            .await
+            .expect("no harness-level error");
+
+        assert!(out.ok);
+        assert!(out.truncated);
+        let stdout = out.data.expect("data present")["stdout"]
+            .as_str()
+            .expect("stdout is a string")
+            .to_string();
+        // The capped prefix is preserved and a marker names the stream + scale.
+        assert!(stdout.starts_with(&"x".repeat(super::OUTPUT_LIMIT_BYTES)));
+        assert!(stdout.contains("stdout truncated"));
     }
 
     #[tokio::test]

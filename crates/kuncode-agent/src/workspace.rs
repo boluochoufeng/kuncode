@@ -67,12 +67,12 @@ impl Workspace {
         path: impl AsRef<Path>,
     ) -> Result<PathBuf, WorkspaceError> {
         let candidate = self.candidate(path.as_ref());
-        let resolved = tokio::fs::canonicalize(&candidate).await.map_err(|source| {
-            WorkspaceError::CanonicalizePath {
+        let resolved = tokio::fs::canonicalize(&candidate)
+            .await
+            .map_err(|source| WorkspaceError::CanonicalizePath {
                 path: candidate.clone(),
                 source,
-            }
-        })?;
+            })?;
 
         self.ensure_inside(resolved)
     }

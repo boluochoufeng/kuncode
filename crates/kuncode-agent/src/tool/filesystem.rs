@@ -28,9 +28,10 @@ const MAX_GLOB_LIMIT: usize = 1_000;
 pub struct ReadFileArgs {
     /// Workspace-relative or absolute path to an existing UTF-8 file.
     path: String,
-    /// Zero-based line offset where reading starts.
+    /// One-based line number to start reading from. Defaults to `1` (the first
+    /// line). Feed back the `next_line` from a previous result to paginate.
     #[serde(default)]
-    offset: Option<usize>,
+    start_line: Option<usize>,
     /// Maximum number of lines to return.
     #[serde(default)]
     limit: Option<usize>,
@@ -44,31 +45,33 @@ pub struct ReadFileOutput {
     /// File content, sliced by line range and bounded by byte/line caps.
     pub content: String,
     /// One-based line number of the first returned line; `0` when nothing was
-    /// returned (e.g. `offset` is past the end of the file).
+    /// returned (e.g. `start_line` is past the end of the file).
     pub start_line: usize,
     /// Number of lines returned in [`Self::content`].
     pub returned_lines: usize,
     /// `true` when more *lines* follow the returned range. This is the vertical
     /// pagination axis only: it never refers to a partial line, and re-reading
-    /// at [`Self::next_offset`] resumes at the next whole line (see
+    /// at [`Self::next_line`] resumes at the next whole line (see
     /// [`Self::truncated_lines`] for tails dropped *within* a line). Exact total
     /// line count is intentionally not reported, since it would require reading
     /// the whole file even for a small slice.
     pub has_more: bool,
-    /// Offset to pass back as `offset` to continue reading where this call left
-    /// off. Present only when [`Self::has_more`] is `true`.
+    /// One-based line number to pass back as `start_line` to continue reading
+    /// where this call left off. Present only when [`Self::has_more`] is `true`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub next_offset: Option<usize>,
-    /// One-based line numbers, among the returned lines, whose tail was dropped
-    /// to fit `MAX_LINE_BYTES`. These lines are INCOMPLETE: the elided tail is
-    /// not in `content` and — unlike [`Self::has_more`] — is *not* reachable via
-    /// [`Self::next_offset`], which only advances by whole lines. Recover it
-    /// another way (e.g. `grep`). Omitted when every returned line is intact.
+    pub next_line: Option<usize>,
+    /// One-based *file* line numbers (the same numbering as [`Self::start_line`])
+    /// whose tail was dropped to fit `MAX_LINE_BYTES`. These lines are
+    /// INCOMPLETE: the elided tail is not in `content` and — unlike
+    /// [`Self::has_more`] — is *not* reachable via [`Self::next_line`], which
+    /// only advances by whole lines. Recover it another way (e.g. `grep`).
+    /// Omitted when every returned line is intact.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub truncated_lines: Vec<usize>,
 }
 
 /// Reads UTF-8 files from the workspace.
+/// TODO: Add line numbers to the content read.
 #[derive(Clone, Debug)]
 pub struct ReadFile {
     definition: ToolDefinition,
@@ -115,7 +118,13 @@ impl TypedTool for ReadFile {
             );
         }
 
-        let offset = args.offset.unwrap_or(0);
+        let start_line = args.start_line.unwrap_or(1);
+        if start_line == 0 {
+            return ToolOutput::failure(
+                "invalid_arguments",
+                "`start_line` is 1-based and must be greater than zero",
+            );
+        }
         if matches!(args.limit, Some(0)) {
             return ToolOutput::failure("invalid_arguments", "`limit` must be greater than zero");
         }
@@ -126,12 +135,13 @@ impl TypedTool for ReadFile {
         };
         let mut lines = BufReader::new(file).lines();
 
-        // Skip `offset` lines without keeping them. Cost is proportional to
-        // `offset`, not file size; nothing past the requested window is read.
-        for _ in 0..offset {
+        // Skip the lines before `start_line` without keeping them. Cost is
+        // proportional to `start_line`, not file size; nothing past the
+        // requested window is read.
+        for _ in 0..(start_line - 1) {
             match lines.next_line().await {
                 Ok(Some(_)) => {}
-                // `offset` is past EOF: there is simply nothing to return.
+                // `start_line` is past EOF: there is simply nothing to return.
                 Ok(None) => break,
                 Err(err) => return io_error("read", &resolved, err, &self.workspace),
             }
@@ -139,18 +149,26 @@ impl TypedTool for ReadFile {
 
         let mut collected = Vec::new();
         let mut used_bytes = 0usize;
-        // The *horizontal* truncation axis: one-based line numbers whose tail we
-        // dropped to fit `MAX_LINE_BYTES`. Lossy and — unlike `has_more` /
-        // `next_offset` — NOT recoverable by paginating.
+        // The *horizontal* truncation axis: one-based file line numbers (same
+        // numbering as `start_line`) whose tail we dropped to fit
+        // `MAX_LINE_BYTES`. Lossy and — unlike `has_more` / `next_line` — NOT
+        // recoverable by paginating.
         let mut truncated_lines: Vec<usize> = Vec::new();
         let mut has_more = false;
 
         loop {
             // Stop once the line budget is met, peeking one line ahead so the
             // caller learns whether more lines remain. This is the *vertical*
-            // axis: lossless, the next read at `next_offset` resumes here.
+            // axis: lossless, the next read at `next_line` resumes here.
             if args.limit.is_some_and(|limit| collected.len() >= limit) {
-                has_more = matches!(lines.next_line().await, Ok(Some(_)));
+                // A read error while peeking is a real failure (e.g. invalid
+                // UTF-8 on the next line), not EOF — surface it like every other
+                // read instead of reporting a false end-of-file via `has_more`.
+                has_more = match lines.next_line().await {
+                    Ok(Some(_)) => true,
+                    Ok(None) => false,
+                    Err(err) => return io_error("read", &resolved, err, &self.workspace),
+                };
                 break;
             }
 
@@ -181,7 +199,7 @@ impl TypedTool for ReadFile {
             // sub-lines (`41.1`, `41.2`) that fold the tail back onto the
             // vertical pagination axis — is worth the line-numbering complexity.
             if line_truncated {
-                truncated_lines.push(offset + collected.len() + 1);
+                truncated_lines.push(start_line + collected.len());
                 line.push_str(&line_truncated_marker(raw_bytes - line.len()));
             }
 
@@ -190,20 +208,24 @@ impl TypedTool for ReadFile {
         }
 
         let returned_lines = collected.len();
-        let next_offset = has_more.then_some(offset + returned_lines);
+        let next_line = has_more.then_some(start_line + returned_lines);
         let truncated = !truncated_lines.is_empty();
 
         let output = ToolOutput::success(ReadFileOutput {
             path: self.workspace.relative_display(&resolved),
             content: collected.join("\n"),
-            start_line: if returned_lines == 0 { 0 } else { offset + 1 },
+            start_line: if returned_lines == 0 { 0 } else { start_line },
             returned_lines,
             has_more,
-            next_offset,
+            next_line,
             truncated_lines,
         });
 
-        if truncated { output.truncated() } else { output }
+        if truncated {
+            output.truncated()
+        } else {
+            output
+        }
     }
 }
 
@@ -562,7 +584,7 @@ fn io_error<D>(kind: &str, path: &Path, err: io::Error, workspace: &Workspace) -
 
 /// Inline marker appended to a line whose tail was dropped to fit
 /// `MAX_LINE_BYTES`. Deliberately explicit: the elided tail is neither in the
-/// returned content nor reachable via `next_offset` (which advances by whole
+/// returned content nor reachable via `next_line` (which advances by whole
 /// lines), so the model is told to recover it another way rather than re-read.
 fn line_truncated_marker(elided_bytes: usize) -> String {
     format!(
@@ -653,7 +675,9 @@ fn walk_workspace(workspace: &Workspace, include_ignored: bool) -> Vec<String> {
         // `read_file`/`write_file` will actually act on; escaping and dangling
         // links are dropped. The `canonicalize` cost lands only on links, which
         // are rare, and we are already on the blocking pool.
-        if entry.file_type().is_some_and(|file_type| file_type.is_symlink())
+        if entry
+            .file_type()
+            .is_some_and(|file_type| file_type.is_symlink())
             && !std::fs::canonicalize(path).is_ok_and(|target| target.starts_with(root))
         {
             continue;
@@ -792,7 +816,7 @@ mod tests {
         let output = tool
             .call(serde_json::json!({
                 "path": "notes.txt",
-                "offset": 1,
+                "start_line": 2,
                 "limit": 1
             }))
             .await
@@ -806,9 +830,10 @@ mod tests {
         assert_eq!(data["content"], "two");
         assert_eq!(data["start_line"], 2);
         assert_eq!(data["returned_lines"], 1);
-        // A line still follows the window, so the model can paginate.
+        // A line still follows the window, so the model can paginate: the next
+        // read resumes at line 3 (`three`).
         assert_eq!(data["has_more"], true);
-        assert_eq!(data["next_offset"], 2);
+        assert_eq!(data["next_line"], 3);
     }
 
     #[tokio::test]
@@ -829,18 +854,18 @@ mod tests {
         assert_eq!(data["start_line"], 1);
         assert_eq!(data["returned_lines"], 2);
         assert_eq!(data["has_more"], false);
-        // `next_offset` is omitted once the whole file has been read.
-        assert!(data["next_offset"].is_null());
+        // `next_line` is omitted once the whole file has been read.
+        assert!(data["next_line"].is_null());
     }
 
     #[tokio::test]
-    async fn read_file_offset_past_end_returns_empty() {
+    async fn read_file_start_past_end_returns_empty() {
         let tmp = TestDir::new();
         fs::write(tmp.path().join("notes.txt"), "a\nb").expect("file should be written");
         let tool = ReadFile::new(tmp.workspace().await);
 
         let output = tool
-            .call(serde_json::json!({ "path": "notes.txt", "offset": 5 }))
+            .call(serde_json::json!({ "path": "notes.txt", "start_line": 6 }))
             .await
             .expect("no harness-level error");
 
@@ -933,7 +958,8 @@ mod tests {
         // 50 lines * 1000 bytes fills the budget; the rest spills to a next read.
         assert_eq!(data["returned_lines"], 50);
         assert_eq!(data["has_more"], true);
-        assert_eq!(data["next_offset"], 50);
+        // 50 lines read starting at line 1, so the next read resumes at line 51.
+        assert_eq!(data["next_line"], 51);
         // No line lost its tail, so the horizontal axis is empty/omitted.
         assert!(data["truncated_lines"].is_null());
     }
@@ -944,7 +970,7 @@ mod tests {
         let long_line = "x".repeat(MAX_LINE_BYTES + 500);
         // A truncated line sits in the *middle* of the window, with a line after
         // it — the case where a single `truncated` boolean would mislead the
-        // model into thinking `next_offset` recovers the lost tail.
+        // model into thinking `next_line` recovers the lost tail.
         fs::write(
             tmp.path().join("mixed.txt"),
             format!("head\n{long_line}\ntail\n"),
@@ -969,10 +995,51 @@ mod tests {
                 .expect("content is a string")
                 .contains("line truncated")
         );
-        // Vertical: `next_offset` points at the *next line* (`tail`), never at
+        // Vertical: `next_line` points at the *next line* 3 (`tail`), never at
         // the truncated line's missing tail.
         assert_eq!(data["has_more"], true);
-        assert_eq!(data["next_offset"], 2);
+        assert_eq!(data["next_line"], 3);
+    }
+
+    #[tokio::test]
+    async fn read_file_surfaces_a_read_error_while_peeking_for_more() {
+        let tmp = TestDir::new();
+        // The first line is valid UTF-8; the next line is not. Reading with
+        // `limit: 1` collects line 1, then peeks line 2 to set `has_more` — the
+        // peek must surface the decode error, not report a clean end-of-file.
+        fs::write(
+            tmp.path().join("mixed.bin"),
+            [b'o', b'k', b'\n', 0xff, 0xfe],
+        )
+        .expect("file should be written");
+        let tool = ReadFile::new(tmp.workspace().await);
+
+        let output = tool
+            .call(serde_json::json!({ "path": "mixed.bin", "limit": 1 }))
+            .await
+            .expect("no harness-level error");
+
+        assert!(!output.ok);
+        assert_eq!(output.error.expect("error present").kind, "read");
+    }
+
+    #[tokio::test]
+    async fn read_file_rejects_zero_start_line() {
+        let tmp = TestDir::new();
+        fs::write(tmp.path().join("notes.txt"), "a\nb").expect("file should be written");
+        let tool = ReadFile::new(tmp.workspace().await);
+
+        // `start_line` is 1-based; `0` is a contract violation, not "line 0".
+        let output = tool
+            .call(serde_json::json!({ "path": "notes.txt", "start_line": 0 }))
+            .await
+            .expect("no harness-level error");
+
+        assert!(!output.ok);
+        assert_eq!(
+            output.error.expect("error present").kind,
+            "invalid_arguments"
+        );
     }
 
     #[tokio::test]
@@ -1165,7 +1232,10 @@ mod tests {
         assert!(output.ok);
         let data = output.data.expect("data present");
         // The escape hatch reaches files the project ignores by default.
-        assert_eq!(data["matches"], serde_json::json!(["build/out.rs", "keep.rs"]));
+        assert_eq!(
+            data["matches"],
+            serde_json::json!(["build/out.rs", "keep.rs"])
+        );
         assert_eq!(data["total_matches"], 2);
     }
 
@@ -1183,8 +1253,11 @@ mod tests {
         fs::write(&outside, "").expect("outside file should be written");
         fs::write(tmp.path().join("keep.rs"), "").expect("file should be written");
         symlink(&outside, tmp.path().join("escape_link.rs")).expect("symlink should be created");
-        symlink(tmp.path().join("keep.rs"), tmp.path().join("inside_link.rs"))
-            .expect("symlink should be created");
+        symlink(
+            tmp.path().join("keep.rs"),
+            tmp.path().join("inside_link.rs"),
+        )
+        .expect("symlink should be created");
         let tool = Glob::new(tmp.workspace().await);
 
         let output = tool
