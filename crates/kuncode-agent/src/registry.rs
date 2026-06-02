@@ -4,7 +4,14 @@ use std::{collections::HashMap, sync::Arc};
 
 use kuncode_core::completion::ToolDefinition;
 
-use crate::tool::{Tool, ToolError, ToolOutput};
+use crate::{
+    tool::{
+        Tool, ToolError, ToolOutput,
+        bash::Bash,
+        filesystem::{EditFile, Glob, ReadFile, WriteFile},
+    },
+    workspace::Workspace,
+};
 
 /// Registered tools available to the agent loop.
 ///
@@ -23,6 +30,25 @@ impl ToolRegistry {
     /// Creates an empty registry.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Creates a registry with the default tools bound to a workspace.
+    pub fn with_default_workspace_tools(workspace: Workspace) -> Self {
+        let mut registry = Self::new();
+        registry.register_default_workspace_tools(workspace);
+        registry
+    }
+
+    /// Registers the default tools used by the CLI.
+    ///
+    /// The order is stable for provider-side cache reuse and keeps the
+    /// lowest-level escape hatch (`bash`) first, followed by safer file tools.
+    pub fn register_default_workspace_tools(&mut self, workspace: Workspace) {
+        let _ = self.register(Bash::new(workspace.clone()));
+        let _ = self.register(ReadFile::new(workspace.clone()));
+        let _ = self.register(WriteFile::new(workspace.clone()));
+        let _ = self.register(EditFile::new(workspace.clone()));
+        let _ = self.register(Glob::new(workspace));
     }
 
     /// Registers a tool, replacing any existing tool with the same model-facing
@@ -95,6 +121,13 @@ mod tests {
     use kuncode_core::completion::ToolDefinition;
 
     use crate::tool::{Tool, ToolOutput, bash::Bash};
+    use crate::workspace::Workspace;
+
+    async fn bash() -> Bash {
+        Bash::from_current_dir()
+            .await
+            .expect("current directory should be a valid workspace")
+    }
 
     struct NamedTool {
         definition: ToolDefinition,
@@ -137,21 +170,40 @@ mod tests {
         assert!(registry.definition().is_empty());
     }
 
-    #[test]
-    fn registered_tool_is_advertised_to_the_model() {
+    #[tokio::test]
+    async fn registered_tool_is_advertised_to_the_model() {
         let mut registry = ToolRegistry::new();
 
-        assert!(registry.register(Bash::new()).is_none());
+        assert!(registry.register(bash().await).is_none());
 
         let definitions = registry.definition();
         assert_eq!(definitions.len(), 1);
         assert_eq!(definitions[0].name, "bash");
     }
 
-    #[test]
-    fn definitions_json_snapshot_is_stable_for_cache_prefix() {
+    #[tokio::test]
+    async fn default_workspace_tools_are_registered_in_stable_order() {
+        let workspace = Workspace::from_current_dir()
+            .await
+            .expect("current directory should be a valid workspace");
+        let registry = ToolRegistry::with_default_workspace_tools(workspace);
+
+        let names = registry
+            .definition()
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            ["bash", "read_file", "write_file", "edit_file", "glob"]
+        );
+    }
+
+    #[tokio::test]
+    async fn definitions_json_snapshot_is_stable_for_cache_prefix() {
         let mut registry = ToolRegistry::new();
-        registry.register(Bash::new());
+        registry.register(bash().await);
 
         let snapshot =
             serde_json::to_string(&registry.definition()).expect("definitions serialize to JSON");
@@ -184,7 +236,7 @@ mod tests {
     #[tokio::test]
     async fn dispatches_registered_tool() {
         let mut registry = ToolRegistry::new();
-        registry.register(Bash::new());
+        registry.register(bash().await);
 
         let output = registry
             .call("bash", serde_json::json!({ "cmd": "printf registry" }))

@@ -1,7 +1,7 @@
 use kuncode_agent::{
     registry::ToolRegistry,
     runner::{AgentConfig, AgentRunner},
-    tool::bash::Bash,
+    workspace::Workspace,
 };
 use kuncode_core::{
     completion::CompletionModel,
@@ -18,13 +18,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(2);
     }
 
-    let workspace = std::env::current_dir()?;
+    let workspace = Workspace::from_current_dir().await?;
     let system_prompt = format!(
         "You are kuncode, a coding agent operating in the user's shell. \
-Use the `bash` tool to inspect and act on {}; prefer concrete commands over \
-guessing. Keep working until the task is done, then give a short, direct final \
-answer.",
-        workspace.display()
+Use `read_file`, `write_file`, `edit_file`, and `glob` for workspace file \
+operations under {}; use `bash` for commands. Prefer dedicated file tools over \
+shell text manipulation. Keep working until the task is done, then give a \
+short, direct final answer.",
+        workspace.root().display()
     );
 
     let client = DeepSeekClient::from_env()?;
@@ -32,8 +33,7 @@ answer.",
         std::env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| "deepseek-v4-flash".to_string());
     let model = DeepSeekCompletionModel::make(&client, model_name);
 
-    let mut registry = ToolRegistry::new();
-    registry.register(Bash::new());
+    let registry = ToolRegistry::with_default_workspace_tools(workspace);
 
     let config = AgentConfig {
         system_prompt: Some(system_prompt),

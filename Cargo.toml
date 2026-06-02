@@ -20,6 +20,7 @@ tokio = { version = "1.52.3", features = ["full"] }
 reqwest = { version = "0.13.3", default-features = false }
 thiserror = "2.0.18"
 async-trait = "0.1.89"
+ignore = "0.4.23"
 tracing = "0.1.44"
 futures-core = "0.3.31"
 dotenvy = "0.15.7"

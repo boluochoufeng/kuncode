@@ -211,6 +211,12 @@ mod tests {
     use super::{AgentConfig, AgentRunner};
     use crate::{error::AgentError, registry::ToolRegistry, tool::bash::Bash};
 
+    async fn bash() -> Bash {
+        Bash::from_current_dir()
+            .await
+            .expect("current directory should be a valid workspace")
+    }
+
     #[derive(Clone, Default)]
     struct FakeModel {
         responses: Arc<Mutex<VecDeque<CompletionResponse<Value>>>>,
@@ -286,7 +292,7 @@ mod tests {
             response(AssistantContent::text("done")),
         ]);
         let mut registry = ToolRegistry::new();
-        registry.register(Bash::new());
+        registry.register(bash().await);
         let runner = AgentRunner::new(model.clone(), registry);
 
         let run = runner
@@ -325,7 +331,7 @@ mod tests {
             serde_json::json!({ "cmd": "printf loop" }),
         ))]);
         let mut registry = ToolRegistry::new();
-        registry.register(Bash::new());
+        registry.register(bash().await);
         let runner = AgentRunner::with_config(
             model,
             registry,
@@ -360,7 +366,7 @@ mod tests {
     async fn injects_system_prompt_as_first_message() {
         let model = FakeModel::new([response(AssistantContent::text("hi"))]);
         let mut registry = ToolRegistry::new();
-        registry.register(Bash::new());
+        registry.register(bash().await);
         let runner = AgentRunner::with_config(
             model.clone(),
             registry,
