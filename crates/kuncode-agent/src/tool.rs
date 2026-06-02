@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
 pub mod bash;
+pub mod filesystem;
 
 /// Harness-level failures the agent loop must handle itself — as opposed to
 /// failures the model can react to, which are reported inside [`ToolOutput`].

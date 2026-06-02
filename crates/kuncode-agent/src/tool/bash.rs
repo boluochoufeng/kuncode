@@ -6,7 +6,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::{process::Command, time::timeout};
 
-use crate::tool::{ToolErrorPayload, ToolOutput, TypedTool, definition_for};
+use crate::{
+    tool::{ToolErrorPayload, ToolOutput, TypedTool, definition_for},
+    workspace::{Workspace, WorkspaceError},
+};
 
 const OUTPUT_LIMIT_BYTES: usize = 20_000;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
@@ -31,19 +34,23 @@ pub struct BashOutput {
 #[derive(Debug)]
 pub struct Bash {
     definition: ToolDefinition,
+    workspace: Workspace,
 }
 
 impl Bash {
-    pub fn new() -> Self {
+    pub fn new(workspace: Workspace) -> Self {
         Self {
             definition: definition_for::<BashArgs>("bash", "Run a shell command"),
+            workspace,
         }
     }
-}
 
-impl Default for Bash {
-    fn default() -> Self {
-        Self::new()
+    pub async fn from_current_dir() -> Result<Self, WorkspaceError> {
+        Ok(Self::new(Workspace::from_current_dir().await?))
+    }
+
+    pub fn workspace(&self) -> &Workspace {
+        &self.workspace
     }
 }
 
@@ -74,6 +81,7 @@ impl TypedTool for Bash {
         command
             .arg("-lc")
             .arg(&cmd)
+            .current_dir(self.workspace.root())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -143,11 +151,18 @@ fn blocked_pattern(cmd: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::{Bash, blocked_pattern};
-    use crate::tool::Tool;
+    use crate::{tool::Tool, workspace::Workspace};
+
+    async fn bash() -> Bash {
+        Bash::from_current_dir()
+            .await
+            .expect("current directory should be a valid workspace")
+    }
 
     #[tokio::test]
     async fn call_erases_typed_output_for_the_model() {
-        let out = Bash::new()
+        let out = bash()
+            .await
             .call(serde_json::json!({ "cmd": "printf hello" }))
             .await
             .expect("no harness-level error");
@@ -161,7 +176,8 @@ mod tests {
 
     #[tokio::test]
     async fn call_reports_bad_arguments_in_the_envelope() {
-        let out = Bash::new()
+        let out = bash()
+            .await
             .call(serde_json::json!({}))
             .await
             .expect("bad arguments are model-recoverable, not a harness error");
@@ -170,9 +186,9 @@ mod tests {
         assert_eq!(out.error.expect("error payload").kind, "invalid_arguments");
     }
 
-    #[test]
-    fn definition_schema_is_generated_from_args() {
-        let bash = Bash::new();
+    #[tokio::test]
+    async fn definition_schema_is_generated_from_args() {
+        let bash = bash().await;
         let definition = Tool::definition(&bash);
 
         assert_eq!(definition.name, "bash");
@@ -211,5 +227,32 @@ mod tests {
                 "expected `{cmd}` to be allowed"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn runs_commands_from_workspace_root() {
+        let workspace = Workspace::new(std::env::current_dir().expect("current directory exists"))
+            .await
+            .expect("workspace should be valid");
+        let out = Bash::new(workspace)
+            .call(serde_json::json!({ "cmd": "pwd" }))
+            .await
+            .expect("no harness-level error");
+
+        assert!(out.ok);
+        let stdout = out.data.expect("data present")["stdout"]
+            .as_str()
+            .expect("stdout should be a string")
+            .trim()
+            .to_string();
+        assert_eq!(
+            stdout,
+            std::env::current_dir()
+                .expect("current directory exists")
+                .canonicalize()
+                .expect("current directory canonicalizes")
+                .display()
+                .to_string()
+        );
     }
 }
