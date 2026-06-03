@@ -5,5 +5,6 @@
 pub mod error;
 pub mod registry;
 pub mod runner;
+pub mod session;
 pub mod tool;
 pub mod workspace;

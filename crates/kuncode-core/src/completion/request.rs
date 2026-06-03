@@ -201,13 +201,12 @@ pub trait CompletionModel: Clone + Send + Sync {
 
 /// Fluent builder for [`CompletionRequest`].
 ///
-/// The terminal user `prompt` is supplied up front and appended last by
-/// [`build`](Self::build), which guarantees `chat_history` is never empty
-/// regardless of how the caller orders the other builder methods.
+/// The builder stores the request transcript directly so message order is
+/// explicit. Use [`Self::new`] for a single-message request and
+/// [`Self::from_messages`] when a caller already owns a full transcript.
 pub struct CompletionRequestBuilder {
-    prompt: Message,
+    chat_history: NonEmptyVec<Message>,
     request_model: Option<String>,
-    chat_history: Vec<Message>,
     tools: Vec<ToolDefinition>,
     temperature: Option<f64>,
     top_p: Option<f64>,
@@ -220,12 +219,28 @@ pub struct CompletionRequestBuilder {
 }
 
 impl CompletionRequestBuilder {
-    /// Starts a builder whose final message will be `prompt`.
+    /// Starts a builder with a single-message transcript.
     pub fn new(prompt: impl Into<Message>) -> Self {
         CompletionRequestBuilder {
-            prompt: prompt.into(),
+            chat_history: NonEmptyVec::new(prompt.into()),
             request_model: None,
-            chat_history: Vec::new(),
+            tools: Vec::new(),
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            stop: None,
+            reasoning: None,
+            tool_choice: None,
+            additional_params: None,
+            output_schema: None,
+        }
+    }
+
+    /// Starts a builder from an already ordered, non-empty transcript.
+    pub fn from_messages(messages: NonEmptyVec<Message>) -> Self {
+        CompletionRequestBuilder {
+            chat_history: messages,
+            request_model: None,
             tools: Vec::new(),
             temperature: None,
             top_p: None,
@@ -244,13 +259,13 @@ impl CompletionRequestBuilder {
         self
     }
 
-    /// Appends a single message to the chat history (before the prompt).
+    /// Appends a single message to the request transcript.
     pub fn message(mut self, message: Message) -> Self {
         self.chat_history.push(message);
         self
     }
 
-    /// Appends multiple messages to the chat history.
+    /// Appends multiple messages to the request transcript.
     pub fn messages(mut self, messages: impl IntoIterator<Item = Message>) -> Self {
         self.chat_history.extend(messages);
         self
@@ -332,22 +347,11 @@ impl CompletionRequestBuilder {
 
     /// Finalizes the builder into a [`CompletionRequest`].
     ///
-    /// The prompt is appended after the accumulated history so it is always
-    /// the last message; if no history was supplied, the resulting request
-    /// contains the prompt alone.
+    /// Preserves the transcript order accumulated on the builder.
     pub fn build(self) -> CompletionRequest {
-        let chat_history = if let Ok(mut chat_history) =
-            TryInto::<NonEmptyVec<Message>>::try_into(self.chat_history)
-        {
-            chat_history.push(self.prompt);
-            chat_history
-        } else {
-            NonEmptyVec::new(self.prompt)
-        };
-
         CompletionRequest {
             model: self.request_model,
-            chat_history,
+            chat_history: self.chat_history,
             tools: self.tools,
             temperature: self.temperature,
             top_p: self.top_p,
@@ -358,5 +362,39 @@ impl CompletionRequestBuilder {
             additional_params: self.additional_params,
             output_schema: self.output_schema,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CompletionRequestBuilder, Message, NonEmptyVec};
+
+    #[test]
+    fn builder_from_messages_preserves_transcript_order() {
+        let messages = NonEmptyVec::from_first_rest(
+            Message::system("system"),
+            vec![Message::user("first"), Message::assistant("answer")],
+        );
+
+        let request = CompletionRequestBuilder::from_messages(messages.clone()).build();
+
+        assert_eq!(request.chat_history, messages);
+    }
+
+    #[test]
+    fn builder_appends_messages_in_call_order() {
+        let request = CompletionRequestBuilder::new(Message::system("system"))
+            .message(Message::user("first"))
+            .message(Message::assistant("answer"))
+            .build();
+
+        assert_eq!(
+            request.chat_history.into_vec(),
+            [
+                Message::system("system"),
+                Message::user("first"),
+                Message::assistant("answer")
+            ]
+        );
     }
 }

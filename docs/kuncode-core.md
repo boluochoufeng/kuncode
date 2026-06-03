@@ -80,7 +80,7 @@ pub struct CompletionRequest {
 }
 ```
 
-由 `CompletionRequestBuilder` 构造：`new(prompt)` 接住「最后一条消息」，`build()` 把它追加到 history 末尾，从而**保证 `chat_history` 永不为空**，与 builder 方法调用顺序无关。
+由 `CompletionRequestBuilder` 构造：`new(prompt)` 创建单消息 transcript，`from_messages(messages)` 接收已有完整 transcript。builder 内部直接维护 `NonEmptyVec<Message>`，因此 `chat_history` 非空由类型保证，消息顺序按调用方提供的 transcript 保留。
 
 `ReasoningEffort` 是中立档位 `Off / Minimal / Low / Medium / High / Xhigh`，词汇对齐 OpenAI 的粒度；各 provider 把它近似到自己的原生标度。`None` = 用模型默认，`Off` = 显式关思考。
 

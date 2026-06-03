@@ -462,6 +462,10 @@ impl TryFrom<DeepSeekCompletionResponse>
 pub struct DeepSeekCompletionRequest {
     // Mapped fields from CompletionRequest.
     model: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tools: Vec<ToolDefinition>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<ToolChoice>,
     messages: Vec<Message>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
@@ -471,10 +475,6 @@ pub struct DeepSeekCompletionRequest {
     top_p: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stop: Option<Stop>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    tools: Vec<ToolDefinition>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_choice: Option<ToolChoice>,
     // Split from the neutral reasoning effort in TryFrom.
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<Thinking>,
@@ -504,10 +504,7 @@ impl TryFrom<completion::CompletionRequest> for DeepSeekCompletionRequest {
         let chat_history: Vec<Message> = req
             .chat_history
             .into_iter()
-            .map(Vec::<Message>::from)
-            .collect::<Vec<Vec<Message>>>()
-            .into_iter()
-            .flatten()
+            .flat_map(Vec::<Message>::from)
             .collect();
 
         let tool_choice = req.tool_choice.map(ToolChoice::from);
@@ -542,14 +539,14 @@ impl TryFrom<completion::CompletionRequest> for DeepSeekCompletionRequest {
 
         Ok(Self {
             model,
+            tools: req.tools.into_iter().map(ToolDefinition::from).collect(),
+            tool_choice,
             messages: chat_history,
             max_tokens: req.max_tokens.map(|t| t as u32),
             temperature,
             top_p,
             // Treat an empty list as unset to avoid sending "stop": [].
             stop: req.stop.filter(|s| !s.is_empty()).map(Stop::Multi),
-            tools: req.tools.into_iter().map(ToolDefinition::from).collect(),
-            tool_choice,
             stream: None,
             stream_options: None,
             thinking,
@@ -662,6 +659,91 @@ mod tests {
     use super::Message;
     use crate::completion::message as dm;
     use crate::non_empty_vec::NonEmptyVec;
+
+    #[test]
+    fn request_serializes_tool_metadata_before_messages() {
+        let tool = crate::completion::ToolDefinition {
+            name: "bash".to_string(),
+            description: "Run a shell command".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "cmd": { "type": "string" }
+                },
+                "required": ["cmd"]
+            }),
+        };
+        let request = crate::completion::CompletionRequestBuilder::new(dm::Message::user("hello"))
+            .model("deepseek-test")
+            .tool(tool)
+            .tool_choice(Some(dm::ToolChoice::Auto))
+            .build();
+
+        let wire = super::DeepSeekCompletionRequest::try_from(request)
+            .expect("request should map to wire");
+        let json = serde_json::to_string(&wire).expect("wire request should serialize");
+
+        let model = json.find("\"model\"").expect("model field");
+        let tools = json.find("\"tools\"").expect("tools field");
+        let tool_choice = json.find("\"tool_choice\"").expect("tool_choice field");
+        let messages = json.find("\"messages\"").expect("messages field");
+
+        assert!(model < tools);
+        assert!(tools < tool_choice);
+        assert!(tool_choice < messages);
+    }
+
+    #[test]
+    fn request_mapping_preserves_flattened_message_order() {
+        let messages = NonEmptyVec::from_first_rest(
+            dm::Message::system("system"),
+            vec![
+                dm::Message::user("first"),
+                dm::Message::User {
+                    content: NonEmptyVec::from_first_rest(
+                        dm::UserContent::ToolResult(dm::ToolResult {
+                            id: "call_1".to_string(),
+                            call_id: None,
+                            content: NonEmptyVec::new(dm::ToolResultContent::text("tool output")),
+                        }),
+                        vec![dm::UserContent::text("after tool")],
+                    ),
+                },
+                dm::Message::assistant("done"),
+            ],
+        );
+        let request = crate::completion::CompletionRequestBuilder::from_messages(messages)
+            .model("deepseek-test")
+            .build();
+
+        let wire = super::DeepSeekCompletionRequest::try_from(request)
+            .expect("request should map to wire");
+
+        assert_eq!(wire.messages.len(), 5);
+        assert!(matches!(
+            &wire.messages[0],
+            Message::System { content, .. } if content == "system"
+        ));
+        assert!(matches!(
+            &wire.messages[1],
+            Message::User { content, .. } if content == "first"
+        ));
+        assert!(matches!(
+            &wire.messages[2],
+            Message::ToolResult {
+                tool_call_id,
+                content,
+            } if tool_call_id == "call_1" && content == "tool output"
+        ));
+        assert!(matches!(
+            &wire.messages[3],
+            Message::User { content, .. } if content == "after tool"
+        ));
+        assert!(matches!(
+            &wire.messages[4],
+            Message::Assistant { content, .. } if content == "done"
+        ));
+    }
 
     /// A mixed user message emits tool results first, then merged user text.
     ///
