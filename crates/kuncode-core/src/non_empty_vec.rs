@@ -89,6 +89,15 @@ impl<T: Clone> From<T> for NonEmptyVec<T> {
     }
 }
 
+impl<T: Clone> Extend<T> for NonEmptyVec<T> {
+    fn extend<I>(&mut self, iter: I)
+    where
+        I: IntoIterator<Item = T>,
+    {
+        self.inner.extend(iter);
+    }
+}
+
 impl<T: Clone> IntoIterator for NonEmptyVec<T> {
     type Item = T;
     type IntoIter = std::vec::IntoIter<T>;
@@ -122,5 +131,19 @@ where
         let vec = Vec::<T>::deserialize(deserializer)?;
         NonEmptyVec::try_from(vec)
             .map_err(|e: EmptyVecError| serde::de::Error::custom(e.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NonEmptyVec;
+
+    #[test]
+    fn extend_appends_without_losing_the_head() {
+        let mut values = NonEmptyVec::new(1);
+
+        values.extend([2, 3]);
+
+        assert_eq!(values.into_vec(), [1, 2, 3]);
     }
 }

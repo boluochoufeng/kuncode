@@ -124,17 +124,15 @@ impl CompletionModel for DeepSeekCompletionModel {
 
         let extra_params = request.additional_params.take();
         let request = DeepSeekCompletionRequest::try_from(request)?;
-        let mut body = serde_json::to_value(&request)?;
-        if let Some(extra) = extra_params {
-            body = json_utils::merge(body, extra);
-        }
 
-        let response = self
-            .client
-            .post("/chat/completions")
-            .json(&body)
-            .send()
-            .await?;
+        let request_builder = self.client.post("/chat/completions");
+        let response = match extra_params {
+            Some(extra) => {
+                let body = json_utils::merge(serde_json::to_value(&request)?, extra);
+                request_builder.json(&body).send().await?
+            }
+            None => request_builder.json(&request).send().await?,
+        };
 
         let status = response.status();
         if !status.is_success() {
@@ -161,7 +159,10 @@ impl CompletionModel for DeepSeekCompletionModel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::completion::{AssistantContent, CompletionRequestBuilder, Message, ToolDefinition};
+    use crate::{
+        completion::{AssistantContent, CompletionRequestBuilder, Message, ToolDefinition},
+        non_empty_vec::NonEmptyVec,
+    };
 
     #[tokio::test]
     #[ignore = "hits the real DeepSeek API; requires DEEPSEEK_API_KEY"]
@@ -253,19 +254,20 @@ mod tests {
         .to_string();
 
         // Round 2: replay assistant(tool_call) plus the tool result and expect
-        // the model to summarize from that result. build() appends the prompt
-        // last, so the final order is [user, assistant(tool_call), tool_result].
+        // the model to summarize from that result.
         let assistant_turn = Message::Assistant {
             id: resp1.message_id.clone(),
             content: resp1.choice.clone(),
         };
         let result_turn = Message::tool_result(tool_call.id.clone(), tool_output);
 
-        let round2 = CompletionRequestBuilder::new(result_turn)
-            .messages([user_prompt, assistant_turn])
-            .tool(weather_tool)
-            .max_tokens(Some(1024))
-            .build();
+        let round2 = CompletionRequestBuilder::from_messages(NonEmptyVec::from_first_rest(
+            user_prompt,
+            vec![assistant_turn, result_turn],
+        ))
+        .tool(weather_tool)
+        .max_tokens(Some(1024))
+        .build();
 
         let resp2 = model.completion(round2).await.expect("round2 failed");
         println!("== round2 choice ==\n{:#?}", resp2.choice);

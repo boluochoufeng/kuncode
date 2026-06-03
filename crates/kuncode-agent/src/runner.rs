@@ -3,14 +3,14 @@
 use kuncode_core::{
     completion::{
         AssistantContent, CompletionModel, CompletionRequest, CompletionRequestBuilder, Message,
-        ReasoningEffort, ToolCall, ToolChoice, ToolResult, ToolResultContent, Usage, UserContent,
+        ReasoningEffort, ToolChoice, ToolResult, ToolResultContent, Usage, UserContent,
     },
     non_empty_vec::NonEmptyVec,
 };
 
-use crate::{error::AgentError, registry::ToolRegistry};
+use crate::{error::AgentError, registry::ToolRegistry, session::AgentSession};
 
-const DEFAULT_MAX_ITERATIONS: usize = 10;
+const DEFAULT_MAX_ITERATIONS: usize = 50;
 
 /// Runtime knobs for one agent loop.
 #[derive(Clone, Debug)]
@@ -23,9 +23,9 @@ pub struct AgentConfig {
     pub reasoning: Option<ReasoningEffort>,
     /// Tool-call policy passed through to the provider.
     pub tool_choice: Option<ToolChoice>,
-    /// System prompt injected as the first message of every request. `None`
-    /// sends no system prompt; it is request-only and never stored in the
-    /// transcript ([`AgentRun::messages`]).
+    /// System prompt injected as the first message of every request.
+    ///
+    /// It is request-only and never stored in [`AgentSession`].
     pub system_prompt: Option<String>,
 }
 
@@ -41,31 +41,21 @@ impl Default for AgentConfig {
     }
 }
 
-/// Result of a completed agent run.
-#[derive(Clone, Debug)]
-pub struct AgentRun {
-    /// Full transcript including tool-call and tool-result turns.
-    pub messages: Vec<Message>,
-    /// Final assistant content produced after no further tool calls were
-    /// requested.
-    pub final_content: NonEmptyVec<AssistantContent>,
-    /// Aggregated provider usage across all model calls in the loop.
+/// Summary for one completed user turn appended to an existing transcript.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AgentTurn {
+    /// Index of the final assistant message inside the caller-owned transcript.
+    pub final_message_index: usize,
+    /// Provider usage aggregated across this turn's model calls.
     pub usage: Usage,
-    /// Number of model calls performed.
+    /// Number of model calls performed for this turn.
     pub iterations: usize,
 }
 
-impl AgentRun {
+impl AgentTurn {
     /// Concatenates visible text blocks from the final assistant message.
-    pub fn final_text(&self) -> String {
-        self.final_content
-            .iter()
-            .filter_map(|content| match content {
-                AssistantContent::Text(text) => Some(text.text_ref()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("")
+    pub fn final_text(&self, session: &AgentSession) -> String {
+        final_text_at(session.messages(), self.final_message_index)
     }
 }
 
@@ -95,103 +85,184 @@ where
         }
     }
 
-    /// Runs the loop from a single user prompt.
-    pub async fn run(&self, prompt: impl Into<String>) -> Result<AgentRun, AgentError> {
-        self.run_messages(vec![Message::user(prompt)]).await
+    /// Appends a user prompt, then advances the transcript until a final answer.
+    pub async fn run_turn(
+        &self,
+        session: &mut AgentSession,
+        prompt: impl Into<String>,
+    ) -> Result<AgentTurn, AgentError> {
+        session.push_user(prompt);
+        self.continue_session(session).await
     }
 
-    /// Runs the loop from an existing transcript.
-    pub async fn run_messages(&self, mut messages: Vec<Message>) -> Result<AgentRun, AgentError> {
-        if messages.is_empty() {
+    /// Advances an existing transcript in place until the model stops calling tools.
+    pub async fn continue_session(
+        &self,
+        session: &mut AgentSession,
+    ) -> Result<AgentTurn, AgentError> {
+        if session.is_empty() {
             return Err(AgentError::EmptyTranscript);
         }
 
         let mut usage = Usage::default();
 
         for iteration in 0..self.config.max_iterations {
-            let request = self.build_request(&messages)?;
-            let response = self.model.completion(request).await?;
+            let iteration_result = self.run_iteration(session).await?;
+            usage += iteration_result.usage;
 
-            usage += response.usage;
-
-            let assistant_content = response.choice.clone();
-            messages.push(Message::Assistant {
-                id: response.message_id,
-                content: assistant_content.clone(),
-            });
-
-            let tool_calls = tool_calls(&assistant_content);
-            if tool_calls.is_empty() {
-                return Ok(AgentRun {
-                    messages,
-                    final_content: assistant_content,
+            if iteration_result.tool_calls.is_empty() {
+                return Ok(AgentTurn {
+                    final_message_index: iteration_result.assistant_message_index,
                     usage,
                     iterations: iteration + 1,
                 });
             }
 
-            for tool_call in tool_calls {
-                let output = self
-                    .registry
-                    .call(
-                        &tool_call.function.name,
-                        tool_call.function.arguments.clone(),
-                    )
-                    .await
-                    .map_err(|source| AgentError::Tool {
-                        name: tool_call.function.name.clone(),
-                        source,
-                    })?;
-
-                messages.push(tool_result_message(&tool_call, output.to_model_content()));
-            }
+            self.execute_tool_calls(session, iteration_result.tool_calls)
+                .await?;
         }
 
         Err(AgentError::MaxIterations {
             max_iterations: self.config.max_iterations,
-            messages,
+            messages: session.messages().to_vec(),
             usage,
         })
     }
 
-    fn build_request(&self, messages: &[Message]) -> Result<CompletionRequest, AgentError> {
-        let Some((prompt, history)) = messages.split_last() else {
-            return Err(AgentError::EmptyTranscript);
-        };
+    async fn run_iteration(
+        &self,
+        session: &mut AgentSession,
+    ) -> Result<IterationResult, AgentError> {
+        let request = self.build_request(session)?;
+        let response = self.model.completion(request).await?;
 
-        let mut builder = CompletionRequestBuilder::new(prompt.clone());
-        if let Some(system) = &self.config.system_prompt {
-            builder = builder.message(Message::system(system.clone()));
+        let tool_calls = pending_tool_calls(&response.choice);
+        let usage = response.usage;
+        session.push(Message::Assistant {
+            id: response.message_id,
+            content: response.choice,
+        });
+
+        Ok(IterationResult {
+            assistant_message_index: session.messages().len() - 1,
+            usage,
+            tool_calls,
+        })
+    }
+
+    async fn execute_tool_calls(
+        &self,
+        session: &mut AgentSession,
+        tool_calls: Vec<PendingToolCall>,
+    ) -> Result<(), AgentError> {
+        for tool_call in tool_calls {
+            let PendingToolCall {
+                id,
+                call_id,
+                name,
+                arguments,
+            } = tool_call;
+
+            let output = match self.registry.call(&name, arguments).await {
+                Ok(output) => output,
+                Err(source) => return Err(AgentError::Tool { name, source }),
+            };
+
+            session.push(tool_result_message(id, call_id, output.to_model_content()));
         }
 
-        Ok(builder
-            .messages(history.iter().cloned())
-            .tools(self.registry.definition())
-            .max_tokens(self.config.max_tokens)
-            .reasoning(self.config.reasoning)
-            .tool_choice(self.config.tool_choice.clone())
-            .build())
+        Ok(())
+    }
+
+    fn build_request(&self, session: &AgentSession) -> Result<CompletionRequest, AgentError> {
+        if session.is_empty() {
+            return Err(AgentError::EmptyTranscript);
+        }
+
+        let mut chat_history = Vec::with_capacity(
+            session.messages().len() + usize::from(self.config.system_prompt.is_some()),
+        );
+        if let Some(system) = &self.config.system_prompt {
+            chat_history.push(Message::system(system.clone()));
+        }
+        chat_history.extend(session.messages().iter().cloned());
+
+        Ok(CompletionRequestBuilder::from_messages(
+            NonEmptyVec::try_from(chat_history).map_err(|_| AgentError::EmptyTranscript)?,
+        )
+        .tools(self.registry.definition())
+        .max_tokens(self.config.max_tokens)
+        .reasoning(self.config.reasoning)
+        .tool_choice(self.config.tool_choice.clone())
+        .build())
     }
 }
 
-fn tool_calls(content: &NonEmptyVec<AssistantContent>) -> Vec<ToolCall> {
+#[derive(Debug)]
+struct IterationResult {
+    assistant_message_index: usize,
+    usage: Usage,
+    tool_calls: Vec<PendingToolCall>,
+}
+
+#[derive(Debug)]
+struct PendingToolCall {
+    id: String,
+    call_id: Option<String>,
+    name: String,
+    arguments: serde_json::Value,
+}
+
+fn pending_tool_calls(content: &NonEmptyVec<AssistantContent>) -> Vec<PendingToolCall> {
     content
         .iter()
         .filter_map(|content| match content {
-            AssistantContent::ToolCall(tool_call) => Some(tool_call.clone()),
+            AssistantContent::ToolCall(tool_call) => Some(PendingToolCall {
+                id: tool_call.id.clone(),
+                call_id: tool_call.call_id.clone(),
+                name: tool_call.function.name.clone(),
+                arguments: tool_call.function.arguments.clone(),
+            }),
             _ => None,
         })
         .collect()
 }
 
-fn tool_result_message(tool_call: &ToolCall, content: String) -> Message {
+fn tool_result_message(id: String, call_id: Option<String>, content: String) -> Message {
     Message::User {
         content: NonEmptyVec::new(UserContent::ToolResult(ToolResult {
-            id: tool_call.id.clone(),
-            call_id: tool_call.call_id.clone(),
+            id,
+            call_id,
             content: NonEmptyVec::new(ToolResultContent::text(content)),
         })),
     }
+}
+
+fn assistant_content_at(
+    messages: &[Message],
+    index: usize,
+) -> Option<&NonEmptyVec<AssistantContent>> {
+    match messages.get(index) {
+        Some(Message::Assistant { content, .. }) => Some(content),
+        _ => None,
+    }
+}
+
+fn final_text_at(messages: &[Message], index: usize) -> String {
+    assistant_content_at(messages, index)
+        .map(assistant_text)
+        .unwrap_or_default()
+}
+
+fn assistant_text(content: &NonEmptyVec<AssistantContent>) -> String {
+    content
+        .iter()
+        .filter_map(|content| match content {
+            AssistantContent::Text(text) => Some(text.text_ref()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 #[cfg(test)]
@@ -209,7 +280,9 @@ mod tests {
     use serde_json::Value;
 
     use super::{AgentConfig, AgentRunner};
-    use crate::{error::AgentError, registry::ToolRegistry, tool::bash::Bash};
+    use crate::{
+        error::AgentError, registry::ToolRegistry, session::AgentSession, tool::bash::Bash,
+    };
 
     async fn bash() -> Bash {
         Bash::from_current_dir()
@@ -294,16 +367,17 @@ mod tests {
         let mut registry = ToolRegistry::new();
         registry.register(bash().await);
         let runner = AgentRunner::new(model.clone(), registry);
+        let mut session = AgentSession::new();
 
-        let run = runner
-            .run("inspect the workspace")
+        let turn = runner
+            .run_turn(&mut session, "inspect the workspace")
             .await
             .expect("agent run should complete");
 
-        assert_eq!(run.final_text(), "done");
-        assert_eq!(run.iterations, 2);
-        assert_eq!(run.usage.total_tokens, 6);
-        assert_eq!(run.messages.len(), 4);
+        assert_eq!(turn.final_text(&session), "done");
+        assert_eq!(turn.iterations, 2);
+        assert_eq!(turn.usage.total_tokens, 6);
+        assert_eq!(session.messages().len(), 4);
 
         let requests = model.requests();
         assert_eq!(requests.len(), 2);
@@ -311,7 +385,7 @@ mod tests {
         assert_eq!(requests[1].tools[0].name, "bash");
         assert_eq!(requests[1].chat_history.len(), 3);
 
-        match &run.messages[2] {
+        match &session.messages()[2] {
             Message::User { content } => {
                 let UserContent::ToolResult(result) = content.first() else {
                     panic!("expected tool result content");
@@ -321,6 +395,61 @@ mod tests {
             }
             other => panic!("expected tool result user message, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn run_turn_updates_transcript_in_place() {
+        let model = FakeModel::new([response(AssistantContent::text("done"))]);
+        let runner = AgentRunner::new(model, ToolRegistry::new());
+        let mut session = AgentSession::new();
+
+        let turn = runner
+            .run_turn(&mut session, "finish this")
+            .await
+            .expect("agent turn should complete");
+
+        assert_eq!(turn.final_text(&session), "done");
+        assert_eq!(turn.final_message_index, 1);
+        assert_eq!(session.messages().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn requests_keep_stable_prefix_between_tool_iterations() {
+        let model = FakeModel::new([
+            response(AssistantContent::tool_call(
+                "call_1",
+                "bash",
+                serde_json::json!({ "cmd": "printf cache" }),
+            )),
+            response(AssistantContent::text("done")),
+        ]);
+        let mut registry = ToolRegistry::new();
+        registry.register(bash().await);
+        let runner = AgentRunner::with_config(
+            model.clone(),
+            registry,
+            AgentConfig {
+                system_prompt: Some("be stable".to_string()),
+                ..AgentConfig::default()
+            },
+        );
+        let mut session = AgentSession::new();
+
+        runner
+            .run_turn(&mut session, "inspect the workspace")
+            .await
+            .expect("agent run should complete");
+
+        let requests = model.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].tools, requests[1].tools);
+        assert!(
+            requests[1]
+                .chat_history
+                .starts_with(&requests[0].chat_history)
+        );
+        assert_eq!(requests[0].chat_history.len(), 2);
+        assert_eq!(requests[1].chat_history.len(), 4);
     }
 
     #[tokio::test]
@@ -340,9 +469,10 @@ mod tests {
                 ..AgentConfig::default()
             },
         );
+        let mut session = AgentSession::new();
 
         let err = runner
-            .run("keep using tools")
+            .run_turn(&mut session, "keep using tools")
             .await
             .expect_err("run should stop at the iteration budget");
 
@@ -375,12 +505,16 @@ mod tests {
                 ..AgentConfig::default()
             },
         );
+        let mut session = AgentSession::new();
 
-        let run = runner.run("hello").await.expect("run completes");
+        runner
+            .run_turn(&mut session, "hello")
+            .await
+            .expect("run completes");
 
         // The system prompt is request-only, never part of the transcript.
         assert!(!matches!(
-            run.messages.first(),
+            session.messages().first(),
             Some(Message::System { .. })
         ));
 
@@ -394,9 +528,10 @@ mod tests {
     #[tokio::test]
     async fn rejects_empty_transcript() {
         let runner = AgentRunner::new(FakeModel::default(), ToolRegistry::new());
+        let mut session = AgentSession::new();
 
         let err = runner
-            .run_messages(Vec::new())
+            .continue_session(&mut session)
             .await
             .expect_err("empty transcript is invalid");
 

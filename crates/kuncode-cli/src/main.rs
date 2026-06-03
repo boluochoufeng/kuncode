@@ -1,13 +1,13 @@
 use std::io::{self, Write};
 
 use kuncode_agent::{
-    error::AgentError,
     registry::ToolRegistry,
     runner::{AgentConfig, AgentRunner},
+    session::AgentSession,
     workspace::Workspace,
 };
 use kuncode_core::{
-    completion::{CompletionModel, Message},
+    completion::CompletionModel,
     providers::deepseek::{DeepSeekClient, DeepSeekCompletionModel},
 };
 
@@ -37,11 +37,11 @@ the task is done, then give a short, direct final answer.",
     };
     let runner = AgentRunner::with_config(model, registry, config);
 
-    let mut messages = Vec::new();
+    let mut session = AgentSession::new();
     let initial_prompt = std::env::args().skip(1).collect::<Vec<_>>().join(" ");
     if !initial_prompt.trim().is_empty() {
-        let run = runner.run(initial_prompt).await?;
-        println!("\n{}", run.final_text());
+        let turn = runner.run_turn(&mut session, initial_prompt).await?;
+        println!("\n{}", turn.final_text(&session));
         return Ok(());
     }
 
@@ -63,42 +63,11 @@ the task is done, then give a short, direct final answer.",
             break;
         }
 
-        if let Err(err) = run_turn(&runner, &mut messages, input.to_string()).await {
-            eprintln!("error: {err}");
+        match runner.run_turn(&mut session, input.to_string()).await {
+            Ok(turn) => println!("\n{}", turn.final_text(&session)),
+            Err(err) => eprintln!("error: {err}"),
         }
     }
 
     Ok(())
-}
-
-async fn run_turn<M>(
-    runner: &AgentRunner<M>,
-    messages: &mut Vec<Message>,
-    prompt: String,
-) -> Result<(), AgentError>
-where
-    M: CompletionModel,
-{
-    messages.push(Message::user(prompt));
-
-    match runner.run_messages(messages.clone()).await {
-        Ok(run) => {
-            println!("\n{}", run.final_text());
-            *messages = run.messages;
-            Ok(())
-        }
-        Err(AgentError::MaxIterations {
-            max_iterations,
-            messages: partial,
-            usage,
-        }) => {
-            *messages = partial.clone();
-            Err(AgentError::MaxIterations {
-                max_iterations,
-                messages: partial,
-                usage,
-            })
-        }
-        Err(err) => Err(err),
-    }
 }
