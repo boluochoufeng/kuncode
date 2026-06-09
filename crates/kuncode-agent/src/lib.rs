@@ -3,6 +3,8 @@
 //! This crate owns the harness layer around `kuncode-core`.
 
 pub mod error;
+pub mod glob;
+pub mod permission;
 pub mod registry;
 pub mod runner;
 pub mod session;

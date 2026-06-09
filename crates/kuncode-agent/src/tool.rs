@@ -5,17 +5,52 @@ use kuncode_core::completion::ToolDefinition;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
+
+use crate::permission::PermissionRequest;
 
 pub mod bash;
 pub mod filesystem;
 
+/// Per-call execution context threaded into every tool.
+///
+/// Kept deliberately small. It carries only a cancellation token today; the
+/// permission *gate* lives in the runner, not here (the runner computes the
+/// verdict before dispatch). Tools already self-hold their [`Workspace`], so it
+/// is not duplicated here. Future fields (a `request_permission` hook for s06
+/// subagents, a `cwd` override) attach at this seam.
+///
+/// [`Workspace`]: crate::workspace::Workspace
+#[derive(Clone, Debug, Default)]
+pub struct ToolContext {
+    /// Cancelled by the runner (user interrupt / shutdown). A tool may observe
+    /// it for cooperative cancellation, but the runner also races `call`
+    /// against it, so most tools can ignore it.
+    pub cancel: CancellationToken,
+}
+
+impl ToolContext {
+    /// A context with a fresh, never-cancelled token. Handy for tests and
+    /// non-interactive callers.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Builds a context wrapping an existing cancellation token.
+    pub fn with_cancel(cancel: CancellationToken) -> Self {
+        Self { cancel }
+    }
+}
+
 /// Harness-level failures the agent loop must handle itself — as opposed to
 /// failures the model can react to, which are reported inside [`ToolOutput`].
 ///
-/// Cancellation is reserved for the upcoming execution-context work and is
-/// surfaced by the runner around [`Tool::call`] (e.g. a `select!` against a
-/// cancellation token). [`ToolError::Internal`] is produced today when a
-/// tool's typed output fails to serialize at the dispatch boundary.
+/// [`ToolError::Cancelled`] is surfaced by the runner, which races
+/// [`Tool::call`] against the [`ToolContext`] cancellation token (user
+/// interrupt / shutdown) and maps a token win onto
+/// [`AgentError::Cancelled`](crate::error::AgentError::Cancelled).
+/// [`ToolError::Internal`] is produced when a tool's typed output fails to
+/// serialize at the dispatch boundary.
 #[derive(Debug, Error)]
 pub enum ToolError {
     /// The tool was cancelled before completing (user interrupt or shutdown).
@@ -131,13 +166,29 @@ pub trait Tool: Send + Sync {
         &self.definition().name
     }
 
+    /// Computes the permission request for a call, *before* it runs.
+    ///
+    /// Parses and lexically inspects the arguments only — no filesystem access.
+    /// A parse failure returns `Err(ToolOutput)` (an `invalid_arguments`
+    /// failure) so bad arguments are reported to the model and **never reach the
+    /// approver**.
+    fn permission(
+        &self,
+        args: &serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<PermissionRequest, ToolOutput>;
+
     /// Invoke the tool with the raw JSON arguments produced by the model.
     ///
     /// Two error channels: failures the model can react to (bad arguments,
     /// non-zero exit, …) are reported in [`ToolOutput`] so the loop can feed
     /// them back for a retry, while [`ToolError`] is for harness-level failures
     /// (cancellation, internal bugs) the loop handles itself.
-    async fn call(&self, args: serde_json::Value) -> Result<ToolOutput, ToolError>;
+    async fn call(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<ToolOutput, ToolError>;
 }
 
 /// Ergonomic tool definition with strongly-typed arguments and output.
@@ -164,8 +215,18 @@ pub trait TypedTool: Send + Sync {
     /// [`definition_for`] so schema generation isn't repeated per call.
     fn definition(&self) -> &ToolDefinition;
 
+    /// Declares what this call wants to do, for the permission gate.
+    ///
+    /// Synchronous and **lexical only**: it may normalize a path string for
+    /// rule matching, but must not touch the filesystem (no `canonicalize`).
+    /// The real workspace-boundary check stays in [`run`](Self::run) — rules
+    /// are policy, the boundary is a security invariant, and the two are
+    /// separate layers. Required (no default) so every new tool consciously
+    /// declares its permission surface instead of being silently misclassified.
+    fn permission(&self, args: &Self::Args, ctx: &ToolContext) -> PermissionRequest;
+
     /// Run the tool with already-parsed, validated arguments.
-    async fn run(&self, args: Self::Args) -> ToolOutput<Self::Output>;
+    async fn run(&self, args: Self::Args, ctx: &ToolContext) -> ToolOutput<Self::Output>;
 }
 
 #[async_trait]
@@ -177,9 +238,31 @@ where
         TypedTool::definition(self)
     }
 
-    async fn call(&self, args: serde_json::Value) -> Result<ToolOutput, ToolError> {
+    fn permission(
+        &self,
+        args: &serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<PermissionRequest, ToolOutput> {
+        // Parse once for the gate so bad arguments fail here as
+        // `invalid_arguments` and never reach the approver. `call` parses again
+        // (double-parse is the accepted trade-off; a `PreparedToolCall` that
+        // parses once is a later optimization).
+        match serde_json::from_value::<T::Args>(args.clone()) {
+            Ok(parsed) => Ok(TypedTool::permission(self, &parsed, ctx)),
+            Err(err) => Err(ToolOutput::failure(
+                "invalid_arguments",
+                format!("failed to parse arguments: {err}"),
+            )),
+        }
+    }
+
+    async fn call(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<ToolOutput, ToolError> {
         let output = match serde_json::from_value::<T::Args>(args) {
-            Ok(args) => self.run(args).await,
+            Ok(args) => self.run(args, ctx).await,
             Err(err) => {
                 return Ok(ToolOutput::failure(
                     "invalid_arguments",

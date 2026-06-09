@@ -27,6 +27,12 @@ pub enum AgentError {
     #[error("agent transcript is empty")]
     EmptyTranscript,
 
+    /// The turn was cancelled — a user interrupt, or an `Abort` at an approval
+    /// prompt. Distinct from a tool failure so callers (e.g. the CLI) can tell a
+    /// deliberate Ctrl-C apart from a real error.
+    #[error("agent turn was cancelled")]
+    Cancelled,
+
     /// The model kept requesting tools until the loop budget was exhausted.
     #[error("agent exceeded max iterations ({max_iterations}) before producing a final answer")]
     MaxIterations {

@@ -6,7 +6,7 @@ use kuncode_core::completion::ToolDefinition;
 
 use crate::{
     tool::{
-        Tool, ToolError, ToolOutput,
+        Tool, ToolContext, ToolError, ToolOutput,
         bash::Bash,
         filesystem::{EditFile, Glob, ReadFile, WriteFile},
     },
@@ -85,17 +85,29 @@ impl ToolRegistry {
             .collect()
     }
 
+    /// Looks up a registered tool by its model-facing name.
+    ///
+    /// The runner uses this to compute the permission request and dispatch on
+    /// the same handle, so the gate and the call see one tool instance.
+    pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
+        self.index
+            .get(name)
+            .and_then(|&index| self.tools.get(index))
+            .cloned()
+    }
+
     /// Dispatches a tool call by the name emitted by the model.
     ///
     /// Unknown tools are returned as model-recoverable tool failures so the
     /// runner can append the result to the transcript and let the model retry.
-    pub async fn call(&self, name: &str, args: serde_json::Value) -> Result<ToolOutput, ToolError> {
-        match self
-            .index
-            .get(name)
-            .and_then(|&index| self.tools.get(index))
-        {
-            Some(tool) => tool.call(args).await,
+    pub async fn call(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<ToolOutput, ToolError> {
+        match self.get(name) {
+            Some(tool) => tool.call(args, ctx).await,
             None => Ok(ToolOutput::failure(
                 "unknown_tool",
                 format!("tool `{name}` is not registered"),
@@ -120,7 +132,8 @@ mod tests {
     use async_trait::async_trait;
     use kuncode_core::completion::ToolDefinition;
 
-    use crate::tool::{Tool, ToolOutput, bash::Bash};
+    use crate::permission::{PermissionAction, PermissionRequest};
+    use crate::tool::{Tool, ToolContext, ToolOutput, bash::Bash};
     use crate::workspace::Workspace;
 
     async fn bash() -> Bash {
@@ -151,9 +164,23 @@ mod tests {
             &self.definition
         }
 
+        fn permission(
+            &self,
+            _args: &serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> Result<PermissionRequest, ToolOutput> {
+            Ok(PermissionRequest::new(
+                self.definition.name.clone(),
+                PermissionAction::Read,
+                None,
+                "test tool",
+            ))
+        }
+
         async fn call(
             &self,
             _args: serde_json::Value,
+            _ctx: &ToolContext,
         ) -> Result<ToolOutput, crate::tool::ToolError> {
             Ok(ToolOutput::success(serde_json::json!({
                 "name": self.definition.name
@@ -239,7 +266,11 @@ mod tests {
         registry.register(bash().await);
 
         let output = registry
-            .call("bash", serde_json::json!({ "cmd": "printf registry" }))
+            .call(
+                "bash",
+                serde_json::json!({ "cmd": "printf registry" }),
+                &ToolContext::new(),
+            )
             .await
             .expect("registered tool should not fail at harness level");
 
@@ -252,7 +283,7 @@ mod tests {
         let registry = ToolRegistry::new();
 
         let output = registry
-            .call("missing", serde_json::json!({}))
+            .call("missing", serde_json::json!({}), &ToolContext::new())
             .await
             .expect("unknown tool should be reported to the model");
 

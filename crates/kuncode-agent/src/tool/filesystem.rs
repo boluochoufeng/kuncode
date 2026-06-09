@@ -14,7 +14,9 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::{
-    tool::{ToolOutput, TypedTool, definition_for},
+    glob::{glob_match, normalize_pattern},
+    permission::{PermissionAction, PermissionRequest},
+    tool::{ToolContext, ToolOutput, TypedTool, definition_for},
     workspace::{Workspace, WorkspaceError},
 };
 
@@ -97,7 +99,17 @@ impl TypedTool for ReadFile {
         &self.definition
     }
 
-    async fn run(&self, args: ReadFileArgs) -> ToolOutput<ReadFileOutput> {
+    fn permission(&self, args: &ReadFileArgs, _ctx: &ToolContext) -> PermissionRequest {
+        let path = rule_path(&self.workspace, &args.path);
+        PermissionRequest::new(
+            "read_file",
+            PermissionAction::Read,
+            Some(path.clone()),
+            format!("Read file: {path}"),
+        )
+    }
+
+    async fn run(&self, args: ReadFileArgs, _ctx: &ToolContext) -> ToolOutput<ReadFileOutput> {
         let path = match non_empty_path(&args.path) {
             Ok(path) => path,
             Err(output) => return output,
@@ -276,7 +288,17 @@ impl TypedTool for WriteFile {
         &self.definition
     }
 
-    async fn run(&self, args: WriteFileArgs) -> ToolOutput<WriteFileOutput> {
+    fn permission(&self, args: &WriteFileArgs, _ctx: &ToolContext) -> PermissionRequest {
+        let path = rule_path(&self.workspace, &args.path);
+        PermissionRequest::new(
+            "write_file",
+            PermissionAction::Write,
+            Some(path.clone()),
+            format!("Write file: {path}"),
+        )
+    }
+
+    async fn run(&self, args: WriteFileArgs, _ctx: &ToolContext) -> ToolOutput<WriteFileOutput> {
         let path = match non_empty_path(&args.path) {
             Ok(path) => path,
             Err(output) => return output,
@@ -359,7 +381,17 @@ impl TypedTool for EditFile {
         &self.definition
     }
 
-    async fn run(&self, args: EditFileArgs) -> ToolOutput<EditFileOutput> {
+    fn permission(&self, args: &EditFileArgs, _ctx: &ToolContext) -> PermissionRequest {
+        let path = rule_path(&self.workspace, &args.path);
+        PermissionRequest::new(
+            "edit_file",
+            PermissionAction::Write,
+            Some(path.clone()),
+            format!("Edit file: {path}"),
+        )
+    }
+
+    async fn run(&self, args: EditFileArgs, _ctx: &ToolContext) -> ToolOutput<EditFileOutput> {
         let path = match non_empty_path(&args.path) {
             Ok(path) => path,
             Err(output) => return output,
@@ -482,7 +514,17 @@ impl TypedTool for Glob {
         &self.definition
     }
 
-    async fn run(&self, args: GlobArgs) -> ToolOutput<GlobOutput> {
+    fn permission(&self, args: &GlobArgs, _ctx: &ToolContext) -> PermissionRequest {
+        let pattern = normalize_pattern(args.pattern.trim());
+        PermissionRequest::new(
+            "glob",
+            PermissionAction::Read,
+            Some(pattern.clone()),
+            format!("Search files: {pattern}"),
+        )
+    }
+
+    async fn run(&self, args: GlobArgs, _ctx: &ToolContext) -> ToolOutput<GlobOutput> {
         let pattern = args.pattern.trim();
         if pattern.is_empty() {
             return ToolOutput::failure("invalid_arguments", "`pattern` must not be empty");
@@ -536,6 +578,58 @@ impl TypedTool for Glob {
         } else {
             output
         }
+    }
+}
+
+/// Lexically normalizes a path argument into a workspace-relative, slash-form
+/// string for permission-rule matching. Pure string work — **no filesystem
+/// access**: an absolute path under the root is stripped textually, separators
+/// are unified, and the result is [`lexical_fold`]-ed so `.`, `..`, and `//`
+/// can't spell a path around a `deny` rule (`secrets/../secrets/x`). The
+/// authoritative canonicalization + symlink/boundary check still happens in
+/// each tool's `run`; this is only what a `Read(src/**)`-style rule matches.
+fn rule_path(workspace: &Workspace, path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    let root = workspace.root().to_string_lossy().replace('\\', "/");
+    let relative = normalized
+        .strip_prefix(&format!("{root}/"))
+        .unwrap_or(&normalized);
+    lexical_fold(relative)
+}
+
+/// Folds a slash-separated path lexically: drops `.` and empty (`//`) segments
+/// and resolves `..` by popping the preceding normal segment. A leading `/` is
+/// preserved, and `..` that would climb above the start is kept verbatim (it
+/// can't be folded without a parent, and `run`'s boundary rejects it anyway).
+///
+/// Symlinks are **not** resolved here — that needs the filesystem and would
+/// reintroduce TOCTOU into the otherwise-pure permission layer. This only
+/// closes the *textual* spellings of a path; the hard guarantee is still the
+/// workspace-boundary canonicalize in each tool's `run`.
+fn lexical_fold(path: &str) -> String {
+    let absolute = path.starts_with('/');
+    let mut stack: Vec<&str> = Vec::new();
+    for segment in path.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                // Pop a real segment; keep `..` only when there's nothing to
+                // pop (a relative path climbing above its start), never for an
+                // absolute path (which can't climb above root).
+                if matches!(stack.last(), Some(&seg) if seg != "..") {
+                    stack.pop();
+                } else if !absolute {
+                    stack.push("..");
+                }
+            }
+            normal => stack.push(normal),
+        }
+    }
+    let joined = stack.join("/");
+    if absolute {
+        format!("/{joined}")
+    } else {
+        joined
     }
 }
 
@@ -694,80 +788,18 @@ fn relative_slash(workspace: &Workspace, path: &Path) -> String {
     workspace.relative_display(path).replace('\\', "/")
 }
 
-fn normalize_pattern(pattern: &str) -> String {
-    pattern.replace('\\', "/")
-}
-
-fn glob_match(pattern: &str, path: &str) -> bool {
-    let pattern_parts = pattern.split('/').collect::<Vec<_>>();
-    let path_parts = path.split('/').collect::<Vec<_>>();
-    glob_parts_match(&pattern_parts, &path_parts)
-}
-
-fn glob_parts_match(pattern: &[&str], path: &[&str]) -> bool {
-    match (pattern.split_first(), path.split_first()) {
-        (None, None) => true,
-        (None, Some(_)) => false,
-        (Some((&"**", rest)), None) => glob_parts_match(rest, path),
-        (Some((&"**", rest)), Some((_, path_rest))) => {
-            glob_parts_match(rest, path) || glob_parts_match(pattern, path_rest)
-        }
-        (Some((segment_pattern, pattern_rest)), Some((segment, path_rest))) => {
-            segment_match(segment_pattern, segment) && glob_parts_match(pattern_rest, path_rest)
-        }
-        (Some(_), None) => false,
-    }
-}
-
-fn segment_match(pattern: &str, text: &str) -> bool {
-    let pattern = pattern.chars().collect::<Vec<_>>();
-    let text = text.chars().collect::<Vec<_>>();
-    let mut dp = vec![vec![false; text.len() + 1]; pattern.len() + 1];
-    dp[0][0] = true;
-
-    for index in 0..pattern.len() {
-        match pattern[index] {
-            '*' => {
-                for text_index in 0..=text.len() {
-                    if dp[index][text_index] {
-                        dp[index + 1][text_index] = true;
-                    }
-                    if text_index > 0 && dp[index + 1][text_index - 1] {
-                        dp[index + 1][text_index] = true;
-                    }
-                }
-            }
-            '?' => {
-                for text_index in 0..text.len() {
-                    if dp[index][text_index] {
-                        dp[index + 1][text_index + 1] = true;
-                    }
-                }
-            }
-            literal => {
-                for text_index in 0..text.len() {
-                    if dp[index][text_index] && text[text_index] == literal {
-                        dp[index + 1][text_index + 1] = true;
-                    }
-                }
-            }
-        }
-    }
-
-    dp[pattern.len()][text.len()]
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
         fs,
         path::{Path, PathBuf},
+        sync::atomic::{AtomicU64, Ordering},
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::{EditFile, Glob, MAX_LINE_BYTES, ReadFile, WriteFile, glob_match};
+    use super::{EditFile, Glob, MAX_LINE_BYTES, ReadFile, WriteFile};
     use crate::{
-        tool::Tool,
+        tool::{Tool, ToolContext},
         workspace::{Workspace, WorkspaceError},
     };
 
@@ -777,12 +809,18 @@ mod tests {
 
     impl TestDir {
         fn new() -> Self {
+            // pid + timestamp keep names unique across separate test-binary
+            // runs; a process-wide counter keeps them unique across *parallel*
+            // tests in one run, where the nanosecond stamp can collide and one
+            // test's `Drop` would otherwise `remove_dir_all` another's directory.
+            static SEQ: AtomicU64 = AtomicU64::new(0);
             let stamp = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("system time should be after unix epoch")
                 .as_nanos();
+            let seq = SEQ.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
-                "kuncode-filesystem-tool-test-{stamp}-{}",
+                "kuncode-filesystem-tool-test-{}-{stamp}-{seq}",
                 std::process::id()
             ));
             fs::create_dir_all(&path).expect("test directory should be created");
@@ -814,11 +852,14 @@ mod tests {
         let tool = ReadFile::new(tmp.workspace().await);
 
         let output = tool
-            .call(serde_json::json!({
-                "path": "notes.txt",
-                "start_line": 2,
-                "limit": 1
-            }))
+            .call(
+                serde_json::json!({
+                    "path": "notes.txt",
+                    "start_line": 2,
+                    "limit": 1
+                }),
+                &ToolContext::new(),
+            )
             .await
             .expect("no harness-level error");
 
@@ -843,7 +884,10 @@ mod tests {
         let tool = ReadFile::new(tmp.workspace().await);
 
         let output = tool
-            .call(serde_json::json!({ "path": "notes.txt" }))
+            .call(
+                serde_json::json!({ "path": "notes.txt" }),
+                &ToolContext::new(),
+            )
             .await
             .expect("no harness-level error");
 
@@ -865,7 +909,10 @@ mod tests {
         let tool = ReadFile::new(tmp.workspace().await);
 
         let output = tool
-            .call(serde_json::json!({ "path": "notes.txt", "start_line": 6 }))
+            .call(
+                serde_json::json!({ "path": "notes.txt", "start_line": 6 }),
+                &ToolContext::new(),
+            )
             .await
             .expect("no harness-level error");
 
@@ -885,7 +932,7 @@ mod tests {
         let tool = ReadFile::new(tmp.workspace().await);
 
         let output = tool
-            .call(serde_json::json!({ "path": "min.js" }))
+            .call(serde_json::json!({ "path": "min.js" }), &ToolContext::new())
             .await
             .expect("no harness-level error");
 
@@ -915,7 +962,10 @@ mod tests {
         let tool = ReadFile::new(tmp.workspace().await);
 
         let output = tool
-            .call(serde_json::json!({ "path": "cjk.txt" }))
+            .call(
+                serde_json::json!({ "path": "cjk.txt" }),
+                &ToolContext::new(),
+            )
             .await
             .expect("no harness-level error");
 
@@ -946,7 +996,10 @@ mod tests {
         let tool = ReadFile::new(tmp.workspace().await);
 
         let output = tool
-            .call(serde_json::json!({ "path": "big.txt" }))
+            .call(
+                serde_json::json!({ "path": "big.txt" }),
+                &ToolContext::new(),
+            )
             .await
             .expect("no harness-level error");
 
@@ -979,7 +1032,10 @@ mod tests {
         let tool = ReadFile::new(tmp.workspace().await);
 
         let output = tool
-            .call(serde_json::json!({ "path": "mixed.txt", "limit": 2 }))
+            .call(
+                serde_json::json!({ "path": "mixed.txt", "limit": 2 }),
+                &ToolContext::new(),
+            )
             .await
             .expect("no harness-level error");
 
@@ -1015,7 +1071,10 @@ mod tests {
         let tool = ReadFile::new(tmp.workspace().await);
 
         let output = tool
-            .call(serde_json::json!({ "path": "mixed.bin", "limit": 1 }))
+            .call(
+                serde_json::json!({ "path": "mixed.bin", "limit": 1 }),
+                &ToolContext::new(),
+            )
             .await
             .expect("no harness-level error");
 
@@ -1031,7 +1090,10 @@ mod tests {
 
         // `start_line` is 1-based; `0` is a contract violation, not "line 0".
         let output = tool
-            .call(serde_json::json!({ "path": "notes.txt", "start_line": 0 }))
+            .call(
+                serde_json::json!({ "path": "notes.txt", "start_line": 0 }),
+                &ToolContext::new(),
+            )
             .await
             .expect("no harness-level error");
 
@@ -1048,10 +1110,13 @@ mod tests {
         let tool = WriteFile::new(tmp.workspace().await);
 
         let output = tool
-            .call(serde_json::json!({
-                "path": "missing/new.txt",
-                "content": "hello"
-            }))
+            .call(
+                serde_json::json!({
+                    "path": "missing/new.txt",
+                    "content": "hello"
+                }),
+                &ToolContext::new(),
+            )
             .await
             .expect("no harness-level error");
 
@@ -1066,10 +1131,13 @@ mod tests {
         let tool = WriteFile::new(tmp.workspace().await);
 
         let output = tool
-            .call(serde_json::json!({
-                "path": "src/new.txt",
-                "content": "hello"
-            }))
+            .call(
+                serde_json::json!({
+                    "path": "src/new.txt",
+                    "content": "hello"
+                }),
+                &ToolContext::new(),
+            )
             .await
             .expect("no harness-level error");
 
@@ -1088,11 +1156,14 @@ mod tests {
         let tool = EditFile::new(tmp.workspace().await);
 
         let output = tool
-            .call(serde_json::json!({
-                "path": "notes.txt",
-                "old_text": "target",
-                "new_text": "done"
-            }))
+            .call(
+                serde_json::json!({
+                    "path": "notes.txt",
+                    "old_text": "target",
+                    "new_text": "done"
+                }),
+                &ToolContext::new(),
+            )
             .await
             .expect("no harness-level error");
 
@@ -1111,11 +1182,14 @@ mod tests {
         let tool = EditFile::new(tmp.workspace().await);
 
         let output = tool
-            .call(serde_json::json!({
-                "path": "notes.txt",
-                "old_text": "same",
-                "new_text": "done"
-            }))
+            .call(
+                serde_json::json!({
+                    "path": "notes.txt",
+                    "old_text": "same",
+                    "new_text": "done"
+                }),
+                &ToolContext::new(),
+            )
             .await
             .expect("no harness-level error");
 
@@ -1135,11 +1209,14 @@ mod tests {
         let tool = EditFile::new(tmp.workspace().await);
 
         let output = tool
-            .call(serde_json::json!({
-                "path": "notes.txt",
-                "old_text": "missing",
-                "new_text": "done"
-            }))
+            .call(
+                serde_json::json!({
+                    "path": "notes.txt",
+                    "old_text": "missing",
+                    "new_text": "done"
+                }),
+                &ToolContext::new(),
+            )
             .await
             .expect("no harness-level error");
 
@@ -1157,7 +1234,10 @@ mod tests {
         let tool = Glob::new(tmp.workspace().await);
 
         let output = tool
-            .call(serde_json::json!({ "pattern": "**/*.rs" }))
+            .call(
+                serde_json::json!({ "pattern": "**/*.rs" }),
+                &ToolContext::new(),
+            )
             .await
             .expect("no harness-level error");
 
@@ -1185,7 +1265,10 @@ mod tests {
         let tool = Glob::new(tmp.workspace().await);
 
         let output = tool
-            .call(serde_json::json!({ "pattern": "**/*.rs" }))
+            .call(
+                serde_json::json!({ "pattern": "**/*.rs" }),
+                &ToolContext::new(),
+            )
             .await
             .expect("no harness-level error");
 
@@ -1206,7 +1289,10 @@ mod tests {
 
         // Even with `include_ignored`, the VCS store must never be traversed.
         let output = tool
-            .call(serde_json::json!({ "pattern": "**/*.rs", "include_ignored": true }))
+            .call(
+                serde_json::json!({ "pattern": "**/*.rs", "include_ignored": true }),
+                &ToolContext::new(),
+            )
             .await
             .expect("no harness-level error");
 
@@ -1225,7 +1311,10 @@ mod tests {
         let tool = Glob::new(tmp.workspace().await);
 
         let output = tool
-            .call(serde_json::json!({ "pattern": "**/*.rs", "include_ignored": true }))
+            .call(
+                serde_json::json!({ "pattern": "**/*.rs", "include_ignored": true }),
+                &ToolContext::new(),
+            )
             .await
             .expect("no harness-level error");
 
@@ -1261,7 +1350,10 @@ mod tests {
         let tool = Glob::new(tmp.workspace().await);
 
         let output = tool
-            .call(serde_json::json!({ "pattern": "**/*.rs" }))
+            .call(
+                serde_json::json!({ "pattern": "**/*.rs" }),
+                &ToolContext::new(),
+            )
             .await
             .expect("no harness-level error");
 
@@ -1282,7 +1374,10 @@ mod tests {
         let tool = Glob::new(tmp.workspace().await);
 
         let output = tool
-            .call(serde_json::json!({ "pattern": "../*.rs" }))
+            .call(
+                serde_json::json!({ "pattern": "../*.rs" }),
+                &ToolContext::new(),
+            )
             .await
             .expect("no harness-level error");
 
@@ -1309,7 +1404,7 @@ mod tests {
         let tool = ReadFile::new(tmp.workspace().await);
 
         let output = tool
-            .call(serde_json::json!({ "path": "link" }))
+            .call(serde_json::json!({ "path": "link" }), &ToolContext::new())
             .await
             .expect("no harness-level error");
 
@@ -1319,12 +1414,18 @@ mod tests {
     }
 
     #[test]
-    fn glob_match_supports_segment_and_recursive_wildcards() {
-        assert!(glob_match("*.rs", "main.rs"));
-        assert!(!glob_match("*.rs", "src/main.rs"));
-        assert!(glob_match("**/*.rs", "src/main.rs"));
-        assert!(glob_match("src/**/main.??", "src/bin/main.rs"));
-        assert!(!glob_match("src/**/main.??", "src/bin/main.txt"));
+    fn lexical_fold_closes_textual_path_spellings() {
+        use super::lexical_fold;
+        // `.`, `..`, and `//` are folded so they can't spell a path around a
+        // `deny(secrets/**)` rule.
+        assert_eq!(lexical_fold("secrets/../secrets/x"), "secrets/x");
+        assert_eq!(lexical_fold("./secrets/x"), "secrets/x");
+        assert_eq!(lexical_fold("secrets//x"), "secrets/x");
+        assert_eq!(lexical_fold("src/../README.md"), "README.md");
+        // A leading climb is kept verbatim (run's boundary rejects it); an
+        // absolute path keeps its leading slash and never climbs above root.
+        assert_eq!(lexical_fold("../../etc/passwd"), "../../etc/passwd");
+        assert_eq!(lexical_fold("/etc/../etc/passwd"), "/etc/passwd");
     }
 
     #[test]
