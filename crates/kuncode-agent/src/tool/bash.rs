@@ -7,13 +7,13 @@ use serde::{Deserialize, Serialize};
 use tokio::{process::Command, time::timeout};
 
 use crate::{
-    tool::{ToolErrorPayload, ToolOutput, TypedTool, definition_for},
+    permission::{PermissionAction, PermissionRequest},
+    tool::{ToolContext, ToolErrorPayload, ToolOutput, TypedTool, definition_for},
     workspace::{Workspace, WorkspaceError},
 };
 
 const OUTPUT_LIMIT_BYTES: usize = 20_000;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
-const DANGEROUS_COMMAND_PATTERNS: &[&str] = &["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"];
 
 /// Arguments accepted by the [`Bash`] tool.
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -63,20 +63,24 @@ impl TypedTool for Bash {
         &self.definition
     }
 
-    async fn run(&self, args: BashArgs) -> ToolOutput<BashOutput> {
+    fn permission(&self, args: &BashArgs, _ctx: &ToolContext) -> PermissionRequest {
+        // Lightly normalize (trim + collapse whitespace) for rule matching only;
+        // this is NOT shell lexing — see the threat model in the s03 doc.
+        let command = normalize_command(&args.cmd);
+        let summary = format!("Run shell command: {command}");
+        PermissionRequest::new("bash", PermissionAction::Execute, Some(command), summary)
+    }
+
+    async fn run(&self, args: BashArgs, _ctx: &ToolContext) -> ToolOutput<BashOutput> {
         let cmd = args.cmd;
 
         if cmd.trim().is_empty() {
             return ToolOutput::failure("invalid_arguments", "`cmd` must not be empty");
         }
 
-        if let Some(pattern) = blocked_pattern(&cmd) {
-            return ToolOutput::failure(
-                "dangerous_command",
-                format!("command contains blocked pattern `{pattern}`"),
-            );
-        }
-
+        // Dangerous-command protection is no longer a per-tool substring
+        // blocklist (trivially bypassable). It now lives in the permission gate
+        // as built-in `deny` rules enforced by the runner before this runs.
         let mut command = Command::new("bash");
         command
             .arg("-lc")
@@ -153,17 +157,20 @@ fn output_text(stream: &str, bytes: &[u8]) -> (String, bool) {
     (text, true)
 }
 
-fn blocked_pattern(cmd: &str) -> Option<&'static str> {
-    DANGEROUS_COMMAND_PATTERNS
-        .iter()
-        .copied()
-        .find(|pattern| cmd.contains(pattern))
+/// Collapses runs of whitespace to a single space and trims the ends, so
+/// `rm  -rf   /` matches a `Bash(rm -rf /*)` rule. This is for rule matching
+/// only — it is not shell lexing and makes no security claim.
+fn normalize_command(cmd: &str) -> String {
+    cmd.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Bash, blocked_pattern};
-    use crate::{tool::Tool, workspace::Workspace};
+    use super::Bash;
+    use crate::{
+        tool::{Tool, ToolContext},
+        workspace::Workspace,
+    };
 
     async fn bash() -> Bash {
         Bash::from_current_dir()
@@ -175,7 +182,10 @@ mod tests {
     async fn call_erases_typed_output_for_the_model() {
         let out = bash()
             .await
-            .call(serde_json::json!({ "cmd": "printf hello" }))
+            .call(
+                serde_json::json!({ "cmd": "printf hello" }),
+                &ToolContext::new(),
+            )
             .await
             .expect("no harness-level error");
 
@@ -190,7 +200,7 @@ mod tests {
     async fn call_reports_bad_arguments_in_the_envelope() {
         let out = bash()
             .await
-            .call(serde_json::json!({}))
+            .call(serde_json::json!({}), &ToolContext::new())
             .await
             .expect("bad arguments are model-recoverable, not a harness error");
 
@@ -215,32 +225,6 @@ mod tests {
         assert_eq!(params["properties"]["cmd"]["type"], "string");
     }
 
-    #[test]
-    fn detects_dangerous_commands() {
-        for cmd in [
-            "rm -rf /",
-            "sudo ls",
-            "shutdown now",
-            "reboot",
-            "echo test > /dev/sda",
-        ] {
-            assert!(
-                blocked_pattern(cmd).is_some(),
-                "expected `{cmd}` to be blocked"
-            );
-        }
-    }
-
-    #[test]
-    fn allows_regular_commands() {
-        for cmd in ["ls -la", "cargo check", "rg ToolOutput crates"] {
-            assert!(
-                blocked_pattern(cmd).is_none(),
-                "expected `{cmd}` to be allowed"
-            );
-        }
-    }
-
     #[tokio::test]
     async fn truncates_oversized_output_with_a_visible_marker() {
         let workspace = Workspace::new(std::env::current_dir().expect("current directory exists"))
@@ -248,7 +232,10 @@ mod tests {
             .expect("workspace should be valid");
         // Emit well over OUTPUT_LIMIT_BYTES of pure `x` on stdout.
         let out = Bash::new(workspace)
-            .call(serde_json::json!({ "cmd": "printf 'x%.0s' {1..30000}" }))
+            .call(
+                serde_json::json!({ "cmd": "printf 'x%.0s' {1..30000}" }),
+                &ToolContext::new(),
+            )
             .await
             .expect("no harness-level error");
 
@@ -269,7 +256,7 @@ mod tests {
             .await
             .expect("workspace should be valid");
         let out = Bash::new(workspace)
-            .call(serde_json::json!({ "cmd": "pwd" }))
+            .call(serde_json::json!({ "cmd": "pwd" }), &ToolContext::new())
             .await
             .expect("no harness-level error");
 

@@ -10,7 +10,14 @@ path = "src/main.rs"
 [dependencies]
 kuncode-core = { path = "../kuncode-core" }
 kuncode-agent = { path = "../kuncode-agent" }
+async-trait = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
+tokio-util = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 dotenvy = { workspace = true }
 
 [dev-dependencies]
