@@ -8,10 +8,12 @@
 //! - [`Approver`] — the side-effecting human prompt, owned by the runner.
 //! - [`evaluate`] — the pure decision function over the three above.
 //!
-//! The runner sets the gate *before* dispatch: compute a [`PermissionRequest`]
-//! from the tool, `evaluate` it, and only on `Ask` consult the [`Approver`].
+//! The runner sets the gate *before* dispatch via [`PermissionGate`]: `prepare`
+//! a [`PermissionRequest`] from the tool, then `decide` it (`evaluate`, and only
+//! on `Ask` consult the [`Approver`]).
 
 pub mod approver;
+pub mod gate;
 pub mod policy;
 pub mod request;
 pub mod rule;
@@ -20,6 +22,7 @@ pub mod state;
 #[cfg(test)]
 pub use approver::ScriptedApprover;
 pub use approver::{Approver, AutoApprove, DenyAll};
+pub use gate::{Decision, PermissionGate, Prepared};
 pub use policy::{PermissionPolicy, evaluate};
 pub use request::{ApprovalOutcome, DenyReason, PermissionAction, PermissionRequest, Verdict};
 pub use rule::{

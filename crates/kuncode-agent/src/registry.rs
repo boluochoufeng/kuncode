@@ -6,7 +6,7 @@ use kuncode_core::completion::ToolDefinition;
 
 use crate::{
     tool::{
-        Tool, ToolContext, ToolError, ToolOutput,
+        Tool,
         bash::Bash,
         filesystem::{EditFile, Glob, ReadFile, WriteFile},
     },
@@ -94,25 +94,6 @@ impl ToolRegistry {
             .get(name)
             .and_then(|&index| self.tools.get(index))
             .cloned()
-    }
-
-    /// Dispatches a tool call by the name emitted by the model.
-    ///
-    /// Unknown tools are returned as model-recoverable tool failures so the
-    /// runner can append the result to the transcript and let the model retry.
-    pub async fn call(
-        &self,
-        name: &str,
-        args: serde_json::Value,
-        ctx: &ToolContext,
-    ) -> Result<ToolOutput, ToolError> {
-        match self.get(name) {
-            Some(tool) => tool.call(args, ctx).await,
-            None => Ok(ToolOutput::failure(
-                "unknown_tool",
-                format!("tool `{name}` is not registered"),
-            )),
-        }
     }
 
     /// Returns the number of registered tools.
@@ -258,36 +239,5 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(names, ["bash", "read", "edit", "write"]);
-    }
-
-    #[tokio::test]
-    async fn dispatches_registered_tool() {
-        let mut registry = ToolRegistry::new();
-        registry.register(bash().await);
-
-        let output = registry
-            .call(
-                "bash",
-                serde_json::json!({ "cmd": "printf registry" }),
-                &ToolContext::new(),
-            )
-            .await
-            .expect("registered tool should not fail at harness level");
-
-        assert!(output.ok);
-        assert_eq!(output.data.expect("tool data")["stdout"], "registry");
-    }
-
-    #[tokio::test]
-    async fn unknown_tool_is_model_recoverable() {
-        let registry = ToolRegistry::new();
-
-        let output = registry
-            .call("missing", serde_json::json!({}), &ToolContext::new())
-            .await
-            .expect("unknown tool should be reported to the model");
-
-        assert!(!output.ok);
-        assert_eq!(output.error.expect("error payload").kind, "unknown_tool");
     }
 }

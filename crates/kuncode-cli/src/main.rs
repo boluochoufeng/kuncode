@@ -1,4 +1,5 @@
 mod approver;
+mod observer;
 mod settings;
 
 use std::{
@@ -91,7 +92,8 @@ the task is done, then give a short, direct final answer."
     };
     let runner = AgentRunner::with_config(model, registry, config)
         .with_policy(policy)
-        .with_approver(Arc::new(TerminalApprover));
+        .with_approver(Arc::new(TerminalApprover))
+        .with_observer(Arc::new(observer::CliObserver));
 
     let mut session = AgentSession::with_mode(mode);
 
