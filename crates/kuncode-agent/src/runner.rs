@@ -315,10 +315,7 @@ where
                 .gated_call(session, iteration, &id, &name, arguments, &ctx)
                 .await
             {
-                Ok(output) => {
-                    self.emit_tool_end(session, iteration, &id, &name, &output);
-                    session.push(tool_result_message(id, call_id, output.to_model_content()));
-                }
+                Ok(output) => self.record_result(session, iteration, id, call_id, &name, output),
                 Err(error) => {
                     // The turn is unwinding with this tool_call — and any that
                     // follow it — still unpaired. Pair each with a synthetic
@@ -336,23 +333,17 @@ where
                         }
                         _ => interrupted_tool_output(),
                     };
-                    self.emit_tool_end(session, iteration, &id, &name, &failed);
-                    session.push(tool_result_message(id, call_id, failed.to_model_content()));
+                    self.record_result(session, iteration, id, call_id, &name, failed);
 
                     for unpaired in &tool_calls[index + 1..] {
-                        let interrupted = interrupted_tool_output();
-                        self.emit_tool_end(
+                        self.record_result(
                             session,
                             iteration,
-                            &unpaired.id,
-                            &unpaired.name,
-                            &interrupted,
-                        );
-                        session.push(tool_result_message(
                             unpaired.id.clone(),
                             unpaired.call_id.clone(),
-                            interrupted.to_model_content(),
-                        ));
+                            &unpaired.name,
+                            interrupted_tool_output(),
+                        );
                     }
                     return Err(error);
                 }
@@ -362,28 +353,36 @@ where
         Ok(())
     }
 
-    /// Emits the [`ToolEnd`](EventKind::ToolEnd) that mirrors `output` — same
-    /// `ok`/`error`/`truncated` — kept beside every transcript write so the
-    /// event and the result it describes can never drift apart.
-    fn emit_tool_end(
+    /// Records one tool result: emits the [`ToolEnd`](EventKind::ToolEnd) that
+    /// mirrors `output` — same `ok`/`error`/`truncated` — then appends the
+    /// transcript `tool_result` carrying the same `output`.
+    ///
+    /// The sole producer of either half, so the invariant "exactly one
+    /// `ToolEnd` per transcript `tool_result`, both describing the same outcome"
+    /// is structural: a new result path calls this and cannot emit the event
+    /// without the transcript write, or let the two describe different outcomes.
+    /// Event before transcript so a UI row closes no later than the result lands.
+    fn record_result(
         &self,
         session: &mut AgentSession,
         iteration: usize,
-        tool_call_id: &str,
+        id: String,
+        call_id: Option<String>,
         tool: &str,
-        output: &ToolOutput,
+        output: ToolOutput,
     ) {
         self.emit(
             session,
             Some(iteration),
             EventKind::ToolEnd {
-                tool_call_id: tool_call_id.to_string(),
+                tool_call_id: id.clone(),
                 tool: tool.to_string(),
                 ok: output.ok,
                 truncated: output.truncated,
                 error: output.error.as_ref().map(ToolFailure::from),
             },
         );
+        session.push(tool_result_message(id, call_id, output.to_model_content()));
     }
 
     /// Gates a tool call, then dispatches. The gate races the approval prompt
