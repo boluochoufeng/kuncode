@@ -14,6 +14,11 @@ use crate::permission::{PermissionMode, PermissionSessionState};
 pub struct AgentSession {
     messages: Vec<Message>,
     permissions: PermissionSessionState,
+    /// Monotonic counter handing out [`AgentEvent`](crate::observer::AgentEvent)
+    /// sequence numbers. Lives on the session, not the `&self`/`Clone` runner,
+    /// because ordering is per-session — same reasoning as the per-session
+    /// permission grants above.
+    seq: u64,
 }
 
 impl AgentSession {
@@ -27,6 +32,7 @@ impl AgentSession {
         Self {
             messages: Vec::new(),
             permissions: PermissionSessionState::new(mode),
+            seq: 0,
         }
     }
 
@@ -35,6 +41,7 @@ impl AgentSession {
         Self {
             messages,
             permissions: PermissionSessionState::default(),
+            seq: 0,
         }
     }
 
@@ -66,6 +73,13 @@ impl AgentSession {
 
     pub(crate) fn push(&mut self, message: Message) {
         self.messages.push(message);
+    }
+
+    /// Hands out the next event sequence number, then advances. Starts at `0`.
+    pub(crate) fn next_seq(&mut self) -> u64 {
+        let seq = self.seq;
+        self.seq += 1;
+        seq
     }
 
     pub(crate) fn is_empty(&self) -> bool {
