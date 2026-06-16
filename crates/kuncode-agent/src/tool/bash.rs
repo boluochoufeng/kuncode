@@ -65,7 +65,7 @@ impl TypedTool for Bash {
 
     fn permission(&self, args: &BashArgs, _ctx: &ToolContext) -> PermissionRequest {
         // Lightly normalize (trim + collapse whitespace) for rule matching only;
-        // this is NOT shell lexing — see the threat model in the s03 doc.
+        // this is NOT shell lexing and must not be relied on as a security boundary.
         let command = normalize_command(&args.cmd);
         let summary = format!("Run shell command: {command}");
         PermissionRequest::new("bash", PermissionAction::Execute, Some(command), summary)

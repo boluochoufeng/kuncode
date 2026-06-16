@@ -1372,7 +1372,7 @@ mod tests {
         let events = observer.events();
         let kinds: Vec<_> = events.iter().map(|e| event_label(&e.kind)).collect();
         // ModelStart's "thinking" state is closed by the Error, with no
-        // intervening Assistant — exactly the finding-2 guarantee.
+        // intervening Assistant.
         assert_eq!(kinds, vec!["model_start", "error"]);
         assert!(matches!(
             &events[1].kind,
@@ -1411,7 +1411,7 @@ mod tests {
             })
             .collect();
         // call_1 actually ran and failed → honest "tool_error"; call_2 never ran
-        // → "cancelled". This is finding 1.
+        // → "cancelled".
         assert_eq!(
             tool_ends,
             vec![

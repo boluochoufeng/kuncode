@@ -3,8 +3,7 @@
 //! This lives inside [`AgentSession`](crate::session::AgentSession), which is
 //! already passed `&mut` into every turn. Keeping the *mutable* grants here —
 //! rather than on the shared, `Clone` + `&self` runner — gives per-session
-//! isolation with no lock and no cross-session leak (see
-//! `docs/s03/permission-system.md` §3).
+//! isolation with no lock and no cross-session leak.
 
 use super::rule::Rule;
 
@@ -17,8 +16,8 @@ pub enum PermissionMode {
     /// Writes are auto-allowed; reads stay free; execute still asks. Explicit
     /// `deny`/`ask` rules still win (they are checked first).
     AcceptEdits,
-    /// Skip all prompts. Still honors `deny` — deny is unbypassable in normal
-    /// modes (diverges from Claude Code by design; see the threat model).
+    /// Skip all prompts. Still honors `deny` — an unbypassable security floor by
+    /// design, even here (a deliberate divergence from Claude Code).
     BypassPermissions,
 }
 

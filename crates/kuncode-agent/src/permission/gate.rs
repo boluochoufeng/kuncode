@@ -3,9 +3,9 @@
 //! The gate is the permission module's composed interface. It owns tool
 //! resolution, argument parsing, rule evaluation, the approval handshake, grant
 //! recording, the model-recoverable denial payloads, and the structured audit
-//! log. The runner calls it before dispatch and acts on the [`Decision`] —
-//! keeping `docs/s03/permission-system.md` §5's "gate in the runner, before
-//! dispatch" while giving the decision a seam with its own test surface.
+//! log. The runner calls it before dispatch and acts on the [`Decision`] — the
+//! gate sits in the runner, before dispatch, while giving the decision a seam
+//! with its own test surface.
 //!
 //! Two phases, split exactly where the runner emits `ToolStart` (so an unknown
 //! tool / bad arguments — which never produce a [`PermissionRequest`] — get no
@@ -52,7 +52,7 @@ pub enum Prepared {
         /// Resolved tool handle, shared with the gate's lookup.
         tool: Arc<dyn Tool>,
         /// The raw arguments, threaded through to dispatch (parsed again there —
-        /// the accepted double-parse, see `docs/s03/permission-system.md` §6).
+        /// an accepted double-parse).
         args: serde_json::Value,
         /// The computed permission request.
         request: PermissionRequest,
@@ -155,7 +155,7 @@ impl PermissionGate<'_> {
     }
 }
 
-/// Emits one structured permission audit event (§13). With no `tracing`
+/// Emits one structured permission audit event. With no `tracing`
 /// subscriber installed this is a no-op; the CLI installs one so `RUST_LOG`
 /// surfaces decisions.
 fn audit(request: &PermissionRequest, resource: &str, decision: &str, rule: Option<&str>) {

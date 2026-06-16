@@ -3,7 +3,7 @@
 //! Implements [`AgentObserver`] so `kuncode-agent` stays free of terminal IO:
 //! the agent emits, this renders. Live progress only — the turn's *final* answer
 //! and the cancel/error footer are printed by `main.rs`, the sole owner of the
-//! turn's terminal line (see `docs/agent-events.md` §4). Writes are light, so
+//! turn's terminal line. Writes are light, so
 //! running synchronously on the loop task is fine.
 
 use kuncode_agent::observer::{AgentEvent, AgentObserver, EventKind};

@@ -34,8 +34,7 @@ impl Approver for TerminalApprover {
         // wins, this task is orphaned and keeps holding stdin until the user
         // hits Enter — the next REPL read can then lose a line. Tolerated for
         // now (only triggers on Ctrl-C *during* a prompt); it dissolves once
-        // the CLI grows a single-owner input loop / line editor. See the
-        // design doc's deferred items (§17).
+        // the CLI grows a single-owner input loop / line editor.
         let answer = tokio::task::spawn_blocking(move || prompt(&summary, &scope_rule))
             .await
             .unwrap_or_else(|_| "n".to_string());

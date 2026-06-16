@@ -3,7 +3,7 @@
 //! The runner emits structured [`AgentEvent`]s at key points so a frontend can
 //! render live progress. This mirrors the [`Approver`] seam — the agent defines
 //! the trait and emits, the frontend implements rendering — so `kuncode-agent`
-//! never touches the terminal. See `docs/agent-events.md` for the full design.
+//! never touches the terminal.
 //!
 //! [`Approver`]: crate::permission::Approver
 
@@ -74,7 +74,8 @@ pub enum EventKind {
     /// The single terminal event for a tool call, derived from the `ToolOutput`
     /// written to the transcript. Success, denial, unknown tool, bad arguments,
     /// harness error, interruption — all flavors, told apart by `error.kind`.
-    /// Carries no full result body (see `docs/agent-events.md` §7).
+    /// Carries no full result body — that stays in the transcript; the event is
+    /// a thin notification, not the payload.
     ToolEnd {
         tool_call_id: String,
         tool: String,

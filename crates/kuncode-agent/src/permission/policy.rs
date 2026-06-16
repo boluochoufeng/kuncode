@@ -58,8 +58,8 @@ impl PermissionPolicy {
 
 /// Decides a request against the static policy and mutable session state.
 ///
-/// Pure: no IO, no mutation. Precedence (see `docs/s03/permission-system.md`
-/// §4): `deny → Bypass → ask → allow → AcceptEdits(Write) → default_for(action)`.
+/// Pure: no IO, no mutation. Precedence:
+/// `deny → Bypass → ask → allow → AcceptEdits(Write) → default_for(action)`.
 pub fn evaluate(
     policy: &PermissionPolicy,
     state: &PermissionSessionState,
