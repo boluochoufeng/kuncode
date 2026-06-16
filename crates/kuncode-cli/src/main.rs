@@ -1,4 +1,5 @@
 mod approver;
+mod config;
 mod observer;
 mod settings;
 
@@ -10,7 +11,6 @@ use std::{
 use clap::Parser;
 use kuncode_agent::{
     error::AgentError,
-    permission::{PermissionMode, PermissionPolicy, Rule, RuleOrigin, parse_rule},
     registry::ToolRegistry,
     runner::{AgentConfig, AgentRunner},
     session::AgentSession,
@@ -22,7 +22,11 @@ use kuncode_core::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::{approver::TerminalApprover, settings::load_project_settings};
+use crate::{
+    approver::TerminalApprover,
+    config::{PermissionFlags, resolve_permissions},
+    settings::load_project_settings,
+};
 
 /// kuncode — a coding agent operating in your shell.
 #[derive(Parser, Debug)]
@@ -60,19 +64,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let workspace = Workspace::from_current_dir().await?;
     let cwd = workspace.root().display().to_string();
 
-    // Assemble the permission policy: built-in deny ∪ project file ∪ CLI flags.
+    // Resolve permissions from built-in ∪ project file ∪ CLI flags, with mode
+    // precedence CLI > project > Default. The merge is pure and tested in `config`;
+    // loading the project file (I/O) stays in `settings`.
     let project = load_project_settings(workspace.root())?;
-    let mut policy = PermissionPolicy::builtin();
-    policy.append(project.policy);
-    append_flag_rules(&mut policy, &cli)?;
-
-    // Mode precedence: CLI flag > project file > Default.
-    let mode = match &cli.mode {
-        Some(name) => {
-            PermissionMode::parse(name).ok_or_else(|| format!("invalid --mode `{name}`"))?
-        }
-        None => project.default_mode.unwrap_or_default(),
+    let flags = PermissionFlags {
+        allow: &cli.allow,
+        ask: &cli.ask,
+        deny: &cli.deny,
+        mode: cli.mode.as_deref(),
     };
+    let resolved = resolve_permissions(project, &flags)?;
 
     let system_prompt = format!(
         "You are kuncode, a coding agent operating in the user's shell. \
@@ -91,11 +93,11 @@ the task is done, then give a short, direct final answer."
         ..AgentConfig::default()
     };
     let runner = AgentRunner::with_config(model, registry, config)
-        .with_policy(policy)
+        .with_policy(resolved.policy)
         .with_approver(Arc::new(TerminalApprover))
         .with_observer(Arc::new(observer::CliObserver));
 
-    let mut session = AgentSession::with_mode(mode);
+    let mut session = AgentSession::with_mode(resolved.mode);
 
     let initial_prompt = cli.prompt.join(" ");
     if !initial_prompt.trim().is_empty() {
@@ -167,21 +169,4 @@ async fn run_turn<M: CompletionModel>(
         Err(AgentError::Cancelled) => Err(TurnError::Cancelled),
         Err(err) => Err(TurnError::Agent(err)),
     }
-}
-
-/// Appends `--allow` / `--ask` / `--deny` flag rules onto the policy lists.
-fn append_flag_rules(policy: &mut PermissionPolicy, cli: &Cli) -> Result<(), String> {
-    push_flag_rules(&mut policy.allow, &cli.allow)?;
-    push_flag_rules(&mut policy.ask, &cli.ask)?;
-    push_flag_rules(&mut policy.deny, &cli.deny)?;
-    Ok(())
-}
-
-fn push_flag_rules(target: &mut Vec<Rule>, rules: &[String]) -> Result<(), String> {
-    for rule in rules {
-        let parsed = parse_rule(rule, RuleOrigin::CliFlag)
-            .map_err(|err| format!("invalid rule `{rule}`: {err}"))?;
-        target.extend(parsed);
-    }
-    Ok(())
 }
