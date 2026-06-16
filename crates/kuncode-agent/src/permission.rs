@@ -1,6 +1,6 @@
 //! Permission system: rules, policy, session state, and approval.
 //!
-//! Layering (see `docs/s03/permission-system.md`):
+//! Layering:
 //!
 //! - [`PermissionPolicy`] — static rules, owned read-only by the runner.
 //! - [`PermissionSessionState`] — per-session grants + mode, lives in

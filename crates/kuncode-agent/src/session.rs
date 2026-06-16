@@ -8,8 +8,7 @@ use crate::permission::{PermissionMode, PermissionSessionState};
 ///
 /// Besides the message history it carries the mutable
 /// [`PermissionSessionState`]: keeping per-session grants and mode here — rather
-/// than on the shared, `&self` runner — gives per-session isolation with no lock
-/// (see `docs/s03/permission-system.md` §3).
+/// than on the shared, `&self` runner — gives per-session isolation with no lock.
 #[derive(Clone, Debug, Default)]
 pub struct AgentSession {
     messages: Vec<Message>,
