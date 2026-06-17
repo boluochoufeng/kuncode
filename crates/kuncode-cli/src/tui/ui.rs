@@ -2,59 +2,148 @@
 
 use ratatui::{
     Frame,
-    layout::{Constraint, Layout, Position, Rect},
-    style::{Style, Stylize},
+    layout::{Constraint, Layout, Margin, Position, Rect},
+    style::{Color, Style, Stylize},
     text::{Line, Text},
-    widgets::{Block, Clear, Paragraph, Wrap},
+    widgets::{Block, Paragraph, Wrap},
 };
 
 use super::app::{App, Item, Status, ToolState, mode_label};
 use super::bridge::ApprovalRequest;
 
-/// Draws one frame: conversation body, input box (height grows with the buffer),
-/// status line, and — when an approval is pending — a centered modal on top.
-pub fn draw(frame: &mut Frame, app: &App) {
-    let input_lines = app.input.split('\n').count().max(1) as u16;
-    // Border (2) + content, capped so a long paste can't swallow the screen.
-    let input_height = (input_lines + 2).min(8);
+/// Height of the approval panel when it takes the input box's place: a wrapped
+/// summary line, the rule line, the choices line, plus the border.
+const APPROVAL_HEIGHT: u16 = 6;
 
-    let [body, input_area, status_area] = Layout::vertical([
+/// Background tint distinguishing user input from agent output.
+const USER_BG: Color = Color::Rgb(45, 50, 70);
+
+/// Draws one frame: conversation body, a bottom pane, and the status line. The
+/// bottom pane is the input box, or — while an approval is pending — the
+/// permission panel *in its place* (aligned to the input, not a centered popup).
+pub fn draw(frame: &mut Frame, app: &mut App) {
+    let bottom_height = if app.approval.is_some() {
+        APPROVAL_HEIGHT
+    } else {
+        // Border (2) + content, capped so a long paste can't swallow the screen.
+        let input_lines = app.input.split('\n').count().max(1) as u16;
+        (input_lines + 2).min(8)
+    };
+
+    let [body, bottom, status_area] = Layout::vertical([
         Constraint::Min(1),
-        Constraint::Length(input_height),
+        Constraint::Length(bottom_height),
         Constraint::Length(1),
     ])
     .areas(frame.area());
 
     draw_conversation(frame, app, body);
-    draw_input(frame, app, input_area);
-    draw_status(frame, app, status_area);
-
     if let Some(approval) = &app.approval {
-        draw_approval(frame, approval, frame.area());
+        draw_approval(frame, approval, bottom);
+    } else {
+        draw_input(frame, app, bottom);
     }
+    draw_status(frame, app, status_area);
 }
 
-fn draw_conversation(frame: &mut Frame, app: &App, area: Rect) {
-    let lines = conversation_lines(app);
-
-    // Auto-follow the tail: scroll so the last line sits at the bottom. The wrap
-    // count is estimated from each line's display width (`Line::width`, which is
-    // unicode-aware) divided by the body's inner width, so long answers don't
-    // push the latest reply off-screen. Word-wrap can use a row or two more than
-    // this hard-division estimate; manual scroll-back lands in a later step.
+fn draw_conversation(frame: &mut Frame, app: &mut App, area: Rect) {
     let inner_width = area.width.saturating_sub(2).max(1);
     let inner_height = area.height.saturating_sub(2);
-    let total: u16 = lines
-        .iter()
-        .map(|line| (line.width() as u16).div_ceil(inner_width).max(1))
-        .sum();
-    let scroll = total.saturating_sub(inner_height);
+
+    // Wrap to exact physical lines ourselves rather than letting `Paragraph`
+    // word-wrap: a hard-division estimate runs short of the real wrapped count,
+    // so `max_scroll` came out too small and PageUp got swallowed. Exact wrapping
+    // makes the scroll range correct.
+    let lines = wrap_lines(conversation_lines(app), inner_width);
+    // Tag user rows by their background so we can repaint them after layout:
+    // `Paragraph` leaves a wide glyph's second cell untinted (sawtooth gaps).
+    let user_rows: Vec<bool> = lines.iter().map(|l| l.style.bg == Some(USER_BG)).collect();
+    let max_scroll = (lines.len() as u16).saturating_sub(inner_height);
+
+    // Follow pins to the bottom; a manual scroll clamps within range and
+    // re-enables follow once it lands back at the bottom.
+    if app.follow {
+        app.scroll = max_scroll;
+    } else {
+        app.scroll = app.scroll.min(max_scroll);
+        if app.scroll == max_scroll {
+            app.follow = true;
+        }
+    }
 
     let para = Paragraph::new(Text::from(lines))
         .block(Block::bordered().title("kuncode"))
-        .wrap(Wrap { trim: false })
-        .scroll((scroll, 0));
+        .scroll((app.scroll, 0));
     frame.render_widget(para, area);
+    paint_user_bg(frame, area, app.scroll, &user_rows);
+}
+
+/// Repaints the full-width background of user-message rows after layout.
+///
+/// A line-level background doesn't reach the second cell of a wide (CJK) glyph,
+/// so `Paragraph` renders user rows with dotted/sawtooth gaps. This fills every
+/// inner cell of those rows uniformly, including the continuation cells.
+fn paint_user_bg(frame: &mut Frame, area: Rect, scroll: u16, user_rows: &[bool]) {
+    let inner = area.inner(Margin::new(1, 1));
+    let buf = frame.buffer_mut();
+    for dy in 0..inner.height {
+        let idx = scroll as usize + dy as usize;
+        if user_rows.get(idx).copied().unwrap_or(false) {
+            let y = inner.y + dy;
+            for dx in 0..inner.width {
+                if let Some(cell) = buf.cell_mut((inner.x + dx, y)) {
+                    cell.bg = USER_BG;
+                }
+            }
+        }
+    }
+}
+
+/// Wraps logical lines to `width` display columns, preserving each line's style
+/// and padding every physical line out to the full width. Exact wrapping keeps
+/// the scroll range correct; full-width padding lets a line-level background
+/// (user input) span the whole row instead of hugging the text. Splits on
+/// character boundaries (not words) — fine for a conversation log.
+fn wrap_lines(logical: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let mut out = Vec::new();
+    for line in &logical {
+        let style = line.style;
+        let content: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        let mut seg = String::new();
+        let mut seg_width = 0u16;
+        for ch in content.chars() {
+            let cw = char_width(ch);
+            if !seg.is_empty() && seg_width + cw > width {
+                out.push(pad_line(seg, style, width));
+                seg = String::new();
+                seg_width = 0;
+            }
+            seg.push(ch);
+            seg_width += cw;
+        }
+        out.push(pad_line(seg, style, width));
+    }
+    out
+}
+
+/// Pads `content` with trailing spaces to `width` display columns and applies
+/// `style`, so a styled background fills the row to its right edge.
+fn pad_line(content: String, style: Style, width: u16) -> Line<'static> {
+    let used = Line::raw(content.as_str()).width() as u16;
+    let mut padded = content;
+    padded.push_str(&" ".repeat(width.saturating_sub(used) as usize));
+    Line::from(padded).style(style)
+}
+
+/// Display width of a single char (`Line::width` is unicode-aware, counting CJK
+/// as 2 cells).
+fn char_width(ch: char) -> u16 {
+    Line::raw(ch.to_string()).width() as u16
 }
 
 /// Flattens the conversation log into styled lines. Multi-line user/assistant
@@ -64,10 +153,15 @@ fn conversation_lines(app: &App) -> Vec<Line<'static>> {
     for item in &app.conversation {
         match item {
             Item::User(text) => {
+                // Tag rows with the user background; the gap-free fill happens in
+                // `paint_user_bg` after layout. A blank tinted row above and below
+                // gives the block vertical breathing room instead of hugging text.
+                lines.push(Line::from("").bg(USER_BG));
                 for (i, raw) in text.split('\n').enumerate() {
                     let prefix = if i == 0 { "› " } else { "  " };
-                    lines.push(Line::from(format!("{prefix}{raw}")).bold());
+                    lines.push(Line::from(format!("{prefix}{raw}")).bold().bg(USER_BG));
                 }
+                lines.push(Line::from("").bg(USER_BG));
             }
             Item::Assistant(text) => {
                 for raw in text.split('\n') {
@@ -80,7 +174,8 @@ fn conversation_lines(app: &App) -> Vec<Line<'static>> {
                 state,
                 ..
             } => {
-                lines.push(Line::from(format!("⏺ {name}  {summary}")).cyan());
+                let title = display_tool_name(name);
+                lines.push(Line::from(format!("⏺ {title}  {summary}")).cyan());
                 lines.push(tool_state_line(state));
             }
             Item::Error(text) => lines.push(Line::from(format!("✗ {text}")).red()),
@@ -106,6 +201,22 @@ fn tool_state_line(state: &ToolState) -> Line<'static> {
     }
 }
 
+/// Formats a tool's protocol name for display: snake_case → PascalCase, so a
+/// call reads like a proper name (`read_file` → `ReadFile`, `bash` → `Bash`).
+/// The wire name the model sees is unchanged; this is cosmetic only.
+fn display_tool_name(name: &str) -> String {
+    name.split('_')
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| {
+            let mut chars = segment.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().chain(chars).collect::<String>(),
+                None => String::new(),
+            }
+        })
+        .collect()
+}
+
 fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
     let title = if app.status == Status::Running {
         "input (运行中)"
@@ -117,11 +228,14 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
         .wrap(Wrap { trim: false });
     frame.render_widget(para, area);
 
-    // Show the cursor only when the user can type (idle, no modal).
+    // Show the cursor only when the user can type (idle, no modal). The column
+    // offset is the last line's *display* width — `Line::width` counts wide
+    // (CJK) chars as 2 cells — so the cursor sits at the visual end, not the
+    // char count.
     if app.status == Status::Idle && app.approval.is_none() {
         let rows = app.input.split('\n').count() as u16;
         let last = app.input.split('\n').next_back().unwrap_or("");
-        let cursor_x = area.x + 1 + last.chars().count() as u16;
+        let cursor_x = area.x + 1 + Line::raw(last).width() as u16;
         let cursor_y = area.y + rows;
         frame.set_cursor_position(Position::new(cursor_x, cursor_y));
     }
@@ -131,7 +245,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     let (state, hint) = if app.status == Status::Running {
         ("运行中", "^C 取消")
     } else {
-        ("就绪", "⏎ 发送 · ^C 退出")
+        ("就绪", "⏎ 发送 · exit/^C 退出")
     };
     let text = format!(
         " {} · {} · {} · {} ",
@@ -143,37 +257,97 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(text).dim(), area);
 }
 
+/// Renders the approval as a full-width bar in the bottom pane, sharing the
+/// input box's left edge and width.
 fn draw_approval(frame: &mut Frame, approval: &ApprovalRequest, area: Rect) {
     let lines = vec![
-        Line::from(format!("⚠ 需要授权: {}", approval.summary)),
-        Line::from(""),
-        Line::from(format!("记住规则: {}", approval.scope_rule())),
-        Line::from(""),
+        Line::from(format!("⚠ 需要授权: {}", approval.summary)).yellow(),
+        Line::from(format!("记住规则: {}", approval.scope_rule())).dim(),
         Line::from("[y] 允许一次  [a] 总是  [n] 否  [d] 永久拒绝  [c] 取消"),
     ];
-    let width = 64.min(area.width.saturating_sub(4));
-    let height = (lines.len() as u16 + 2).min(area.height);
-    let rect = centered(width, height, area);
-
-    let modal = Paragraph::new(Text::from(lines))
+    let panel = Paragraph::new(Text::from(lines))
         .block(
             Block::bordered()
                 .title("权限")
                 .border_style(Style::new().yellow()),
         )
         .wrap(Wrap { trim: false });
-    frame.render_widget(Clear, rect);
-    frame.render_widget(modal, rect);
+    frame.render_widget(panel, area);
 }
 
-/// A `width`×`height` rectangle centered in `area`, clamped to fit.
-fn centered(width: u16, height: u16, area: Rect) -> Rect {
-    let width = width.min(area.width);
-    let height = height.min(area.height);
-    Rect {
-        x: area.x + (area.width - width) / 2,
-        y: area.y + (area.height - height) / 2,
-        width,
-        height,
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::app::{Item, ToolState};
+    use kuncode_agent::permission::PermissionMode;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    #[test]
+    fn renders_key_elements_without_panicking() {
+        let mut app = App::new("model-x", PermissionMode::Default);
+        app.push_user("hi".to_string());
+        app.conversation.push(Item::Tool {
+            id: "1".to_string(),
+            name: "bash".to_string(),
+            summary: "run ls".to_string(),
+            state: ToolState::Ok { truncated: false },
+        });
+        app.push_assistant("done".to_string());
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 16)).expect("test terminal");
+        terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
+        // Scrolling must also render without panicking.
+        app.scroll_up(5);
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("draw after scroll");
+
+        let rendered = format!("{}", terminal.backend());
+        assert!(
+            rendered.contains("model-x"),
+            "status line should show model"
+        );
+        assert!(rendered.contains("Bash"), "tool call should be visible");
+    }
+
+    #[test]
+    fn tool_names_display_as_pascal_case() {
+        assert_eq!(display_tool_name("bash"), "Bash");
+        assert_eq!(display_tool_name("read_file"), "ReadFile");
+        assert_eq!(display_tool_name("glob"), "Glob");
+    }
+
+    #[test]
+    fn wraps_to_exact_lines_and_pads_full_width() {
+        // "abcdef" at width 4 → "abcd" + "ef", each padded back out to width 4 so
+        // a line background would fill the row.
+        let wrapped = wrap_lines(vec![Line::from("abcdef".to_string())], 4);
+        assert_eq!(wrapped.len(), 2);
+        for line in &wrapped {
+            assert_eq!(line.width(), 4, "each physical line filled to full width");
+        }
+    }
+
+    #[test]
+    fn user_rows_get_a_gapless_background() {
+        // A wide (CJK) glyph occupies two cells but a line-level background only
+        // tints the first; `paint_user_bg` must fill the continuation cell too so
+        // the background has no sawtooth gaps.
+        let mut app = App::new("m", PermissionMode::Default);
+        app.push_user("你好世界".to_string());
+        let (w, h) = (20u16, 8u16);
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("terminal");
+        terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
+
+        let buf = terminal.backend().buffer();
+        // Inner content spans columns 1..w-1 (inside the border). Find a row whose
+        // first inner cell is tinted (a user row) and assert the whole inner span
+        // is tinted — no gaps.
+        let tinted = |x: u16, y: u16| buf.cell((x, y)).unwrap().bg == USER_BG;
+        let user_row = (0..h).find(|&y| tinted(1, y)).expect("a tinted user row");
+        for x in 1..w - 1 {
+            assert!(tinted(x, user_row), "gap in user background at column {x}");
+        }
     }
 }

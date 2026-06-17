@@ -4,7 +4,10 @@ mod observer;
 mod settings;
 mod tui;
 
-use std::{io, sync::Arc};
+use std::{
+    io::{self, IsTerminal},
+    sync::Arc,
+};
 
 use clap::Parser;
 use kuncode_agent::{
@@ -106,6 +109,16 @@ the task is done, then give a short, direct final answer."
             Err(TurnError::Cancelled) => eprintln!("\n^C cancelled"),
             Err(TurnError::Agent(err)) => return Err(err.into()),
         }
+        return Ok(());
+    }
+
+    // The TUI needs a real terminal; a no-prompt invocation in a pipe (no TTY)
+    // can't drive raw mode, so guide the user to the one-shot form instead of
+    // failing inside terminal setup.
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        eprintln!(
+            "kuncode: 交互模式需要终端。用 `kuncode \"<任务>\"` 传入一次性任务,或在终端中直接运行。"
+        );
         return Ok(());
     }
 

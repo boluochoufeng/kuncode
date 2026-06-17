@@ -25,8 +25,9 @@ pub enum ToolState {
 /// One rendered entry in the conversation log.
 ///
 /// Built from the agent's event stream plus the turn's final answer. Tool output
-/// bodies are intentionally absent — events are thin notifications, the bodies
-/// live in the transcript (step 6 reads them back for expansion).
+/// bodies are intentionally absent — events are thin notifications, and the
+/// bodies live in the transcript; the log shows a one-line summary + final state
+/// per call. Inline expansion of full bodies is deferred.
 pub enum Item {
     User(String),
     Assistant(String),
@@ -46,9 +47,14 @@ pub struct App {
     pub conversation: Vec<Item>,
     pub input: String,
     pub status: Status,
-    /// Set while a `PreToolUse` approval is pending; renders as a modal that
-    /// captures keys until the user answers.
+    /// Set while a `PreToolUse` approval is pending; renders as a panel in the
+    /// input box's place that captures keys until the user answers.
     pub approval: Option<ApprovalRequest>,
+    /// Vertical scroll offset of the conversation, in rows.
+    pub scroll: u16,
+    /// When true, the view sticks to the bottom (latest output). Manual
+    /// scroll-up clears it; scrolling back to the bottom restores it.
+    pub follow: bool,
     pub should_quit: bool,
 }
 
@@ -61,6 +67,8 @@ impl App {
             input: String::new(),
             status: Status::Idle,
             approval: None,
+            scroll: 0,
+            follow: true,
             should_quit: false,
         }
     }
@@ -82,6 +90,26 @@ impl App {
     /// Takes the current input, leaving the box empty.
     pub fn take_input(&mut self) -> String {
         std::mem::take(&mut self.input)
+    }
+
+    // --- Scrolling ------------------------------------------------------------
+
+    /// Scrolls up by `lines`, dropping auto-follow so new output won't yank the
+    /// view back to the bottom.
+    pub fn scroll_up(&mut self, lines: u16) {
+        self.follow = false;
+        self.scroll = self.scroll.saturating_sub(lines);
+    }
+
+    /// Scrolls down by `lines`. Re-enabling follow at the bottom is left to the
+    /// renderer, which alone knows the max offset for the current terminal size.
+    pub fn scroll_down(&mut self, lines: u16) {
+        self.scroll = self.scroll.saturating_add(lines);
+    }
+
+    /// Snaps back to following the latest output (e.g. on submit).
+    pub fn follow_tail(&mut self) {
+        self.follow = true;
     }
 
     // --- Conversation log -----------------------------------------------------
