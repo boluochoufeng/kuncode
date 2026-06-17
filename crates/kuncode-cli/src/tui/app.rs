@@ -155,20 +155,31 @@ impl App {
             }
             EventKind::ToolEnd {
                 tool_call_id,
+                tool,
                 ok,
                 truncated,
                 error,
-                tool: _,
             } => {
-                if let Some(state) = self.tool_state_mut(&tool_call_id) {
-                    *state = match (ok, error) {
-                        (true, _) => ToolState::Ok { truncated },
-                        (false, Some(f)) if f.kind == "permission_denied" => {
-                            ToolState::Denied(f.message)
-                        }
-                        (false, Some(f)) => ToolState::Failed(format!("{}: {}", f.kind, f.message)),
-                        (false, None) => ToolState::Failed("failed".to_string()),
-                    };
+                let state = match (ok, error) {
+                    (true, _) => ToolState::Ok { truncated },
+                    (false, Some(f)) if f.kind == "permission_denied" => {
+                        ToolState::Denied(f.message)
+                    }
+                    (false, Some(f)) => ToolState::Failed(format!("{}: {}", f.kind, f.message)),
+                    (false, None) => ToolState::Failed("failed".to_string()),
+                };
+                if let Some(existing) = self.tool_state_mut(&tool_call_id) {
+                    *existing = state;
+                } else {
+                    // A `ToolEnd` with no preceding `ToolStart`: the runner rejects
+                    // an unknown tool / bad arguments before a row is opened. Add
+                    // its own entry so the failure isn't silently dropped.
+                    self.conversation.push(Item::Tool {
+                        id: tool_call_id,
+                        name: tool,
+                        summary: String::new(),
+                        state,
+                    });
                 }
             }
             // `ModelStart` (no spinner yet) and the turn-terminal `Error` (handled
@@ -300,6 +311,33 @@ mod tests {
                 ..
             }]
         ));
+    }
+
+    #[test]
+    fn tool_end_without_a_start_still_surfaces() {
+        // The runner reports an unknown tool / bad arguments as a `ToolEnd` with no
+        // preceding `ToolStart`; it must still show up, not vanish.
+        let mut app = app();
+        app.apply_event(EventKind::ToolEnd {
+            tool_call_id: "1".to_string(),
+            tool: "mystery".to_string(),
+            ok: false,
+            truncated: false,
+            error: Some(ToolFailure {
+                kind: "unknown_tool".to_string(),
+                message: "no such tool".to_string(),
+            }),
+        });
+        match app.conversation.as_slice() {
+            [
+                Item::Tool {
+                    name,
+                    state: ToolState::Failed(_),
+                    ..
+                },
+            ] => assert_eq!(name, "mystery"),
+            _ => panic!("orphan ToolEnd should surface as a tool entry"),
+        }
     }
 
     #[test]

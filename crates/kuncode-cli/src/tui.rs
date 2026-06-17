@@ -146,6 +146,9 @@ async fn run_one_turn<M: CompletionModel>(
 ) -> io::Result<()> {
     let cancel = CancellationToken::new();
     let mut outcome = None;
+    // Once the input stream ends, stop selecting on it so a perpetually-ready
+    // `None` can't busy-spin the loop until the turn finishes.
+    let mut events_closed = false;
 
     {
         let mut turn = Box::pin(runner.run_turn_with(session, input, cancel.clone()));
@@ -156,17 +159,31 @@ async fn run_one_turn<M: CompletionModel>(
                 result = &mut turn => outcome = Some(result),
                 Some(event) = event_rx.recv() => app.apply_event(event.kind),
                 Some(req) = approval_rx.recv() => app.set_approval(req),
-                maybe = events.next() => {
+                maybe = events.next(), if !events_closed => {
                     match maybe {
                         Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
                             handle_running_key(app, key, &cancel);
                         }
                         Some(Ok(Event::Mouse(mouse))) => handle_scroll(app, mouse),
+                        // Mirror the idle loop: a stream error means the terminal
+                        // IO broke, so unwind to the shared restore-and-exit path
+                        // rather than swallowing it (and risking a busy redraw on a
+                        // persistently-ready error).
+                        Some(Err(err)) => return Err(err),
+                        None => events_closed = true,
                         _ => {}
                     }
                 }
             }
         }
+    }
+
+    // The turn's final poll may have enqueued tool/assistant events that `select!`
+    // never consumed before the `result` branch fired. The idle loop doesn't drain
+    // `event_rx`, so flush them here — otherwise the last rows of a fast turn would
+    // leak into the next one (or never render).
+    while let Ok(event) = event_rx.try_recv() {
+        app.apply_event(event.kind);
     }
 
     match outcome.expect("loop exits only once outcome is set") {
