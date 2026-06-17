@@ -115,7 +115,6 @@ mod tests {
         ProjectSettings {
             policy,
             default_mode: None,
-            hooks: Vec::new(),
         }
     }
 
@@ -139,7 +138,6 @@ mod tests {
         ProjectSettings {
             policy: PermissionPolicy::new(),
             default_mode: Some(mode),
-            hooks: Vec::new(),
         }
     }
 
