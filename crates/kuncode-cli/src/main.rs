@@ -2,11 +2,9 @@ mod approver;
 mod config;
 mod observer;
 mod settings;
+mod tui;
 
-use std::{
-    io::{self, Write},
-    sync::Arc,
-};
+use std::{io, sync::Arc};
 
 use clap::Parser;
 use kuncode_agent::{
@@ -85,22 +83,24 @@ the task is done, then give a short, direct final answer."
     let client = DeepSeekClient::from_env()?;
     let model_name =
         std::env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| "deepseek-v4-flash".to_string());
-    let model = DeepSeekCompletionModel::make(&client, model_name);
-
+    let model = DeepSeekCompletionModel::make(&client, model_name.clone());
     let registry = ToolRegistry::with_default_workspace_tools(workspace);
     let config = AgentConfig {
         system_prompt: Some(system_prompt),
         ..AgentConfig::default()
     };
-    let runner = AgentRunner::with_config(model, registry, config)
-        .with_policy(resolved.policy)
-        .with_approver(Arc::new(TerminalApprover))
-        .with_observer(Arc::new(observer::CliObserver));
-
-    let mut session = AgentSession::with_mode(resolved.mode);
 
     let initial_prompt = cli.prompt.join(" ");
+
+    // A prompt on argv (or a non-TTY pipe) runs one-shot on the plain
+    // line-by-line renderer; only the bare interactive session enters the TUI.
     if !initial_prompt.trim().is_empty() {
+        let runner = AgentRunner::with_config(model, registry, config)
+            .with_policy(resolved.policy)
+            .with_approver(Arc::new(TerminalApprover))
+            .with_observer(Arc::new(observer::CliObserver));
+        let mut session = AgentSession::with_mode(resolved.mode);
+
         match run_turn(&runner, &mut session, initial_prompt).await {
             Ok(text) => println!("\n{text}"),
             Err(TurnError::Cancelled) => eprintln!("\n^C cancelled"),
@@ -109,31 +109,17 @@ the task is done, then give a short, direct final answer."
         return Ok(());
     }
 
-    println!("kuncode interactive session. Type `exit` or `quit` to leave.");
-    loop {
-        print!("> ");
-        io::stdout().flush()?;
-
-        let mut input = String::new();
-        if io::stdin().read_line(&mut input)? == 0 {
-            break;
-        }
-
-        let input = input.trim();
-        if input.is_empty() {
-            continue;
-        }
-        if matches!(input, "exit" | "quit") {
-            break;
-        }
-
-        match run_turn(&runner, &mut session, input.to_string()).await {
-            Ok(text) => println!("\n{text}"),
-            Err(TurnError::Cancelled) => eprintln!("\n^C cancelled"),
-            Err(TurnError::Agent(err)) => eprintln!("error: {err}"),
-        }
-    }
-
+    // Interactive: hand the assembled runner pieces to the TUI, which wraps them
+    // with its own observer + approver before driving the event loop.
+    tui::run(
+        model,
+        registry,
+        config,
+        resolved.policy,
+        resolved.mode,
+        model_name,
+    )
+    .await?;
     Ok(())
 }
 
