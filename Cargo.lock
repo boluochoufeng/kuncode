@@ -808,7 +808,6 @@ dependencies = [
  "dotenvy",
  "kuncode-agent",
  "kuncode-core",
- "libc",
  "serde",
  "serde_json",
  "tokio",

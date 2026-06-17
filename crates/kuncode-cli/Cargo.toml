@@ -19,7 +19,6 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 dotenvy = { workspace = true }
-libc = { workspace = true }
 
 [dev-dependencies]
 

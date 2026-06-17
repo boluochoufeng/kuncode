@@ -8,16 +8,12 @@ use std::path::Path;
 use kuncode_agent::permission::{PermissionMode, PermissionPolicy, Rule, RuleOrigin, parse_rule};
 use serde::Deserialize;
 
-use crate::hook::{HookConfig, HookPoint};
-
 const SETTINGS_PATH: &str = ".kuncode/settings.json";
 
 #[derive(Debug, Default, Deserialize)]
 struct SettingsFile {
     #[serde(default)]
     permissions: PermissionsSection,
-    #[serde(default)]
-    hooks: HooksSection,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -32,31 +28,6 @@ struct PermissionsSection {
     default_mode: Option<String>,
 }
 
-/// The `hooks` block: one command list per trigger point. Every field defaults
-/// to empty, so a file that predates hooks (or omits the section) still loads —
-/// same non-breaking stance as [`PermissionsSection`].
-#[derive(Debug, Default, Deserialize)]
-struct HooksSection {
-    #[serde(default, rename = "UserPromptSubmit")]
-    user_prompt_submit: Vec<HookEntry>,
-    #[serde(default, rename = "PreToolUse")]
-    pre_tool_use: Vec<HookEntry>,
-    #[serde(default, rename = "PostToolUse")]
-    post_tool_use: Vec<HookEntry>,
-    #[serde(default, rename = "Stop")]
-    stop: Vec<HookEntry>,
-}
-
-/// One `{ command, matcher?, failClosed? }` entry under a trigger point.
-#[derive(Debug, Deserialize)]
-struct HookEntry {
-    command: String,
-    #[serde(default)]
-    matcher: Option<String>,
-    #[serde(default, rename = "failClosed")]
-    fail_closed: Option<bool>,
-}
-
 /// Permission settings read from the project file.
 #[derive(Debug, Default)]
 pub struct ProjectSettings {
@@ -64,9 +35,6 @@ pub struct ProjectSettings {
     pub policy: PermissionPolicy,
     /// Default mode requested by the file, if any.
     pub default_mode: Option<PermissionMode>,
-    /// Validated hook configurations, in `UserPromptSubmit → PreToolUse →
-    /// PostToolUse → Stop` order (registration order within each point).
-    pub hooks: Vec<HookConfig>,
 }
 
 /// Loads `.kuncode/settings.json` under `root`.
@@ -96,12 +64,9 @@ pub fn load_project_settings(root: &Path) -> Result<ProjectSettings, SettingsErr
         None => None,
     };
 
-    let hooks = build_hooks(file.hooks)?;
-
     Ok(ProjectSettings {
         policy,
         default_mode,
-        hooks,
     })
 }
 
@@ -114,50 +79,6 @@ fn push_rules(target: &mut Vec<Rule>, rules: &[String]) -> Result<(), SettingsEr
     Ok(())
 }
 
-/// Flattens the per-point lists into validated [`HookConfig`]s, preserving the
-/// `UserPromptSubmit → PreToolUse → PostToolUse → Stop` order.
-fn build_hooks(section: HooksSection) -> Result<Vec<HookConfig>, SettingsError> {
-    let mut configs = Vec::new();
-    push_hooks(
-        &mut configs,
-        HookPoint::UserPromptSubmit,
-        section.user_prompt_submit,
-    )?;
-    push_hooks(&mut configs, HookPoint::PreToolUse, section.pre_tool_use)?;
-    push_hooks(&mut configs, HookPoint::PostToolUse, section.post_tool_use)?;
-    push_hooks(&mut configs, HookPoint::Stop, section.stop)?;
-    Ok(configs)
-}
-
-/// Validates and lowers one point's entries.
-///
-/// Resolves `failClosed` against the per-point default — `true` for
-/// `PreToolUse` (a failed guard must not silently let a call through), `false`
-/// elsewhere. `PostToolUse` has no veto outcome, so any `failClosed` there is a
-/// configuration error rather than a silently-ignored field.
-fn push_hooks(
-    target: &mut Vec<HookConfig>,
-    point: HookPoint,
-    entries: Vec<HookEntry>,
-) -> Result<(), SettingsError> {
-    for entry in entries {
-        if point == HookPoint::PostToolUse && entry.fail_closed.is_some() {
-            return Err(SettingsError::Hook(format!(
-                "`failClosed` is not valid on PostToolUse (it has no veto outcome): {}",
-                entry.command
-            )));
-        }
-        let fail_closed = entry.fail_closed.unwrap_or(point == HookPoint::PreToolUse);
-        target.push(HookConfig {
-            point,
-            command: entry.command,
-            matcher: entry.matcher,
-            fail_closed,
-        });
-    }
-    Ok(())
-}
-
 /// Errors raised while loading project settings.
 #[derive(Debug)]
 pub enum SettingsError {
@@ -165,7 +86,6 @@ pub enum SettingsError {
     Parse(serde_json::Error),
     Rule(String, String),
     Mode(String),
-    Hook(String),
 }
 
 impl std::fmt::Display for SettingsError {
@@ -175,7 +95,6 @@ impl std::fmt::Display for SettingsError {
             Self::Parse(err) => write!(f, "failed to parse {SETTINGS_PATH}: {err}"),
             Self::Rule(rule, err) => write!(f, "invalid rule `{rule}` in {SETTINGS_PATH}: {err}"),
             Self::Mode(mode) => write!(f, "invalid defaultMode `{mode}` in {SETTINGS_PATH}"),
-            Self::Hook(err) => write!(f, "invalid hook in {SETTINGS_PATH}: {err}"),
         }
     }
 }
@@ -242,51 +161,6 @@ mod tests {
         assert!(matches!(
             load_project_settings(&dir),
             Err(SettingsError::Rule(_, _))
-        ));
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn loads_hooks_in_point_order_with_defaults() {
-        let dir = unique_dir("hooks");
-        fs::write(
-            dir.join(".kuncode/settings.json"),
-            r#"{ "hooks": {
-                "UserPromptSubmit": [{ "command": "redact" }],
-                "PreToolUse": [{ "matcher": "bash", "command": "guard" }],
-                "Stop": [{ "command": "check", "failClosed": true }]
-            } }"#,
-        )
-        .unwrap();
-
-        let loaded = load_project_settings(&dir).expect("loads");
-        let hooks = &loaded.hooks;
-        assert_eq!(hooks.len(), 3);
-
-        // Order is UserPromptSubmit → PreToolUse → PostToolUse → Stop.
-        assert_eq!(hooks[0].point, HookPoint::UserPromptSubmit);
-        assert!(!hooks[0].fail_closed); // non-PreToolUse defaults fail-open
-        assert_eq!(hooks[1].point, HookPoint::PreToolUse);
-        assert_eq!(hooks[1].matcher.as_deref(), Some("bash"));
-        assert!(hooks[1].fail_closed); // PreToolUse defaults fail-closed
-        assert_eq!(hooks[2].point, HookPoint::Stop);
-        assert!(hooks[2].fail_closed); // explicit override honored
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn fail_closed_on_post_tool_use_is_an_error() {
-        let dir = unique_dir("hookbad");
-        fs::write(
-            dir.join(".kuncode/settings.json"),
-            r#"{ "hooks": {
-                "PostToolUse": [{ "command": "fmt", "failClosed": true }]
-            } }"#,
-        )
-        .unwrap();
-        assert!(matches!(
-            load_project_settings(&dir),
-            Err(SettingsError::Hook(_))
         ));
         let _ = fs::remove_dir_all(&dir);
     }
