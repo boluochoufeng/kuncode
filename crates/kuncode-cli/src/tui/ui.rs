@@ -223,22 +223,61 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         "input"
     };
-    let para = Paragraph::new(app.input.as_str())
+    let inner_width = area.width.saturating_sub(2).max(1);
+    let inner_height = area.height.saturating_sub(2).max(1);
+
+    // Wrap the input on char boundaries exactly as the conversation does, and
+    // render without `Paragraph`'s word-wrap. The caret uses the *same* wrap
+    // (`caret_position`), so cursor and scroll can't drift from what's drawn — a
+    // word-wrap renderer paired with a char-width estimate would, and could scroll
+    // the box to a blank row on ordinary input containing spaces.
+    let logical: Vec<Line> = app
+        .input
+        .split('\n')
+        .map(|seg| Line::raw(seg.to_string()))
+        .collect();
+    let wrapped = wrap_lines(logical, inner_width);
+
+    let (caret_row, caret_col) = caret_position(&app.input, inner_width);
+    // Scroll so the caret's row is the bottom visible row of the box.
+    let scroll = caret_row.saturating_sub(inner_height - 1);
+
+    let para = Paragraph::new(Text::from(wrapped))
         .block(Block::bordered().title(title))
-        .wrap(Wrap { trim: false });
+        .scroll((scroll, 0));
     frame.render_widget(para, area);
 
-    // Show the cursor only when the user can type (idle, no modal). The column
-    // offset is the last line's *display* width — `Line::width` counts wide
-    // (CJK) chars as 2 cells — so the cursor sits at the visual end, not the
-    // char count.
+    // Show the cursor only when the user can type (idle, no modal), clamped inside
+    // the visible box.
     if app.status == Status::Idle && app.approval.is_none() {
-        let rows = app.input.split('\n').count() as u16;
-        let last = app.input.split('\n').next_back().unwrap_or("");
-        let cursor_x = area.x + 1 + Line::raw(last).width() as u16;
-        let cursor_y = area.y + rows;
+        let cursor_x = area.x + 1 + caret_col.min(inner_width.saturating_sub(1));
+        let cursor_y = area.y + 1 + (caret_row - scroll).min(inner_height - 1);
         frame.set_cursor_position(Position::new(cursor_x, cursor_y));
     }
+}
+
+/// Caret row/column at the end of `input`, wrapped to `inner_width` on the same
+/// char-boundary rule as [`wrap_lines`] (greedy, breaking before a char that
+/// would overflow; `'\n'` starts a new row). Returns 0-based (row, column) in
+/// display cells so the cursor lands exactly where the rendered text wraps.
+fn caret_position(input: &str, inner_width: u16) -> (u16, u16) {
+    let inner_width = inner_width.max(1);
+    let mut row = 0u16;
+    let mut col = 0u16;
+    for ch in input.chars() {
+        if ch == '\n' {
+            row += 1;
+            col = 0;
+            continue;
+        }
+        let cw = char_width(ch);
+        if col > 0 && col + cw > inner_width {
+            row += 1;
+            col = 0;
+        }
+        col += cw;
+    }
+    (row, col)
 }
 
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
@@ -309,6 +348,38 @@ mod tests {
             "status line should show model"
         );
         assert!(rendered.contains("Bash"), "tool call should be visible");
+    }
+
+    #[test]
+    fn caret_position_agrees_with_char_wrap() {
+        // Exact fill stays on row 0 — no phantom next row that would blank the box.
+        assert_eq!(caret_position("abcd", 4), (0, 4));
+        // Overflow advances a row.
+        assert_eq!(caret_position("abcde", 4), (1, 1));
+        // Spaces don't get special word-break treatment: char-wrap, same as render.
+        assert_eq!(caret_position("word word", 4), (2, 1));
+        // Wide (CJK) glyphs: width 3 fits one per row.
+        assert_eq!(caret_position("你你你", 3), (2, 2));
+        // Explicit newline starts a fresh row.
+        assert_eq!(caret_position("ab\nc", 4), (1, 1));
+    }
+
+    #[test]
+    fn caret_row_never_exceeds_rendered_rows() {
+        // The caret's row must stay within the wrapped line count, or scroll would
+        // blank the box. Check against the actual `wrap_lines` output.
+        for input in ["", "abcd", "abcde", "word word", "你你你", "a\nbb\nccc"] {
+            let (row, _) = caret_position(input, 4);
+            let logical: Vec<Line> = input
+                .split('\n')
+                .map(|s| Line::raw(s.to_string()))
+                .collect();
+            let rendered = wrap_lines(logical, 4).len() as u16;
+            assert!(
+                row < rendered,
+                "{input:?}: caret row {row} >= {rendered} rows"
+            );
+        }
     }
 
     #[test]
