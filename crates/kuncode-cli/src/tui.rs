@@ -13,7 +13,11 @@ mod ui;
 use std::io;
 use std::sync::Arc;
 
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseEvent, MouseEventKind,
+};
+use crossterm::execute;
 use futures_util::StreamExt;
 use kuncode_agent::error::AgentError;
 use kuncode_agent::observer::AgentEvent;
@@ -28,10 +32,16 @@ use tokio_util::sync::CancellationToken;
 use self::app::{App, Status};
 use self::bridge::{ApprovalRequest, TuiApprover, TuiObserver};
 
+/// Rows scrolled per PageUp/PageDown.
+const SCROLL_STEP: u16 = 10;
+
+/// Rows scrolled per mouse-wheel notch.
+const MOUSE_SCROLL_STEP: u16 = 3;
+
 /// Runs the interactive TUI until the user quits.
 ///
 /// Wraps the assembled runner pieces with the TUI's own observer + approver,
-/// then enters raw mode + the alternate screen via [`ratatui::init`] (which also
+/// then enters raw mode + the alternate screen via [`ratatui::init()`] (which also
 /// installs a panic hook that restores the terminal before unwinding) and
 /// guarantees [`ratatui::restore`] on every exit path.
 pub async fn run<M>(
@@ -56,6 +66,10 @@ where
     let mut app = App::new(model_name, mode);
 
     let mut terminal = ratatui::init();
+    // Capture the mouse so the wheel scrolls the conversation instead of the
+    // terminal's own scrollback. Best-effort: a terminal that refuses it just
+    // loses wheel scrolling, and PageUp/PageDown still work.
+    let _ = execute!(io::stdout(), EnableMouseCapture);
     let result = event_loop(
         &mut terminal,
         &runner,
@@ -65,6 +79,7 @@ where
         &mut approval_rx,
     )
     .await;
+    let _ = execute!(io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
 }
@@ -103,7 +118,8 @@ async fn event_loop<M: CompletionModel>(
                     app.status = Status::Idle;
                 }
             }
-            Some(Ok(_)) => {} // resize / non-press keys — handled later
+            Some(Ok(Event::Mouse(mouse))) => handle_scroll(app, mouse),
+            Some(Ok(_)) => {} // resize / non-press keys
             Some(Err(err)) => return Err(err),
             None => break, // stdin closed
         }
@@ -141,10 +157,12 @@ async fn run_one_turn<M: CompletionModel>(
                 Some(event) = event_rx.recv() => app.apply_event(event.kind),
                 Some(req) = approval_rx.recv() => app.set_approval(req),
                 maybe = events.next() => {
-                    if let Some(Ok(Event::Key(key))) = maybe
-                        && key.kind == KeyEventKind::Press
-                    {
-                        handle_running_key(app, key, &cancel);
+                    match maybe {
+                        Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
+                            handle_running_key(app, key, &cancel);
+                        }
+                        Some(Ok(Event::Mouse(mouse))) => handle_scroll(app, mouse),
+                        _ => {}
                     }
                 }
             }
@@ -171,12 +189,27 @@ fn handle_idle_key(app: &mut App, key: KeyEvent) -> Option<String> {
             app.should_quit = true;
             None
         }
+        (_, KeyCode::PageUp) => {
+            app.scroll_up(SCROLL_STEP);
+            None
+        }
+        (_, KeyCode::PageDown) => {
+            app.scroll_down(SCROLL_STEP);
+            None
+        }
         // Bare Enter submits; a modified Enter (Shift/Alt, where the terminal
         // reports it) inserts a newline for multi-line input.
         (m, KeyCode::Enter) if m.is_empty() => {
-            if app.input.trim().is_empty() {
+            let trimmed = app.input.trim();
+            if trimmed.is_empty() {
+                None
+            } else if trimmed == "exit" {
+                // `exit` is a REPL command, not a prompt: quit instead of sending
+                // it to the agent.
+                app.should_quit = true;
                 None
             } else {
+                app.follow_tail();
                 Some(app.take_input())
             }
         }
@@ -201,10 +234,56 @@ fn handle_idle_key(app: &mut App, key: KeyEvent) -> Option<String> {
 fn handle_running_key(app: &mut App, key: KeyEvent, cancel: &CancellationToken) {
     if app.approval.is_some() {
         app.handle_approval_key(key);
-    } else if matches!(
-        (key.modifiers, key.code),
-        (KeyModifiers::CONTROL, KeyCode::Char('c'))
-    ) {
-        cancel.cancel();
+        return;
+    }
+    match (key.modifiers, key.code) {
+        (KeyModifiers::CONTROL, KeyCode::Char('c')) => cancel.cancel(),
+        (_, KeyCode::PageUp) => app.scroll_up(SCROLL_STEP),
+        (_, KeyCode::PageDown) => app.scroll_down(SCROLL_STEP),
+        _ => {}
+    }
+}
+
+/// Maps a mouse-wheel event to a conversation scroll. Effective only with mouse
+/// capture enabled; otherwise the terminal handles the wheel itself.
+fn handle_scroll(app: &mut App, mouse: MouseEvent) {
+    match mouse.kind {
+        MouseEventKind::ScrollUp => app.scroll_up(MOUSE_SCROLL_STEP),
+        MouseEventKind::ScrollDown => app.scroll_down(MOUSE_SCROLL_STEP),
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn typing(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.insert_char(c);
+        }
+    }
+
+    fn enter() -> KeyEvent {
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::empty())
+    }
+
+    #[test]
+    fn typing_exit_then_enter_quits_without_submitting() {
+        let mut app = App::new("m", PermissionMode::Default);
+        typing(&mut app, "  exit  "); // surrounding whitespace still counts
+        assert!(handle_idle_key(&mut app, enter()).is_none());
+        assert!(app.should_quit, "`exit` should quit the TUI");
+    }
+
+    #[test]
+    fn enter_submits_a_normal_prompt() {
+        let mut app = App::new("m", PermissionMode::Default);
+        typing(&mut app, "exit now");
+        assert_eq!(
+            handle_idle_key(&mut app, enter()).as_deref(),
+            Some("exit now")
+        );
+        assert!(!app.should_quit, "a prompt containing exit must not quit");
     }
 }
