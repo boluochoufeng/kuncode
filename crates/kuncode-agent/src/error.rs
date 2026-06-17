@@ -33,6 +33,16 @@ pub enum AgentError {
     #[error("agent turn was cancelled")]
     Cancelled,
 
+    /// A `UserPromptSubmit` hook blocked the prompt before it entered the
+    /// transcript. Nothing ran and nothing was sent to the provider; `reason`
+    /// is the hook's explanation, shown to the user. Distinct from a real error
+    /// so the CLI can render it as a deliberate rejection.
+    #[error("prompt blocked by hook: {reason}")]
+    PromptBlocked {
+        /// Why the hook rejected the prompt.
+        reason: String,
+    },
+
     /// The model kept requesting tools until the loop budget was exhausted.
     #[error("agent exceeded max iterations ({max_iterations}) before producing a final answer")]
     MaxIterations {

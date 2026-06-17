@@ -4,6 +4,7 @@
 
 pub mod error;
 pub mod glob;
+pub mod hook;
 pub mod observer;
 pub mod permission;
 pub mod registry;

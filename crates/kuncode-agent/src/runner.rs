@@ -13,6 +13,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     error::AgentError,
+    hook::{
+        Hook, Hooks, PostToolCx, PostToolOutcome, PreToolCx, PreToolOutcome, PromptCx,
+        PromptOutcome, StopCx, StopOutcome,
+    },
     observer::{AgentEvent, AgentObserver, EventKind, ToolFailure},
     permission::{Approver, AutoApprove, Decision, PermissionGate, PermissionPolicy, Prepared},
     registry::ToolRegistry,
@@ -21,6 +25,12 @@ use crate::{
 };
 
 const DEFAULT_MAX_ITERATIONS: usize = 50;
+
+/// How many times a `Stop` hook may force a continuation within one
+/// [`run_loop`](AgentRunner::run_loop) before the runner stops honoring it.
+/// Bounds a misbehaving "you're not done" hook; `max_iterations` is the harder
+/// backstop. Mirrors Claude Code's `stop_hook_active`.
+const STOP_CONTINUATION_LIMIT: usize = 3;
 
 /// Runtime knobs for one agent loop.
 #[derive(Clone, Debug)]
@@ -82,6 +92,9 @@ pub struct AgentRunner<M> {
     /// Optional progress sink. With `None` (the default) [`emit`](Self::emit)
     /// invokes no observer and draws no `seq`.
     observer: Option<Arc<dyn AgentObserver>>,
+    /// User-extensible loop intervention points. Empty by default, in which case
+    /// every trigger site skips the hook machinery entirely (fast path).
+    hooks: Arc<Hooks>,
 }
 
 impl<M> AgentRunner<M>
@@ -106,6 +119,7 @@ where
             policy: Arc::new(PermissionPolicy::builtin()),
             approver: Arc::new(AutoApprove),
             observer: None,
+            hooks: Arc::new(Hooks::new()),
         }
     }
 
@@ -124,6 +138,18 @@ where
     /// Attaches a progress observer (e.g. the CLI's terminal renderer).
     pub fn with_observer(mut self, observer: Arc<dyn AgentObserver>) -> Self {
         self.observer = Some(observer);
+        self
+    }
+
+    /// Appends one loop hook, keeping registration order.
+    pub fn with_hook(mut self, hook: Arc<dyn Hook>) -> Self {
+        Arc::make_mut(&mut self.hooks).push(hook);
+        self
+    }
+
+    /// Replaces the whole hook set (e.g. the ones parsed from settings).
+    pub fn with_hooks(mut self, hooks: Hooks) -> Self {
+        self.hooks = Arc::new(hooks);
         self
     }
 
@@ -147,6 +173,35 @@ where
         }
     }
 
+    /// Emits the single turn-terminal [`Error`](EventKind::Error) for a failing
+    /// turn, then returns the error unchanged.
+    ///
+    /// Every unwind path routes through here: `run_loop` failures via
+    /// [`continue_session_with`](Self::continue_session_with), and a
+    /// `UserPromptSubmit` `Block`/cancel directly from
+    /// [`run_turn_with`](Self::run_turn_with) — which returns before `run_loop`
+    /// is ever entered, so it would otherwise miss the emit. One helper keeps
+    /// "exactly one terminal `Error` per turn" true and closes any open
+    /// `ModelStart`/`ToolStart` UI state once. `iteration` is `None` for
+    /// failures with no owning model call (empty transcript, blocked prompt,
+    /// `max_iterations == 0`).
+    fn terminal_error(
+        &self,
+        session: &mut AgentSession,
+        iteration: Option<usize>,
+        error: AgentError,
+    ) -> AgentError {
+        self.emit(
+            session,
+            iteration,
+            EventKind::Error {
+                kind: error_kind(&error).to_string(),
+                message: error.to_string(),
+            },
+        );
+        error
+    }
+
     /// Appends a user prompt, then advances the transcript until a final answer.
     pub async fn run_turn(
         &self,
@@ -165,7 +220,43 @@ where
         prompt: impl Into<String>,
         cancel: CancellationToken,
     ) -> Result<AgentTurn, AgentError> {
-        session.push_user(prompt);
+        let prompt = prompt.into();
+
+        // `UserPromptSubmit` is a *pre-commit* hook: it runs before the prompt
+        // enters the transcript, so a `Block` rejects the input without leaving
+        // it behind to leak to the provider on a later turn. The cx borrows the
+        // transcript, so it is scoped to end before any `push_user`.
+        if self.hooks.is_empty() {
+            session.push_user(prompt);
+        } else {
+            let outcome = {
+                let cx = PromptCx {
+                    prompt: &prompt,
+                    messages: session.messages(),
+                };
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => None,
+                    outcome = self.hooks.user_prompt_submit(&cx) => Some(outcome),
+                }
+            };
+            match outcome {
+                None => return Err(self.terminal_error(session, None, AgentError::Cancelled)),
+                Some(PromptOutcome::Proceed) => session.push_user(prompt),
+                Some(PromptOutcome::AddContext(context)) => {
+                    session.push_user(prompt);
+                    session.push_user(context);
+                }
+                Some(PromptOutcome::Block { reason }) => {
+                    return Err(self.terminal_error(
+                        session,
+                        None,
+                        AgentError::PromptBlocked { reason },
+                    ));
+                }
+            }
+        }
+
         self.continue_session_with(session, cancel).await
     }
 
@@ -187,21 +278,7 @@ where
     ) -> Result<AgentTurn, AgentError> {
         match self.run_loop(session, &cancel).await {
             Ok(turn) => Ok(turn),
-            // The single turn-terminal emission point: every unwind path lands
-            // here, so any open `ModelStart`/`ToolStart` UI state is closed
-            // exactly once. `iteration` is `None` for failures with no owning
-            // model call (empty transcript, `max_iterations == 0`).
-            Err((iteration, error)) => {
-                self.emit(
-                    session,
-                    iteration,
-                    EventKind::Error {
-                        kind: error_kind(&error).to_string(),
-                        message: error.to_string(),
-                    },
-                );
-                Err(error)
-            }
+            Err((iteration, error)) => Err(self.terminal_error(session, iteration, error)),
         }
     }
 
@@ -218,6 +295,9 @@ where
         }
 
         let mut usage = Usage::default();
+        // Local to this run, so the cap resets every turn; on the session it
+        // would accumulate and permanently disable later turns' `Stop` hooks.
+        let mut stop_continuations = 0usize;
 
         for iteration in 0..self.config.max_iterations {
             let iteration_result = self
@@ -227,6 +307,36 @@ where
             usage += iteration_result.usage;
 
             if iteration_result.tool_calls.is_empty() {
+                // A `Stop` hook may force another iteration — but only while
+                // there is budget for another model call and the continuation
+                // cap is not yet hit. Out of either, the final answer the model
+                // just gave is returned as-is, never turned into a
+                // `MaxIterations` error.
+                let may_continue = !self.hooks.is_empty()
+                    && stop_continuations < STOP_CONTINUATION_LIMIT
+                    && iteration + 1 < self.config.max_iterations;
+                if may_continue {
+                    let outcome = {
+                        let cx = StopCx {
+                            messages: session.messages(),
+                            iteration,
+                        };
+                        tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => None,
+                            outcome = self.hooks.stop(&cx) => Some(outcome),
+                        }
+                    };
+                    match outcome {
+                        None => return Err((Some(iteration), AgentError::Cancelled)),
+                        Some(StopOutcome::Allow) => {}
+                        Some(StopOutcome::Continue { message }) => {
+                            stop_continuations += 1;
+                            session.push_user(message);
+                            continue;
+                        }
+                    }
+                }
                 return Ok(AgentTurn {
                     final_message_index: iteration_result.assistant_message_index,
                     usage,
@@ -304,6 +414,12 @@ where
         iteration: usize,
         cancel: &CancellationToken,
     ) -> Result<(), AgentError> {
+        // `PostToolUse` feedback is buffered and flushed only after the whole
+        // batch's tool_results are written: a tool_call's results must stay
+        // contiguous in the next user content, so a feedback message must not be
+        // interleaved between two tool_results (providers reject that).
+        let mut feedback = Vec::new();
+
         for index in 0..tool_calls.len() {
             let ctx = ToolContext::with_cancel(cancel.clone());
             let id = tool_calls[index].id.clone();
@@ -315,18 +431,45 @@ where
                 .gated_call(session, iteration, &id, &name, arguments, &ctx)
                 .await
             {
-                Ok(output) => self.record_result(session, iteration, id, call_id, &name, output),
+                Ok(CallOutcome { output, executed }) => {
+                    // Snapshot the output for PostToolUse before record_result
+                    // consumes it — only when a hook could actually use it.
+                    let post_output = (executed && !self.hooks.is_empty()).then(|| output.clone());
+                    self.record_result(session, iteration, id, call_id, &name, output);
+
+                    if let Some(output) = post_output {
+                        let outcome = {
+                            let cx = PostToolCx {
+                                tool: &name,
+                                output: &output,
+                                messages: session.messages(),
+                                iteration,
+                            };
+                            tokio::select! {
+                                biased;
+                                _ = cancel.cancelled() => None,
+                                outcome = self.hooks.post_tool_use(&cx) => Some(outcome),
+                            }
+                        };
+                        match outcome {
+                            // Cancelled mid-batch: this tool's result is already
+                            // written, so only the *following* calls are unpaired
+                            // (re-pairing `index` would double-write it). Buffered
+                            // feedback is dropped — the turn is unwinding.
+                            None => {
+                                self.pair_unpaired(session, iteration, &tool_calls[index + 1..]);
+                                return Err(AgentError::Cancelled);
+                            }
+                            Some(PostToolOutcome::Proceed) => {}
+                            Some(PostToolOutcome::AddFeedback(text)) => feedback.push(text),
+                        }
+                    }
+                }
                 Err(error) => {
                     // The turn is unwinding with this tool_call — and any that
-                    // follow it — still unpaired. Pair each with a synthetic
-                    // result so the assistant's tool_call message is never left
-                    // dangling: most providers reject a request whose tool_call
-                    // has no matching tool_result before the next user message.
-                    //
-                    // Pair `index` *honestly by why*: a harness tool error did
-                    // run and fail, so don't relabel it "cancelled"; a
-                    // cancel/abort did not run. Every following, never-reached
-                    // call is interrupted.
+                    // follow it — still unpaired. Pair `index` *honestly by why*:
+                    // a harness tool error did run and fail (don't relabel it
+                    // "cancelled"); a cancel/abort did not run.
                     let failed = match &error {
                         AgentError::Tool { source, .. } => {
                             ToolOutput::failure("tool_error", source.to_string())
@@ -334,23 +477,46 @@ where
                         _ => interrupted_tool_output(),
                     };
                     self.record_result(session, iteration, id, call_id, &name, failed);
-
-                    for unpaired in &tool_calls[index + 1..] {
-                        self.record_result(
-                            session,
-                            iteration,
-                            unpaired.id.clone(),
-                            unpaired.call_id.clone(),
-                            &unpaired.name,
-                            interrupted_tool_output(),
-                        );
-                    }
+                    self.pair_unpaired(session, iteration, &tool_calls[index + 1..]);
+                    // Buffered PostToolUse feedback is dropped here, same as the
+                    // cancel branch above: the turn is unwinding, the end-of-loop
+                    // flush is never reached, and a failed turn should not leave a
+                    // trailing feedback message behind. The harness-error path
+                    // (`AgentError::Tool`) is rare; feedback is advisory and the
+                    // real file state survives for the next turn to re-read.
                     return Err(error);
                 }
             }
         }
 
+        // Flush buffered feedback after the batch's tool_results (see above).
+        for text in feedback {
+            session.push_user(text);
+        }
+
         Ok(())
+    }
+
+    /// Pairs every still-unexecuted tool_call with a synthetic interrupted
+    /// result, so an unwinding turn never leaves an assistant tool_call
+    /// dangling — most providers reject a request whose tool_call has no
+    /// matching tool_result before the next user message.
+    fn pair_unpaired(
+        &self,
+        session: &mut AgentSession,
+        iteration: usize,
+        calls: &[PendingToolCall],
+    ) {
+        for call in calls {
+            self.record_result(
+                session,
+                iteration,
+                call.id.clone(),
+                call.call_id.clone(),
+                &call.name,
+                interrupted_tool_output(),
+            );
+        }
     }
 
     /// Records one tool result: emits the [`ToolEnd`](EventKind::ToolEnd) that
@@ -388,15 +554,19 @@ where
     /// Gates a tool call, then dispatches. The gate races the approval prompt
     /// against cancellation; this method races execution.
     ///
-    /// Returns a model-recoverable [`ToolOutput`] for unknown tools, bad
-    /// arguments, and denials (the loop feeds these back). A user `Abort` or a
-    /// cancelled token escalates to [`AgentError::Cancelled`], and a harness-
-    /// level tool failure to [`AgentError::Tool`]; both unwind the whole turn.
+    /// Returns a [`CallOutcome`]: the model-recoverable [`ToolOutput`] to record
+    /// plus whether the tool actually ran. Unknown tools, bad arguments, and
+    /// hook/permission denials carry `executed: false` (the loop feeds the
+    /// output back). A user `Abort` or a cancelled token escalates to
+    /// [`AgentError::Cancelled`], and a harness-level tool failure to
+    /// [`AgentError::Tool`]; both unwind the whole turn (so neither is a
+    /// `CallOutcome` and neither fires `PostToolUse`).
     ///
     /// Emits [`EventKind::ToolStart`] between the gate's two phases — once a
     /// [`PermissionRequest`](crate::permission::PermissionRequest) is in hand —
     /// so an unknown tool / bad arguments (rejected by `prepare`) get a `ToolEnd`
-    /// with no preceding `ToolStart`.
+    /// with no preceding `ToolStart`. `PreToolUse` fires after that row opens and
+    /// before the gate decides, so a hook denial mirrors a permission denial.
     async fn gated_call(
         &self,
         session: &mut AgentSession,
@@ -405,7 +575,7 @@ where
         name: &str,
         arguments: serde_json::Value,
         ctx: &ToolContext,
-    ) -> Result<ToolOutput, AgentError> {
+    ) -> Result<CallOutcome, AgentError> {
         let gate = PermissionGate {
             policy: self.policy.as_ref(),
             approver: self.approver.as_ref(),
@@ -420,7 +590,12 @@ where
                 args,
                 request,
             } => (tool, args, request),
-            Prepared::Rejected(output) => return Ok(output),
+            Prepared::Rejected(output) => {
+                return Ok(CallOutcome {
+                    output,
+                    executed: false,
+                });
+            }
         };
 
         // The request confirms a real call and carries a human summary, so open
@@ -436,8 +611,42 @@ where
             },
         );
 
+        // PreToolUse runs after the row opens and before the gate decides.
+        // Tighten-only: a `Deny` short-circuits *without* consulting the
+        // approver, taking the same path (and event shape) as a permission deny.
+        // The cx borrows the request/args/transcript, so it is scoped to end
+        // before `decide` takes `&mut` of the session.
+        if !self.hooks.is_empty() {
+            let pre = {
+                let cx = PreToolCx {
+                    request: &request,
+                    args: &arguments,
+                    messages: session.messages(),
+                    iteration,
+                };
+                tokio::select! {
+                    biased;
+                    _ = ctx.cancel.cancelled() => None,
+                    outcome = self.hooks.pre_tool_use(&cx) => Some(outcome),
+                }
+            };
+            match pre {
+                None => return Err(AgentError::Cancelled),
+                Some(PreToolOutcome::Proceed) => {}
+                Some(PreToolOutcome::Deny { message }) => {
+                    return Ok(CallOutcome {
+                        output: ToolOutput::failure("blocked_by_hook", message),
+                        executed: false,
+                    });
+                }
+            }
+        }
+
         match gate.decide(&request, session.permissions_mut(), ctx).await {
-            Decision::Deny(output) => Ok(output),
+            Decision::Deny(output) => Ok(CallOutcome {
+                output,
+                executed: false,
+            }),
             Decision::Abort => Err(AgentError::Cancelled),
             // Execute, racing cancellation so a long tool can be interrupted.
             Decision::Allow => {
@@ -446,7 +655,10 @@ where
                     _ = ctx.cancel.cancelled() => Err(ToolError::Cancelled),
                 };
                 match result {
-                    Ok(output) => Ok(output),
+                    Ok(output) => Ok(CallOutcome {
+                        output,
+                        executed: true,
+                    }),
                     Err(ToolError::Cancelled) => Err(AgentError::Cancelled),
                     Err(source) => Err(AgentError::Tool {
                         name: name.to_string(),
@@ -496,6 +708,19 @@ struct PendingToolCall {
     arguments: serde_json::Value,
 }
 
+/// Result of a gated tool call: the [`ToolOutput`] to record plus whether the
+/// tool actually ran.
+///
+/// `executed` is true only on the `Decision::Allow` path where `tool.call`
+/// returned a deliverable output — never for unknown tools, bad arguments, or
+/// denials (all `executed: false`), and never for a harness-boundary
+/// [`AgentError::Tool`] (that returns `Err`, not a `CallOutcome`). `PostToolUse`
+/// fires only when `executed` is true.
+struct CallOutcome {
+    output: ToolOutput,
+    executed: bool,
+}
+
 fn pending_tool_calls(content: &NonEmptyVec<AssistantContent>) -> Vec<PendingToolCall> {
     content
         .iter()
@@ -541,6 +766,7 @@ fn error_kind(error: &AgentError) -> &'static str {
         AgentError::Tool { .. } => "tool",
         AgentError::EmptyTranscript => "empty_transcript",
         AgentError::Cancelled => "cancelled",
+        AgentError::PromptBlocked { .. } => "prompt_blocked",
         AgentError::MaxIterations { .. } => "max_iterations",
     }
 }
@@ -576,7 +802,10 @@ fn assistant_text(content: &NonEmptyVec<AssistantContent>) -> String {
 mod tests {
     use std::{
         collections::VecDeque,
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
     };
 
     use async_trait::async_trait;
@@ -593,6 +822,10 @@ mod tests {
     use super::{AgentConfig, AgentRunner};
     use crate::{
         error::AgentError,
+        hook::{
+            Hook, PostToolCx, PostToolOutcome, PreToolCx, PreToolOutcome, ScriptedHook, StopCx,
+            StopOutcome,
+        },
         observer::{AgentEvent, AgentObserver, CompositeObserver, EventKind},
         permission::{
             ApprovalOutcome, PermissionAction, PermissionPolicy, PermissionRequest, RuleOrigin,
@@ -1609,5 +1842,406 @@ mod tests {
             &events[0].kind,
             EventKind::Error { kind, .. } if kind == "empty_transcript"
         ));
+    }
+
+    /// Counts `PostToolUse` invocations, to prove it does (not) fire.
+    struct CountingPostHook(Arc<AtomicUsize>);
+
+    #[async_trait]
+    impl Hook for CountingPostHook {
+        async fn post_tool_use(&self, _cx: &PostToolCx<'_>) -> PostToolOutcome {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            PostToolOutcome::Proceed
+        }
+    }
+
+    /// Cancels the turn from inside `pre_tool_use`, then hangs — the hook analogue
+    /// of `HangTool`, driving the trigger's `select!` to its cancel branch.
+    struct CancelInPreHook(CancellationToken);
+
+    #[async_trait]
+    impl Hook for CancelInPreHook {
+        async fn pre_tool_use(&self, _cx: &PreToolCx<'_>) -> PreToolOutcome {
+            self.0.cancel();
+            std::future::pending().await
+        }
+    }
+
+    /// Same, but on `post_tool_use` — fires after the current tool's result is
+    /// recorded, exercising the mid-batch cancellation path.
+    struct CancelInPostHook(CancellationToken);
+
+    #[async_trait]
+    impl Hook for CancelInPostHook {
+        async fn post_tool_use(&self, _cx: &PostToolCx<'_>) -> PostToolOutcome {
+            self.0.cancel();
+            std::future::pending().await
+        }
+    }
+
+    /// Always forces a continuation — the runner's cap, not the hook, must stop it.
+    struct AlwaysContinueHook;
+
+    #[async_trait]
+    impl Hook for AlwaysContinueHook {
+        async fn stop(&self, _cx: &StopCx<'_>) -> StopOutcome {
+            StopOutcome::Continue {
+                message: "keep going".to_string(),
+            }
+        }
+    }
+
+    /// Text of the plain user message at `index`, if it is one.
+    fn user_text(session: &AgentSession, index: usize) -> Option<String> {
+        match &session.messages()[index] {
+            Message::User { content } => match content.first() {
+                UserContent::Text(text) => Some(text.text_ref().to_string()),
+                UserContent::ToolResult(_) => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Whether the message at `index` is a tool-result user message.
+    fn is_tool_result(session: &AgentSession, index: usize) -> bool {
+        matches!(
+            &session.messages()[index],
+            Message::User { content } if matches!(content.first(), UserContent::ToolResult(_))
+        )
+    }
+
+    /// Whether any message in a request's history is a user text equal to `text`.
+    fn request_has_user_text(request: &CompletionRequest, text: &str) -> bool {
+        request.chat_history.iter().any(|message| {
+            matches!(
+                message,
+                Message::User { content }
+                    if matches!(content.first(), UserContent::Text(t) if t.text_ref() == text)
+            )
+        })
+    }
+
+    #[tokio::test]
+    async fn pre_tool_use_deny_short_circuits_the_gate() {
+        let model = FakeModel::new([
+            response(AssistantContent::tool_call(
+                "call_1",
+                "bash",
+                serde_json::json!({ "cmd": "printf hi" }),
+            )),
+            response(AssistantContent::text("understood")),
+        ]);
+        let mut registry = ToolRegistry::new();
+        registry.register(bash().await);
+        let observer = Arc::new(CollectingObserver::default());
+        // A scripted approver with no outcomes panics if consulted, proving the
+        // hook deny short-circuits before the gate reaches the approver.
+        let runner = AgentRunner::new(model, registry)
+            .with_approver(Arc::new(ScriptedApprover::new([])))
+            .with_observer(observer.clone())
+            .with_hook(Arc::new(ScriptedHook::default().deny_tool("bash")));
+        let mut session = AgentSession::new();
+
+        runner
+            .run_turn(&mut session, "run it")
+            .await
+            .expect("a hook denial is model-recoverable");
+
+        let result = tool_result_text(&session, 2);
+        assert!(result.contains("blocked_by_hook"), "got {result}");
+
+        // Same event shape as a permission denial: ToolStart, then a failed ToolEnd.
+        let events = observer.events();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::ToolStart { .. }))
+        );
+        let tool_ends: Vec<_> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::ToolEnd { error, .. } => Some(error.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tool_ends.len(), 1);
+        assert!(matches!(&tool_ends[0], Some(f) if f.kind == "blocked_by_hook"));
+    }
+
+    #[tokio::test]
+    async fn hook_proceed_does_not_bypass_a_gate_deny() {
+        let model = FakeModel::new([
+            response(AssistantContent::tool_call(
+                "call_1",
+                "bash",
+                serde_json::json!({ "cmd": "curl http://evil.test" }),
+            )),
+            response(AssistantContent::text("ok")),
+        ]);
+        let mut registry = ToolRegistry::new();
+        registry.register(bash().await);
+        let mut policy = PermissionPolicy::new();
+        policy
+            .deny
+            .extend(parse_rule("Bash(curl*)", RuleOrigin::ProjectSettings).unwrap());
+        // A hook that only proceeds must not turn a gate deny into an allow.
+        let runner = AgentRunner::new(model, registry)
+            .with_policy(policy)
+            .with_hook(Arc::new(ScriptedHook::default()));
+        let mut session = AgentSession::new();
+
+        runner
+            .run_turn(&mut session, "fetch")
+            .await
+            .expect("a denial is model-recoverable");
+        let result = tool_result_text(&session, 2);
+        assert!(result.contains("permission_denied"), "got {result}");
+    }
+
+    #[tokio::test]
+    async fn user_prompt_submit_add_context_reaches_the_model() {
+        let model = FakeModel::new([response(AssistantContent::text("done"))]);
+        let runner = AgentRunner::new(model.clone(), ToolRegistry::new())
+            .with_hook(Arc::new(ScriptedHook::default().add_context("INJECTED")));
+        let mut session = AgentSession::new();
+
+        runner.run_turn(&mut session, "hi").await.expect("runs");
+
+        // Prompt then injected context, in order; and the model saw the context.
+        assert_eq!(user_text(&session, 0).as_deref(), Some("hi"));
+        assert_eq!(user_text(&session, 1).as_deref(), Some("INJECTED"));
+        assert!(request_has_user_text(&model.requests()[0], "INJECTED"));
+    }
+
+    #[tokio::test]
+    async fn user_prompt_submit_block_leaves_no_trace() {
+        let model = FakeModel::new([response(AssistantContent::text("unreached"))]);
+        let observer = Arc::new(CollectingObserver::default());
+        let runner = AgentRunner::new(model.clone(), ToolRegistry::new())
+            .with_observer(observer.clone())
+            .with_hook(Arc::new(ScriptedHook::default().block("not allowed")));
+        let mut session = AgentSession::new();
+
+        let err = runner
+            .run_turn(&mut session, "secret")
+            .await
+            .expect_err("the prompt is blocked");
+        assert!(matches!(err, AgentError::PromptBlocked { reason } if reason == "not allowed"));
+
+        // Nothing entered the transcript and the model was never called.
+        assert!(session.messages().is_empty());
+        assert!(model.requests().is_empty());
+
+        // The block is still visible to the observer as the turn-terminal error.
+        let events = observer.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].iteration, None);
+        assert!(matches!(
+            &events[0].kind,
+            EventKind::Error { kind, .. } if kind == "prompt_blocked"
+        ));
+    }
+
+    #[tokio::test]
+    async fn post_tool_use_feedback_lands_after_the_batch() {
+        let model = FakeModel::new([
+            response_many(vec![
+                AssistantContent::tool_call(
+                    "call_1",
+                    "bash",
+                    serde_json::json!({ "cmd": "printf one" }),
+                ),
+                AssistantContent::tool_call(
+                    "call_2",
+                    "bash",
+                    serde_json::json!({ "cmd": "printf two" }),
+                ),
+            ]),
+            response(AssistantContent::text("done")),
+        ]);
+        let mut registry = ToolRegistry::new();
+        registry.register(bash().await);
+        let runner = AgentRunner::new(model, registry)
+            .with_hook(Arc::new(ScriptedHook::default().add_feedback("FB")));
+        let mut session = AgentSession::new();
+
+        runner.run_turn(&mut session, "do two").await.expect("runs");
+
+        // The two tool_results stay contiguous; feedback follows the batch.
+        assert!(is_tool_result(&session, 2));
+        assert!(is_tool_result(&session, 3));
+        assert!(!is_tool_result(&session, 4));
+        assert_eq!(tool_result_id(&session, 2), "call_1");
+        assert_eq!(tool_result_id(&session, 3), "call_2");
+        assert_eq!(user_text(&session, 4).as_deref(), Some("FB"));
+    }
+
+    #[tokio::test]
+    async fn post_tool_use_does_not_fire_on_a_harness_error() {
+        let model = FakeModel::new([response(AssistantContent::tool_call(
+            "call_1",
+            "broken",
+            serde_json::json!({}),
+        ))]);
+        let mut registry = ToolRegistry::new();
+        registry.register(BrokenTool::new());
+        let count = Arc::new(AtomicUsize::new(0));
+        let runner =
+            AgentRunner::new(model, registry).with_hook(Arc::new(CountingPostHook(count.clone())));
+        let mut session = AgentSession::new();
+
+        let err = runner
+            .run_turn(&mut session, "break")
+            .await
+            .expect_err("a harness tool error unwinds the turn");
+        assert!(matches!(err, AgentError::Tool { .. }));
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            0,
+            "PostToolUse must not fire on a harness-boundary AgentError::Tool",
+        );
+    }
+
+    #[tokio::test]
+    async fn post_tool_use_cancellation_keeps_results_paired() {
+        let model = FakeModel::new([response_many(vec![
+            AssistantContent::tool_call(
+                "call_1",
+                "bash",
+                serde_json::json!({ "cmd": "printf one" }),
+            ),
+            AssistantContent::tool_call(
+                "call_2",
+                "bash",
+                serde_json::json!({ "cmd": "printf two" }),
+            ),
+        ])]);
+        let mut registry = ToolRegistry::new();
+        registry.register(bash().await);
+        let cancel = CancellationToken::new();
+        let runner =
+            AgentRunner::new(model, registry).with_hook(Arc::new(CancelInPostHook(cancel.clone())));
+        let mut session = AgentSession::new();
+
+        let err = runner
+            .run_turn_with(&mut session, "do two", cancel)
+            .await
+            .expect_err("the hook cancels the turn");
+        assert!(matches!(err, AgentError::Cancelled));
+
+        // call_1 ran and was recorded exactly once (real output); call_2 is paired
+        // as interrupted — the invariant holds with no duplicate for call_1.
+        assert_eq!(session.messages().len(), 4);
+        assert_eq!(tool_result_id(&session, 2), "call_1");
+        assert!(tool_result_text(&session, 2).contains("\"stdout\":\"one\""));
+        assert_eq!(tool_result_id(&session, 3), "call_2");
+        assert!(tool_result_text(&session, 3).contains("cancelled"));
+    }
+
+    #[tokio::test]
+    async fn stop_continue_forces_more_iterations_then_allows() {
+        let model = FakeModel::new([
+            response(AssistantContent::text("a")),
+            response(AssistantContent::text("b")),
+            response(AssistantContent::text("done")),
+        ]);
+        let runner = AgentRunner::new(model, ToolRegistry::new()).with_hook(Arc::new(
+            ScriptedHook::default().stop_continue(2, "keep going"),
+        ));
+        let mut session = AgentSession::new();
+
+        let turn = runner
+            .run_turn(&mut session, "go")
+            .await
+            .expect("completes after the scripted continuations");
+        assert_eq!(turn.iterations, 3);
+        assert_eq!(turn.final_text(&session), "done");
+    }
+
+    #[tokio::test]
+    async fn stop_continue_is_ignored_without_iteration_budget() {
+        // The last allowed model call returns a final answer; a hook wants to
+        // continue but there is no budget, so the answer stands rather than
+        // turning into a MaxIterations error.
+        let model = FakeModel::new([response(AssistantContent::text("final"))]);
+        let runner = AgentRunner::with_config(
+            model,
+            ToolRegistry::new(),
+            AgentConfig {
+                max_iterations: 1,
+                ..AgentConfig::default()
+            },
+        )
+        .with_hook(Arc::new(ScriptedHook::default().stop_continue(5, "more")));
+        let mut session = AgentSession::new();
+
+        let turn = runner
+            .run_turn(&mut session, "go")
+            .await
+            .expect("the final answer is kept, not turned into MaxIterations");
+        assert_eq!(turn.iterations, 1);
+        assert_eq!(turn.final_text(&session), "final");
+    }
+
+    #[tokio::test]
+    async fn stop_continuation_cap_resets_each_turn() {
+        // An always-continue hook: the runner's cap (a run_loop local), not the
+        // hook, stops it — so each turn gets a fresh budget of continuations. If
+        // the cap lived on the session, turn B would stop after one iteration.
+        let model = FakeModel::new([
+            response(AssistantContent::text("a0")),
+            response(AssistantContent::text("a1")),
+            response(AssistantContent::text("a2")),
+            response(AssistantContent::text("a3")),
+            response(AssistantContent::text("b0")),
+            response(AssistantContent::text("b1")),
+            response(AssistantContent::text("b2")),
+            response(AssistantContent::text("b3")),
+        ]);
+        let runner =
+            AgentRunner::new(model, ToolRegistry::new()).with_hook(Arc::new(AlwaysContinueHook));
+        let mut session = AgentSession::new();
+
+        let turn_a = runner
+            .run_turn(&mut session, "first")
+            .await
+            .expect("turn A");
+        assert_eq!(turn_a.iterations, 4);
+
+        let turn_b = runner
+            .run_turn(&mut session, "second")
+            .await
+            .expect("turn B");
+        assert_eq!(turn_b.iterations, 4);
+    }
+
+    #[tokio::test]
+    async fn hook_cancellation_is_not_a_model_visible_deny() {
+        let model = FakeModel::new([response(AssistantContent::tool_call(
+            "call_1",
+            "bash",
+            serde_json::json!({ "cmd": "printf hi" }),
+        ))]);
+        let mut registry = ToolRegistry::new();
+        registry.register(bash().await);
+        let cancel = CancellationToken::new();
+        let runner =
+            AgentRunner::new(model, registry).with_hook(Arc::new(CancelInPreHook(cancel.clone())));
+        let mut session = AgentSession::new();
+
+        let err = runner
+            .run_turn_with(&mut session, "run", cancel)
+            .await
+            .expect_err("the hook cancels the turn");
+        assert!(matches!(err, AgentError::Cancelled));
+
+        // The call is paired as interrupted ("cancelled"), never a blocked_by_hook
+        // deny — a user cancel must not be mistaken for a hook decision.
+        let result = tool_result_text(&session, 2);
+        assert!(result.contains("cancelled"), "got {result}");
+        assert!(
+            !result.contains("blocked_by_hook"),
+            "cancellation was mis-mapped to a deny: {result}"
+        );
     }
 }

@@ -1,5 +1,6 @@
 mod approver;
 mod config;
+mod hook;
 mod observer;
 mod settings;
 
@@ -25,6 +26,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     approver::TerminalApprover,
     config::{PermissionFlags, resolve_permissions},
+    hook::build_hooks,
     settings::load_project_settings,
 };
 
@@ -67,7 +69,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Resolve permissions from built-in ∪ project file ∪ CLI flags, with mode
     // precedence CLI > project > Default. The merge is pure and tested in `config`;
     // loading the project file (I/O) stays in `settings`.
-    let project = load_project_settings(workspace.root())?;
+    let mut project = load_project_settings(workspace.root())?;
+    // Take the hooks before `resolve_permissions` consumes `project`; they ride
+    // the same assembly line as the policy but attach to the runner separately.
+    let hooks = build_hooks(std::mem::take(&mut project.hooks));
     let flags = PermissionFlags {
         allow: &cli.allow,
         ask: &cli.ask,
@@ -95,7 +100,8 @@ the task is done, then give a short, direct final answer."
     let runner = AgentRunner::with_config(model, registry, config)
         .with_policy(resolved.policy)
         .with_approver(Arc::new(TerminalApprover))
-        .with_observer(Arc::new(observer::CliObserver));
+        .with_observer(Arc::new(observer::CliObserver))
+        .with_hooks(hooks);
 
     let mut session = AgentSession::with_mode(resolved.mode);
 
@@ -104,6 +110,7 @@ the task is done, then give a short, direct final answer."
         match run_turn(&runner, &mut session, initial_prompt).await {
             Ok(text) => println!("\n{text}"),
             Err(TurnError::Cancelled) => eprintln!("\n^C cancelled"),
+            Err(TurnError::Blocked(reason)) => eprintln!("\nprompt blocked: {reason}"),
             Err(TurnError::Agent(err)) => return Err(err.into()),
         }
         return Ok(());
@@ -130,6 +137,7 @@ the task is done, then give a short, direct final answer."
         match run_turn(&runner, &mut session, input.to_string()).await {
             Ok(text) => println!("\n{text}"),
             Err(TurnError::Cancelled) => eprintln!("\n^C cancelled"),
+            Err(TurnError::Blocked(reason)) => eprintln!("\nprompt blocked: {reason}"),
             Err(TurnError::Agent(err)) => eprintln!("error: {err}"),
         }
     }
@@ -137,9 +145,11 @@ the task is done, then give a short, direct final answer."
     Ok(())
 }
 
-/// A turn either produced final text, was cancelled (Ctrl-C / abort), or failed.
+/// A turn either produced final text, was cancelled (Ctrl-C / abort), was
+/// blocked by a `UserPromptSubmit` hook, or failed.
 enum TurnError {
     Cancelled,
+    Blocked(String),
     Agent(AgentError),
 }
 
@@ -167,6 +177,7 @@ async fn run_turn<M: CompletionModel>(
     match result {
         Ok(turn) => Ok(turn.final_text(session)),
         Err(AgentError::Cancelled) => Err(TurnError::Cancelled),
+        Err(AgentError::PromptBlocked { reason }) => Err(TurnError::Blocked(reason)),
         Err(err) => Err(TurnError::Agent(err)),
     }
 }
