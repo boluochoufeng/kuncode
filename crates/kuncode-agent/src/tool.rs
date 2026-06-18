@@ -8,17 +8,20 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 use crate::permission::PermissionRequest;
+use crate::todo::TodoHandle;
 
 pub mod bash;
 pub mod filesystem;
+pub mod todo_write;
 
 /// Per-call execution context threaded into every tool.
 ///
-/// Kept deliberately small. It carries only a cancellation token today; the
-/// permission *gate* lives in the runner, not here (the runner computes the
-/// verdict before dispatch). Tools already self-hold their [`Workspace`], so it
-/// is not duplicated here. Future fields (a `request_permission` hook for s06
-/// subagents, a `cwd` override) attach at this seam.
+/// Kept deliberately small. The permission *gate* lives in the runner, not here
+/// (the runner computes the verdict before dispatch), and tools already self-hold
+/// their [`Workspace`], so neither is duplicated here. It carries only the
+/// per-session seams a tool genuinely needs at call time: a cancellation token,
+/// and the [`TodoHandle`] for the session plan. Future fields (a
+/// `request_permission` hook for s06 subagents, a `cwd` override) attach here too.
 ///
 /// [`Workspace`]: crate::workspace::Workspace
 #[derive(Clone, Debug, Default)]
@@ -27,18 +30,33 @@ pub struct ToolContext {
     /// it for cooperative cancellation, but the runner also races `call`
     /// against it, so most tools can ignore it.
     pub cancel: CancellationToken,
+    /// Handle to the current session's task plan. The runner clones in the
+    /// session's handle; `todo_write` writes through it. Defaults to a standalone
+    /// empty handle, so a tool that ignores the plan — and tests — still gets a
+    /// valid (if unobserved) target.
+    pub todos: TodoHandle,
 }
 
 impl ToolContext {
-    /// A context with a fresh, never-cancelled token. Handy for tests and
-    /// non-interactive callers.
+    /// A context with a fresh, never-cancelled token and a standalone plan.
+    /// Handy for tests and non-interactive callers.
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Builds a context wrapping an existing cancellation token.
     pub fn with_cancel(cancel: CancellationToken) -> Self {
-        Self { cancel }
+        Self {
+            cancel,
+            ..Self::default()
+        }
+    }
+
+    /// Attaches the session's plan handle, so `todo_write` writes the session's
+    /// plan rather than the standalone default.
+    pub fn with_todos(mut self, todos: TodoHandle) -> Self {
+        self.todos = todos;
+        self
     }
 }
 

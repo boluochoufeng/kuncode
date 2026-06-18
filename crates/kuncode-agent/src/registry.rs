@@ -9,6 +9,7 @@ use crate::{
         Tool,
         bash::Bash,
         filesystem::{EditFile, Glob, ReadFile, WriteFile},
+        todo_write::TodoWrite,
     },
     workspace::Workspace,
 };
@@ -49,6 +50,9 @@ impl ToolRegistry {
         let _ = self.register(WriteFile::new(workspace.clone()));
         let _ = self.register(EditFile::new(workspace.clone()));
         let _ = self.register(Glob::new(workspace));
+        // Plan tool last: workspace-free and appended after the file tools to
+        // keep the definition prefix stable for provider-side cache reuse.
+        let _ = self.register(TodoWrite::new());
     }
 
     /// Registers a tool, replacing any existing tool with the same model-facing
@@ -204,7 +208,14 @@ mod tests {
 
         assert_eq!(
             names,
-            ["bash", "read_file", "write_file", "edit_file", "glob"]
+            [
+                "bash",
+                "read_file",
+                "write_file",
+                "edit_file",
+                "glob",
+                "todo_write"
+            ]
         );
     }
 
