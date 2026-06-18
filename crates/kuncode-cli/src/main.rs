@@ -90,6 +90,9 @@ the task is done, then give a short, direct final answer."
     let registry = ToolRegistry::with_default_workspace_tools(workspace);
     let config = AgentConfig {
         system_prompt: Some(system_prompt),
+        // Nudge the model to keep its plan current after a few quiet calls; the
+        // library leaves this off, the CLI opts in.
+        todo_reminder_interval: Some(3),
         ..AgentConfig::default()
     };
 

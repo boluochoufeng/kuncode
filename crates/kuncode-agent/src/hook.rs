@@ -123,7 +123,7 @@ impl PromptCx<'_> {
 
 /// Borrowed view for [`Hook::pre_tool_use`].
 pub struct PreToolCx<'a> {
-    /// The structured request the gate will rule on (reused from s03).
+    /// The structured request the gate will rule on (the permission gate's own type).
     pub request: &'a PermissionRequest,
     /// Raw arguments (read-only; argument rewrite is deferred).
     pub args: &'a Value,

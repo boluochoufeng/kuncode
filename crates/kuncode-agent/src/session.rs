@@ -19,7 +19,7 @@ pub struct AgentSession {
     /// because ordering is per-session — same reasoning as the per-session
     /// permission grants above.
     seq: u64,
-    /// The session task plan (s05). Same per-session rationale as the permission
+    /// The session task plan. Same per-session rationale as the permission
     /// state. The runner clones this handle into each
     /// [`ToolContext`](crate::tool::ToolContext) so `todo_write` writes here.
     todos: TodoHandle,

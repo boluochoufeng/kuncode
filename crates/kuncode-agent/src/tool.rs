@@ -21,7 +21,7 @@ pub mod todo_write;
 /// their [`Workspace`], so neither is duplicated here. It carries only the
 /// per-session seams a tool genuinely needs at call time: a cancellation token,
 /// and the [`TodoHandle`] for the session plan. Future fields (a
-/// `request_permission` hook for s06 subagents, a `cwd` override) attach here too.
+/// `request_permission` hook for subagents, a `cwd` override) attach here too.
 ///
 /// [`Workspace`]: crate::workspace::Workspace
 #[derive(Clone, Debug, Default)]

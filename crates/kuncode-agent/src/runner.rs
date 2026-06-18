@@ -32,6 +32,14 @@ const DEFAULT_MAX_ITERATIONS: usize = 50;
 /// backstop. Mirrors Claude Code's `stop_hook_active`.
 const STOP_CONTINUATION_LIMIT: usize = 3;
 
+/// Injected as a user message when the task plan has gone idle for
+/// [`AgentConfig::todo_reminder_interval`] model calls. A soft nudge, not
+/// enforcement — it re-surfaces the plan into context so a long task does not
+/// drift off it. The `<reminder>` framing marks it as harness-injected, not the
+/// user speaking.
+const TODO_REMINDER: &str = "<reminder>Keep the task plan current: call todo_write to \
+mark finished steps completed and set the next one in_progress.</reminder>";
+
 /// Runtime knobs for one agent loop.
 #[derive(Clone, Debug)]
 pub struct AgentConfig {
@@ -47,6 +55,15 @@ pub struct AgentConfig {
     ///
     /// It is request-only and never stored in [`AgentSession`].
     pub system_prompt: Option<String>,
+    /// After this many consecutive model calls without the task plan changing,
+    /// inject [`TODO_REMINDER`] to nudge the model to call `todo_write`. `None`
+    /// disables the nag.
+    ///
+    /// A soft scaffold, not enforcement: it only re-surfaces the plan into
+    /// context. The counter tracks iterations since the plan's *generation* last
+    /// advanced, so any accepted `todo_write` (even an identical resubmit) resets
+    /// it; a rejected one does not.
+    pub todo_reminder_interval: Option<usize>,
 }
 
 impl Default for AgentConfig {
@@ -57,6 +74,9 @@ impl Default for AgentConfig {
             reasoning: None,
             tool_choice: None,
             system_prompt: None,
+            // Off by default: a library default that injects extra messages would
+            // surprise embedders. The CLI opts in.
+            todo_reminder_interval: None,
         }
     }
 }
@@ -299,7 +319,29 @@ where
         // would accumulate and permanently disable later turns' `Stop` hooks.
         let mut stop_continuations = 0usize;
 
+        // Plan-nag bookkeeping. `idle_iterations` counts model calls since the
+        // plan's generation last advanced; when it reaches the configured
+        // interval we re-surface the plan. Tracked by generation (not tool name)
+        // so the runner stays agnostic to which tool maintains the plan.
+        let reminder_interval = self.config.todo_reminder_interval;
+        let mut last_todo_generation = session.todo_generation();
+        let mut idle_iterations = 0usize;
+
         for iteration in 0..self.config.max_iterations {
+            // A `todo_write` in the previous iteration's tool batch shows up as an
+            // advanced generation: reset the idle counter. Otherwise nudge once
+            // the plan has sat untouched for `interval` calls.
+            let generation_now = session.todo_generation();
+            if generation_now != last_todo_generation {
+                last_todo_generation = generation_now;
+                idle_iterations = 0;
+            }
+            if reminder_interval.is_some_and(|interval| idle_iterations >= interval) {
+                session.push_user(TODO_REMINDER.to_string());
+                idle_iterations = 0;
+            }
+            idle_iterations += 1;
+
             let iteration_result = self
                 .run_iteration(session, iteration, cancel)
                 .await
@@ -831,7 +873,7 @@ mod tests {
     use serde_json::Value;
     use tokio_util::sync::CancellationToken;
 
-    use super::{AgentConfig, AgentRunner};
+    use super::{AgentConfig, AgentRunner, TODO_REMINDER};
     use crate::{
         error::AgentError,
         hook::{
@@ -1638,6 +1680,106 @@ mod tests {
         assert!(!labels.contains(&"todo_update"), "got {labels:?}");
         // The plan was left empty by the rejected write.
         assert!(session.todos_snapshot().is_empty());
+    }
+
+    /// Counts injected plan-nag reminders in a transcript.
+    fn reminder_count(session: &AgentSession) -> usize {
+        session
+            .messages()
+            .iter()
+            .filter(|m| match m {
+                Message::User { content } => matches!(
+                    content.first(),
+                    UserContent::Text(t) if t.text_ref() == TODO_REMINDER
+                ),
+                _ => false,
+            })
+            .count()
+    }
+
+    #[tokio::test]
+    async fn plan_nag_fires_after_the_idle_interval() {
+        // Two tool-only calls leave the plan untouched; on the third iteration
+        // the idle counter hits the interval and a reminder is injected before
+        // the model call.
+        let model = FakeModel::new([
+            response(AssistantContent::tool_call(
+                "c1",
+                "bash",
+                serde_json::json!({ "cmd": "printf one" }),
+            )),
+            response(AssistantContent::tool_call(
+                "c2",
+                "bash",
+                serde_json::json!({ "cmd": "printf two" }),
+            )),
+            response(AssistantContent::text("done")),
+        ]);
+        let mut registry = ToolRegistry::new();
+        registry.register(bash().await);
+        let runner = AgentRunner::with_config(
+            model,
+            registry,
+            AgentConfig {
+                todo_reminder_interval: Some(2),
+                ..AgentConfig::default()
+            },
+        );
+        let mut session = AgentSession::new();
+
+        runner
+            .run_turn(&mut session, "keep working")
+            .await
+            .expect("agent run should complete");
+
+        // Exactly one nudge, and it is not the opening user message — it was
+        // injected mid-loop once the plan sat idle for the interval.
+        assert_eq!(reminder_count(&session), 1);
+    }
+
+    #[tokio::test]
+    async fn a_todo_write_resets_the_plan_nag() {
+        // Same iteration count as the firing case, but a `todo_write` up front
+        // advances the plan generation and resets the idle counter, so the
+        // interval is never reached and no reminder is injected.
+        let model = FakeModel::new([
+            response(AssistantContent::tool_call(
+                "c1",
+                "todo_write",
+                serde_json::json!({
+                    "todos": [
+                        { "content": "Step", "active_form": "Stepping", "status": "in_progress" }
+                    ]
+                }),
+            )),
+            response(AssistantContent::tool_call(
+                "c2",
+                "bash",
+                serde_json::json!({ "cmd": "printf go" }),
+            )),
+            response(AssistantContent::text("done")),
+        ]);
+        let mut registry = ToolRegistry::new();
+        registry.register(bash().await);
+        registry.register(TodoWrite::new());
+        let runner = AgentRunner::with_config(
+            model,
+            registry,
+            AgentConfig {
+                todo_reminder_interval: Some(2),
+                ..AgentConfig::default()
+            },
+        );
+        let mut session = AgentSession::new();
+
+        runner
+            .run_turn(&mut session, "plan then work")
+            .await
+            .expect("agent run should complete");
+
+        assert_eq!(reminder_count(&session), 0);
+        // The plan really was set, which is what reset the counter.
+        assert_eq!(session.todos_snapshot().len(), 1);
     }
 
     #[tokio::test]
