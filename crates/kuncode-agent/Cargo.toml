@@ -8,6 +8,7 @@ path = "src/lib.rs"
 
 [dependencies]
 async-trait = { workspace = true }
+chrono = { workspace = true }
 ignore = { workspace = true }
 kuncode-core = { path = "../kuncode-core" }
 schemars = { workspace = true }

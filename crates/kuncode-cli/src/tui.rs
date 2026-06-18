@@ -25,6 +25,7 @@ use kuncode_agent::permission::{PermissionMode, PermissionPolicy};
 use kuncode_agent::registry::ToolRegistry;
 use kuncode_agent::runner::{AgentConfig, AgentRunner};
 use kuncode_agent::session::AgentSession;
+use kuncode_agent::system_prompt::SystemPrompt;
 use kuncode_core::completion::CompletionModel;
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 use tokio_util::sync::CancellationToken;
@@ -48,6 +49,7 @@ pub async fn run<M>(
     model: M,
     registry: ToolRegistry,
     config: AgentConfig,
+    system_prompt: SystemPrompt,
     policy: PermissionPolicy,
     mode: PermissionMode,
     model_name: String,
@@ -59,6 +61,7 @@ where
     let (approval_tx, mut approval_rx) = mpsc::unbounded_channel();
 
     let runner = AgentRunner::with_config(model, registry, config)
+        .with_system_prompt(system_prompt)
         .with_policy(policy)
         .with_approver(Arc::new(TuiApprover::new(approval_tx)))
         .with_observer(Arc::new(TuiObserver::new(event_tx)));

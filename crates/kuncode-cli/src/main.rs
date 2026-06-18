@@ -15,6 +15,7 @@ use kuncode_agent::{
     registry::ToolRegistry,
     runner::{AgentConfig, AgentRunner},
     session::AgentSession,
+    system_prompt::{EnvironmentSection, IdentitySection, SystemPrompt, ToolsSection},
     workspace::Workspace,
 };
 use kuncode_core::{
@@ -50,6 +51,13 @@ struct Cli {
     prompt: Vec<String>,
 }
 
+/// Identity and behavioral instructions rendered as the first system-prompt
+/// block. Folds in guidance to maintain a plan via `todo_write`.
+const IDENTITY: &str = "You are kuncode, a coding agent operating in the user's \
+shell. Use the available tools when needed. For multi-step work, maintain a plan \
+with todo_write and keep it current, marking steps completed as you finish them. \
+Keep working until the task is done, then give a short, direct final answer.";
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
@@ -63,7 +71,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     let workspace = Workspace::from_current_dir().await?;
-    let cwd = workspace.root().display().to_string();
 
     // Resolve permissions from built-in ∪ project file ∪ CLI flags, with mode
     // precedence CLI > project > Default. The merge is pure and tested in `config`;
@@ -77,11 +84,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let resolved = resolve_permissions(project, &flags)?;
 
-    let system_prompt = format!(
-        "You are kuncode, a coding agent operating in the user's shell. \
-Operate under cwd {cwd}. Use the available tools when needed. Keep working until \
-the task is done, then give a short, direct final answer."
-    );
+    // Assembled at request time from these sections (identity, environment,
+    // tools). Built before `workspace` is moved into the registry below; moved
+    // into whichever run path executes.
+    let system_prompt = SystemPrompt::new(vec![
+        Box::new(IdentitySection::new(IDENTITY)),
+        Box::new(EnvironmentSection::new(workspace.root().to_path_buf())),
+        Box::new(ToolsSection),
+    ]);
 
     let client = DeepSeekClient::from_env()?;
     let model_name =
@@ -89,7 +99,6 @@ the task is done, then give a short, direct final answer."
     let model = DeepSeekCompletionModel::make(&client, model_name.clone());
     let registry = ToolRegistry::with_default_workspace_tools(workspace);
     let config = AgentConfig {
-        system_prompt: Some(system_prompt),
         // Nudge the model to keep its plan current after a few quiet calls; the
         // library leaves this off, the CLI opts in.
         todo_reminder_interval: Some(3),
@@ -102,6 +111,7 @@ the task is done, then give a short, direct final answer."
     // line-by-line renderer; only the bare interactive session enters the TUI.
     if !initial_prompt.trim().is_empty() {
         let runner = AgentRunner::with_config(model, registry, config)
+            .with_system_prompt(system_prompt)
             .with_policy(resolved.policy)
             .with_approver(Arc::new(TerminalApprover))
             .with_observer(Arc::new(observer::CliObserver));
@@ -131,6 +141,7 @@ the task is done, then give a short, direct final answer."
         model,
         registry,
         config,
+        system_prompt,
         resolved.policy,
         resolved.mode,
         model_name,
