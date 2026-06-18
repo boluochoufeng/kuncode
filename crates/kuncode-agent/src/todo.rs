@@ -1,6 +1,6 @@
 //! Task-plan domain model and the per-session plan store.
 //!
-//! The plan is the data behind the `todo_write` tool (s05): a flat, ordered list
+//! The plan is the data behind the `todo_write` tool: a flat, ordered list
 //! the model overwrites wholesale to keep a long task on track. It lives on the
 //! [`AgentSession`](crate::session::AgentSession) — like the permission state —
 //! and the tool reaches it through a [`TodoHandle`] carried on the

@@ -1,4 +1,4 @@
-//! The `todo_write` tool: maintain the session task plan (s05).
+//! The `todo_write` tool: maintain the session task plan.
 //!
 //! Whole-list overwrite: each call submits the complete plan, replacing the
 //! previous one. The tool holds no state of its own — it writes through the
