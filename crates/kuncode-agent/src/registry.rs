@@ -50,8 +50,6 @@ impl ToolRegistry {
         let _ = self.register(WriteFile::new(workspace.clone()));
         let _ = self.register(EditFile::new(workspace.clone()));
         let _ = self.register(Glob::new(workspace));
-        // Plan tool last: workspace-free and appended after the file tools to
-        // keep the definition prefix stable for provider-side cache reuse.
         let _ = self.register(TodoWrite::new());
     }
 

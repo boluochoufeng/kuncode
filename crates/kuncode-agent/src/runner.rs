@@ -21,6 +21,7 @@ use crate::{
     permission::{Approver, AutoApprove, Decision, PermissionGate, PermissionPolicy, Prepared},
     registry::ToolRegistry,
     session::AgentSession,
+    system_prompt::{PromptContext, SystemPrompt},
     tool::{ToolContext, ToolError, ToolOutput},
 };
 
@@ -51,13 +52,9 @@ pub struct AgentConfig {
     pub reasoning: Option<ReasoningEffort>,
     /// Tool-call policy passed through to the provider.
     pub tool_choice: Option<ToolChoice>,
-    /// System prompt injected as the first message of every request.
-    ///
-    /// It is request-only and never stored in [`AgentSession`].
-    pub system_prompt: Option<String>,
     /// After this many consecutive model calls without the task plan changing,
-    /// inject [`TODO_REMINDER`] to nudge the model to call `todo_write`. `None`
-    /// disables the nag.
+    /// inject a `<reminder>` message nudging the model to call `todo_write`.
+    /// `None` disables the nag.
     ///
     /// A soft scaffold, not enforcement: it only re-surfaces the plan into
     /// context. The counter tracks iterations since the plan's *generation* last
@@ -73,7 +70,6 @@ impl Default for AgentConfig {
             max_tokens: Some(4096),
             reasoning: None,
             tool_choice: None,
-            system_prompt: None,
             // Off by default: a library default that injects extra messages would
             // surprise embedders. The CLI opts in.
             todo_reminder_interval: None,
@@ -105,6 +101,10 @@ pub struct AgentRunner<M> {
     model: M,
     registry: ToolRegistry,
     config: AgentConfig,
+    /// Assembles the first system message per request from pluggable sections.
+    /// Empty by default, in which case no system message is sent. Shared
+    /// read-only across turns, like the other collaborators.
+    system_prompt: Arc<SystemPrompt>,
     /// Static permission rules, shared read-only across turns.
     policy: Arc<PermissionPolicy>,
     /// Side-effecting approval layer consulted on an `Ask` verdict.
@@ -136,11 +136,18 @@ where
             model,
             registry,
             config,
+            system_prompt: Arc::new(SystemPrompt::default()),
             policy: Arc::new(PermissionPolicy::builtin()),
             approver: Arc::new(AutoApprove),
             observer: None,
             hooks: Arc::new(Hooks::new()),
         }
+    }
+
+    /// Replaces the system-prompt assembler (e.g. the CLI's full section set).
+    pub fn with_system_prompt(mut self, system_prompt: SystemPrompt) -> Self {
+        self.system_prompt = Arc::new(system_prompt);
+        self
     }
 
     /// Replaces the static permission policy.
@@ -728,18 +735,25 @@ where
             return Err(AgentError::EmptyTranscript);
         }
 
-        let mut chat_history = Vec::with_capacity(
-            session.messages().len() + usize::from(self.config.system_prompt.is_some()),
-        );
-        if let Some(system) = &self.config.system_prompt {
-            chat_history.push(Message::system(system.clone()));
+        // Assembled fresh each request. Request-only: never stored in the
+        // transcript. Kept stable within a session (no volatile blocks) so it
+        // stays a cacheable prefix.
+        let tools = self.registry.definition();
+        let system = self
+            .system_prompt
+            .assemble(&PromptContext { tools: &tools });
+
+        let mut chat_history =
+            Vec::with_capacity(session.messages().len() + usize::from(system.is_some()));
+        if let Some(system) = system {
+            chat_history.push(Message::system(system));
         }
         chat_history.extend(session.messages().iter().cloned());
 
         Ok(CompletionRequestBuilder::from_messages(
             NonEmptyVec::try_from(chat_history).map_err(|_| AgentError::EmptyTranscript)?,
         )
-        .tools(self.registry.definition())
+        .tools(tools)
         .max_tokens(self.config.max_tokens)
         .reasoning(self.config.reasoning)
         .tool_choice(self.config.tool_choice.clone())
@@ -887,6 +901,7 @@ mod tests {
         },
         registry::ToolRegistry,
         session::AgentSession,
+        system_prompt::{IdentitySection, SystemPrompt},
         tool::{
             Tool, ToolContext, ToolError, ToolOutput, TypedTool, bash::Bash, definition_for,
             todo_write::TodoWrite,
@@ -1137,14 +1152,10 @@ mod tests {
         ]);
         let mut registry = ToolRegistry::new();
         registry.register(bash().await);
-        let runner = AgentRunner::with_config(
-            model.clone(),
-            registry,
-            AgentConfig {
-                system_prompt: Some("be stable".to_string()),
-                ..AgentConfig::default()
-            },
-        );
+        let runner = AgentRunner::with_config(model.clone(), registry, AgentConfig::default())
+            .with_system_prompt(SystemPrompt::new(vec![Box::new(IdentitySection::new(
+                "be stable",
+            ))]));
         let mut session = AgentSession::new();
 
         runner
@@ -1209,14 +1220,12 @@ mod tests {
         let model = FakeModel::new([response(AssistantContent::text("hi"))]);
         let mut registry = ToolRegistry::new();
         registry.register(bash().await);
-        let runner = AgentRunner::with_config(
-            model.clone(),
-            registry,
-            AgentConfig {
-                system_prompt: Some("be terse".to_string()),
-                ..AgentConfig::default()
-            },
-        );
+        // Only an identity section, so the assembled prompt is exactly the text
+        // asserted below (no tools/plan blocks appended).
+        let runner = AgentRunner::with_config(model.clone(), registry, AgentConfig::default())
+            .with_system_prompt(SystemPrompt::new(vec![Box::new(IdentitySection::new(
+                "be terse",
+            ))]));
         let mut session = AgentSession::new();
 
         runner
