@@ -421,11 +421,14 @@ where
         let mut feedback = Vec::new();
 
         for index in 0..tool_calls.len() {
-            let ctx = ToolContext::with_cancel(cancel.clone());
+            let ctx = ToolContext::with_cancel(cancel.clone()).with_todos(session.todo_handle());
             let id = tool_calls[index].id.clone();
             let call_id = tool_calls[index].call_id.clone();
             let name = tool_calls[index].name.clone();
             let arguments = tool_calls[index].arguments.clone();
+            // Snapshot the plan generation so a successful `todo_write` is
+            // detected by the counter advancing — generic, no tool-name check.
+            let todo_generation = session.todo_generation();
 
             match self
                 .gated_call(session, iteration, &id, &name, arguments, &ctx)
@@ -436,6 +439,15 @@ where
                     // consumes it — only when a hook could actually use it.
                     let post_output = (executed && !self.hooks.is_empty()).then(|| output.clone());
                     self.record_result(session, iteration, id, call_id, &name, output);
+
+                    // The plan changed iff the generation advanced (a validation
+                    // failure does not bump it, so a rejected `todo_write` emits
+                    // no update). Fire after `ToolEnd`, before `PostToolUse`, so a
+                    // hook that cancels still leaves the plan render correct.
+                    if session.todo_generation() != todo_generation {
+                        let todos = session.todos_snapshot();
+                        self.emit(session, Some(iteration), EventKind::TodoUpdate { todos });
+                    }
 
                     if let Some(output) = post_output {
                         let outcome = {
@@ -833,7 +845,10 @@ mod tests {
         },
         registry::ToolRegistry,
         session::AgentSession,
-        tool::{Tool, ToolContext, ToolError, ToolOutput, TypedTool, bash::Bash, definition_for},
+        tool::{
+            Tool, ToolContext, ToolError, ToolOutput, TypedTool, bash::Bash, definition_for,
+            todo_write::TodoWrite,
+        },
     };
 
     /// A tool whose `run` never completes — used to test that a cancellation
@@ -1452,6 +1467,7 @@ mod tests {
             EventKind::ToolStart { .. } => "tool_start",
             EventKind::ToolEnd { .. } => "tool_end",
             EventKind::Error { .. } => "error",
+            EventKind::TodoUpdate { .. } => "todo_update",
         }
     }
 
@@ -1531,6 +1547,97 @@ mod tests {
         );
         assert!(events.iter().all(|e| e.iteration.is_some()));
         assert!(events.iter().enumerate().all(|(i, e)| e.seq == i as u64));
+    }
+
+    #[tokio::test]
+    async fn todo_write_emits_a_todo_update_after_tool_end() {
+        let model = FakeModel::new([
+            response(AssistantContent::tool_call(
+                "call_1",
+                "todo_write",
+                serde_json::json!({
+                    "todos": [
+                        { "content": "Plan it", "active_form": "Planning it", "status": "in_progress" }
+                    ]
+                }),
+            )),
+            response(AssistantContent::text("done")),
+        ]);
+        let mut registry = ToolRegistry::new();
+        registry.register(TodoWrite::new());
+        let observer = Arc::new(CollectingObserver::default());
+        let runner = AgentRunner::new(model, registry).with_observer(observer.clone());
+        let mut session = AgentSession::new();
+
+        runner
+            .run_turn(&mut session, "make a plan")
+            .await
+            .expect("agent run should complete");
+
+        let events = observer.events();
+        let kinds: Vec<_> = events.iter().map(|e| event_label(&e.kind)).collect();
+        // `Meta` is allow-by-default, so the call runs unprompted and the plan
+        // update lands right after the tool's terminal event.
+        assert_eq!(
+            kinds,
+            vec![
+                "model_start",
+                "assistant",
+                "tool_start",
+                "tool_end",
+                "todo_update",
+                "model_start",
+                "assistant",
+            ],
+        );
+        let todos = events.iter().find_map(|e| match &e.kind {
+            EventKind::TodoUpdate { todos } => Some(todos.clone()),
+            _ => None,
+        });
+        let todos = todos.expect("a todo_update was emitted");
+        assert_eq!(todos.len(), 1);
+        assert_eq!(todos[0].content, "Plan it");
+        // The session store holds the same plan the event carried.
+        assert_eq!(session.todos_snapshot(), todos);
+    }
+
+    #[tokio::test]
+    async fn rejected_todo_write_emits_no_todo_update() {
+        // Two in_progress items fail validation: the call still produces a
+        // ToolEnd(ok:false), but the plan generation never advances, so no
+        // TodoUpdate is emitted.
+        let model = FakeModel::new([
+            response(AssistantContent::tool_call(
+                "call_1",
+                "todo_write",
+                serde_json::json!({
+                    "todos": [
+                        { "content": "a", "active_form": "a…", "status": "in_progress" },
+                        { "content": "b", "active_form": "b…", "status": "in_progress" }
+                    ]
+                }),
+            )),
+            response(AssistantContent::text("understood")),
+        ]);
+        let mut registry = ToolRegistry::new();
+        registry.register(TodoWrite::new());
+        let observer = Arc::new(CollectingObserver::default());
+        let runner = AgentRunner::new(model, registry).with_observer(observer.clone());
+        let mut session = AgentSession::new();
+
+        runner
+            .run_turn(&mut session, "make a bad plan")
+            .await
+            .expect("a validation failure is model-recoverable");
+
+        let labels: Vec<_> = observer
+            .events()
+            .iter()
+            .map(|e| event_label(&e.kind))
+            .collect();
+        assert!(!labels.contains(&"todo_update"), "got {labels:?}");
+        // The plan was left empty by the rejected write.
+        assert!(session.todos_snapshot().is_empty());
     }
 
     #[tokio::test]

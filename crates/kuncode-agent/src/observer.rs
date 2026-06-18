@@ -11,6 +11,7 @@ use std::{panic::AssertUnwindSafe, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 
+use crate::todo::TodoItem;
 use crate::tool::ToolErrorPayload;
 
 /// One event produced in order by the agent loop.
@@ -91,6 +92,18 @@ pub enum EventKind {
     /// `Assistant`/`ToolEnd` follows. `kind` mirrors the `AgentError` variant,
     /// e.g. `"completion"` / `"tool"` / `"cancelled"` / `"max_iterations"`.
     Error { kind: String, message: String },
+    /// The session task plan changed (the model called `todo_write`). Emitted by
+    /// the runner when a tool call advances the session plan's generation, so it
+    /// stays generic instead of recognizing `todo_write` by name.
+    ///
+    /// A *presentation-only* event with no transcript counterpart: the plan's
+    /// authoritative copies are the `todo_write` `tool_result` (the model's view)
+    /// and the session store (the harness's view), so this does not participate
+    /// in the [`ToolEnd`](Self::ToolEnd) ⇄ `tool_result` mirror invariant.
+    /// Unlike `ToolEnd` it *carries its full payload* — the renderer needs the
+    /// structured plan to draw a checklist and cannot reconstruct it from
+    /// `ToolEnd`, and a plan is small and bounded.
+    TodoUpdate { todos: Vec<TodoItem> },
 }
 
 /// Failure summary for [`EventKind::ToolEnd`], shaped like `ToolOutput.error`

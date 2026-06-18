@@ -3,6 +3,7 @@
 use crossterm::event::{KeyCode, KeyEvent};
 use kuncode_agent::observer::EventKind;
 use kuncode_agent::permission::{ApprovalOutcome, PermissionMode};
+use kuncode_agent::todo::TodoItem;
 
 use super::bridge::ApprovalRequest;
 
@@ -45,6 +46,12 @@ pub struct App {
     pub model_name: String,
     pub mode: PermissionMode,
     pub conversation: Vec<Item>,
+    /// Current session task plan, rendered as a sticky panel above the input —
+    /// *not* a log entry. A linear log can't keep one item pinned to the bottom
+    /// (later tool calls append below it), so the live checklist lives in its own
+    /// fixed pane instead. Empty means no plan (panel hidden). Updated wholesale
+    /// from each [`TodoUpdate`](EventKind::TodoUpdate).
+    pub plan: Vec<TodoItem>,
     pub input: String,
     pub status: Status,
     /// Set while a `PreToolUse` approval is pending; renders as a panel in the
@@ -64,6 +71,7 @@ impl App {
             model_name: model_name.into(),
             mode,
             conversation: Vec::new(),
+            plan: Vec::new(),
             input: String::new(),
             status: Status::Idle,
             approval: None,
@@ -181,6 +189,12 @@ impl App {
                         state,
                     });
                 }
+            }
+            EventKind::TodoUpdate { todos } => {
+                // The plan is a sticky panel, not a log entry, so a wholesale
+                // replace keeps it pinned below the latest activity regardless of
+                // what else streams in. An empty plan hides the panel.
+                self.plan = todos;
             }
             // `ModelStart` (no spinner yet) and the turn-terminal `Error` (handled
             // by the turn driver via `push_error`) need no log entry here.
@@ -338,6 +352,50 @@ mod tests {
             ] => assert_eq!(name, "mystery"),
             _ => panic!("orphan ToolEnd should surface as a tool entry"),
         }
+    }
+
+    fn todo(content: &str, status: kuncode_agent::todo::TodoStatus) -> TodoItem {
+        TodoItem {
+            content: content.to_string(),
+            active_form: format!("{content}…"),
+            status,
+        }
+    }
+
+    #[test]
+    fn todo_update_replaces_the_live_plan_without_touching_the_log() {
+        use kuncode_agent::todo::TodoStatus;
+        let mut app = app();
+        app.apply_event(EventKind::TodoUpdate {
+            todos: vec![todo("a", TodoStatus::InProgress)],
+        });
+        // Intervening log activity must not move or duplicate the plan: it is a
+        // sticky panel, not a conversation entry.
+        app.push_user("keep going".to_string());
+        app.apply_event(EventKind::TodoUpdate {
+            todos: vec![
+                todo("a", TodoStatus::Completed),
+                todo("b", TodoStatus::InProgress),
+            ],
+        });
+        // The plan field holds the latest snapshot wholesale.
+        assert_eq!(app.plan.len(), 2);
+        assert_eq!(app.plan[0].status, TodoStatus::Completed);
+        assert_eq!(app.plan[1].content, "b");
+        // The log only has the user message — no plan entry leaked into it.
+        assert!(matches!(app.conversation.as_slice(), [Item::User(_)]));
+    }
+
+    #[test]
+    fn clearing_the_plan_empties_the_panel() {
+        use kuncode_agent::todo::TodoStatus;
+        let mut app = app();
+        app.apply_event(EventKind::TodoUpdate {
+            todos: vec![todo("a", TodoStatus::InProgress)],
+        });
+        // An empty plan clears it: the panel is hidden, not left as a stale list.
+        app.apply_event(EventKind::TodoUpdate { todos: vec![] });
+        assert!(app.plan.is_empty());
     }
 
     #[test]

@@ -8,6 +8,8 @@ use ratatui::{
     widgets::{Block, Paragraph, Wrap},
 };
 
+use kuncode_agent::todo::{TodoItem, TodoStatus};
+
 use super::app::{App, Item, Status, ToolState, mode_label};
 use super::bridge::ApprovalRequest;
 
@@ -18,9 +20,16 @@ const APPROVAL_HEIGHT: u16 = 6;
 /// Background tint distinguishing user input from agent output.
 const USER_BG: Color = Color::Rgb(45, 50, 70);
 
-/// Draws one frame: conversation body, a bottom pane, and the status line. The
-/// bottom pane is the input box, or — while an approval is pending — the
-/// permission panel *in its place* (aligned to the input, not a centered popup).
+/// Largest the plan panel grows to (border + this many task rows); longer plans
+/// clip rather than crowd out the conversation.
+const PLAN_MAX_ROWS: u16 = 8;
+
+/// Draws one frame: conversation body, the sticky plan panel (while work is
+/// outstanding), a bottom pane, and the status line. The bottom pane is the input
+/// box, or —
+/// while an approval is pending — the permission panel *in its place* (aligned to
+/// the input, not a centered popup). The plan sits between the scrolling log and
+/// the input so the live checklist stays pinned below the latest activity.
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let bottom_height = if app.approval.is_some() {
         APPROVAL_HEIGHT
@@ -30,20 +39,51 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         (input_lines + 2).min(8)
     };
 
-    let [body, bottom, status_area] = Layout::vertical([
+    // Show the panel only while work is outstanding: an empty plan, or one whose
+    // tasks are all completed, collapses the region to zero height. The last task
+    // ticking to ✓ makes the panel vanish — that disappearance *is* the "done"
+    // signal, instead of leaving an all-✓ checklist lingering as noise.
+    let plan_outstanding = app
+        .plan
+        .iter()
+        .any(|task| task.status != TodoStatus::Completed);
+    let plan_height = if plan_outstanding {
+        (app.plan.len() as u16).min(PLAN_MAX_ROWS) + 2 // + border
+    } else {
+        0
+    };
+
+    let [body, plan_area, bottom, status_area] = Layout::vertical([
         Constraint::Min(1),
+        Constraint::Length(plan_height),
         Constraint::Length(bottom_height),
         Constraint::Length(1),
     ])
     .areas(frame.area());
 
     draw_conversation(frame, app, body);
+    if plan_height > 0 {
+        draw_plan(frame, app, plan_area);
+    }
     if let Some(approval) = &app.approval {
         draw_approval(frame, approval, bottom);
     } else {
         draw_input(frame, app, bottom);
     }
     draw_status(frame, app, status_area);
+}
+
+/// Renders the live task plan as a bordered panel: one colored checklist row per
+/// task. Pinned above the input by [`draw`], so it never scrolls away with the
+/// log.
+fn draw_plan(frame: &mut Frame, app: &App, area: Rect) {
+    let rows: Vec<Line> = app.plan.iter().map(plan_item_line).collect();
+    let panel = Paragraph::new(Text::from(rows)).block(
+        Block::bordered()
+            .title("任务计划")
+            .border_style(Style::new().cyan()),
+    );
+    frame.render_widget(panel, area);
 }
 
 fn draw_conversation(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -183,6 +223,20 @@ fn conversation_lines(app: &App) -> Vec<Line<'static>> {
         lines.push(Line::from(""));
     }
     lines
+}
+
+/// One checklist row for the plan panel: the shared status glyph + text, colored
+/// per status. The glyph and text-field choice come from
+/// [`crate::observer::todo_glyph_and_text`] so this and the plain renderer stay
+/// in lockstep; only the color is TUI-local.
+fn plan_item_line(todo: &TodoItem) -> Line<'static> {
+    let (glyph, text) = crate::observer::todo_glyph_and_text(todo);
+    let body = format!(" {glyph} {text}");
+    match todo.status {
+        TodoStatus::Pending => Line::from(body).dim(),
+        TodoStatus::InProgress => Line::from(body).cyan(),
+        TodoStatus::Completed => Line::from(body).green(),
+    }
 }
 
 fn tool_state_line(state: &ToolState) -> Line<'static> {
@@ -348,6 +402,71 @@ mod tests {
             "status line should show model"
         );
         assert!(rendered.contains("Bash"), "tool call should be visible");
+    }
+
+    #[test]
+    fn plan_panel_renders_the_live_plan() {
+        use kuncode_agent::todo::{TodoItem, TodoStatus};
+        let mut app = App::new("m", PermissionMode::Default);
+        // A long log: the plan panel must still show even when the log scrolls.
+        for i in 0..30 {
+            app.push_user(format!("line {i}"));
+        }
+        app.plan = vec![
+            TodoItem {
+                content: "First step".to_string(),
+                active_form: "Doing first step".to_string(),
+                status: TodoStatus::Completed,
+            },
+            TodoItem {
+                content: "Second step".to_string(),
+                active_form: "Doing second step".to_string(),
+                status: TodoStatus::InProgress,
+            },
+        ];
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).expect("test terminal");
+        terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
+        let rendered = format!("{}", terminal.backend());
+
+        assert!(rendered.contains("任务计划"), "plan panel title shown");
+        // The in_progress row shows the present-tense active_form, not content.
+        assert!(
+            rendered.contains("Doing second step"),
+            "in_progress shows active_form"
+        );
+        assert!(
+            rendered.contains("First step"),
+            "completed row shows content"
+        );
+    }
+
+    #[test]
+    fn plan_panel_hides_once_every_task_is_completed() {
+        use kuncode_agent::todo::{TodoItem, TodoStatus};
+        let mut app = App::new("m", PermissionMode::Default);
+        app.plan = vec![
+            TodoItem {
+                content: "First step".to_string(),
+                active_form: "Doing first step".to_string(),
+                status: TodoStatus::Completed,
+            },
+            TodoItem {
+                content: "Second step".to_string(),
+                active_form: "Doing second step".to_string(),
+                status: TodoStatus::Completed,
+            },
+        ];
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).expect("test terminal");
+        terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
+        let rendered = format!("{}", terminal.backend());
+
+        // All tasks done → the panel collapses, so its title is gone.
+        assert!(
+            !rendered.contains("任务计划"),
+            "an all-completed plan hides the panel"
+        );
     }
 
     #[test]

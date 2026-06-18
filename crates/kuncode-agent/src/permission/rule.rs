@@ -56,7 +56,9 @@ impl Rule {
             (Some(_), None) => false,
             (Some(pattern), Some(resource)) => match req.action {
                 PermissionAction::Execute => command_match(pattern, resource),
-                PermissionAction::Read | PermissionAction::Write => {
+                // `Meta` carries no resource, so it never reaches this arm; group
+                // it with the path matcher to keep the match exhaustive.
+                PermissionAction::Read | PermissionAction::Write | PermissionAction::Meta => {
                     glob_match(&normalize_pattern(pattern), &normalize_pattern(resource))
                 }
             },
@@ -160,20 +162,25 @@ pub fn suggest_scope(req: &PermissionRequest) -> Rule {
                 origin: RuleOrigin::SessionGrant,
             }
         }
-        PermissionAction::Read | PermissionAction::Write => match &req.resource {
-            Some(resource) => Rule {
-                raw: format!("{tool}({resource})"),
-                resource: Some(resource.clone()),
-                tool,
-                origin: RuleOrigin::SessionGrant,
-            },
-            None => Rule {
-                raw: tool.clone(),
-                resource: None,
-                tool,
-                origin: RuleOrigin::SessionGrant,
-            },
-        },
+        // `Meta` is allow-by-default and never asks, so `suggest_scope` is never
+        // called for it; grouped here only to keep the match exhaustive — a
+        // resourceless `Meta` would fall to the bare-tool grant below.
+        PermissionAction::Read | PermissionAction::Write | PermissionAction::Meta => {
+            match &req.resource {
+                Some(resource) => Rule {
+                    raw: format!("{tool}({resource})"),
+                    resource: Some(resource.clone()),
+                    tool,
+                    origin: RuleOrigin::SessionGrant,
+                },
+                None => Rule {
+                    raw: tool.clone(),
+                    resource: None,
+                    tool,
+                    origin: RuleOrigin::SessionGrant,
+                },
+            }
+        }
     }
 }
 

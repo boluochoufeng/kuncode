@@ -10,5 +10,6 @@ pub mod permission;
 pub mod registry;
 pub mod runner;
 pub mod session;
+pub mod todo;
 pub mod tool;
 pub mod workspace;

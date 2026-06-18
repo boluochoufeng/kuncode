@@ -7,6 +7,7 @@
 //! running synchronously on the loop task is fine.
 
 use kuncode_agent::observer::{AgentEvent, AgentObserver, EventKind};
+use kuncode_agent::todo::{TodoItem, TodoStatus};
 
 /// Renders intermediate narration, tool starts, and tool results to stdout.
 pub struct CliObserver;
@@ -45,11 +46,34 @@ impl AgentObserver for CliObserver {
                     .map(|f| format!("{}: {}", f.kind, f.message))
                     .unwrap_or_else(|| "failed".into())
             ),
+            // The plan changed: print the whole checklist (it is small). Each
+            // update reprints — there is no in-place cursor model here, unlike the
+            // TUI, so a fresh block is the honest non-TUI rendering. A cleared
+            // (empty) plan prints nothing, so there is no lone header.
+            EventKind::TodoUpdate { todos } if !todos.is_empty() => {
+                println!("⏺ 任务计划");
+                for todo in todos {
+                    let (glyph, text) = todo_glyph_and_text(todo);
+                    println!("  ⎿ {glyph} {text}");
+                }
+            }
             // Turn-terminal backstop: only clear any open progress state. The
             // cancel/error footer is `main.rs`'s (it also drives the exit code),
             // so printing here would duplicate its `^C cancelled` / `error: ..`.
             EventKind::Error { .. } => {}
             _ => {}
         }
+    }
+}
+
+/// Status → (glyph, text) for one plan item, shared by this plain renderer and
+/// the TUI ([`crate::tui`]). `in_progress` shows the present-tense `active_form`;
+/// the others show the imperative `content`. One source of truth so the two
+/// renderers can't drift on the glyph or which text field to show.
+pub(crate) fn todo_glyph_and_text(todo: &TodoItem) -> (&'static str, &str) {
+    match todo.status {
+        TodoStatus::Pending => ("☐", todo.content.as_str()),
+        TodoStatus::InProgress => ("▸", todo.active_form.as_str()),
+        TodoStatus::Completed => ("✓", todo.content.as_str()),
     }
 }

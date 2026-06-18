@@ -3,9 +3,9 @@
 
 use super::rule::{Rule, RuleOrigin};
 
-/// The kind of operation a tool performs. Only the three classes the current
-/// tools need: no `Fetch` (there is no network tool yet) and no `Other` (we
-/// refuse a vague catch-all). Add `Fetch` when a network tool appears.
+/// The kind of operation a tool performs. Only the classes the current tools
+/// need: no `Fetch` (there is no network tool yet) and no `Other` (we refuse a
+/// vague catch-all). Add `Fetch` when a network tool appears.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PermissionAction {
     /// Observe state without changing it. Defaults to `Allow`.
@@ -14,6 +14,11 @@ pub enum PermissionAction {
     Write,
     /// Run an opaque subprocess. Defaults to `Ask`.
     Execute,
+    /// Operate on the agent's own session state (e.g. the task plan) with no
+    /// external side effect — no filesystem, network, or subprocess. Defaults to
+    /// `Allow` and never auto-asks; an explicit deny rule can still block it.
+    /// Distinct from [`Read`](Self::Read), which observes *external* state.
+    Meta,
 }
 
 /// One parsed tool call awaiting a permission verdict. Produced by a tool's

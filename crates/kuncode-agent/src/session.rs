@@ -3,13 +3,14 @@
 use kuncode_core::completion::Message;
 
 use crate::permission::{PermissionMode, PermissionSessionState};
+use crate::todo::{TodoHandle, TodoItem};
 
 /// Conversation transcript owned by the caller between agent turns.
 ///
 /// Besides the message history it carries the mutable
 /// [`PermissionSessionState`]: keeping per-session grants and mode here — rather
 /// than on the shared, `&self` runner — gives per-session isolation with no lock.
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub struct AgentSession {
     messages: Vec<Message>,
     permissions: PermissionSessionState,
@@ -18,6 +19,25 @@ pub struct AgentSession {
     /// because ordering is per-session — same reasoning as the per-session
     /// permission grants above.
     seq: u64,
+    /// The session task plan (s05). Same per-session rationale as the permission
+    /// state. The runner clones this handle into each
+    /// [`ToolContext`](crate::tool::ToolContext) so `todo_write` writes here.
+    todos: TodoHandle,
+}
+
+impl Clone for AgentSession {
+    /// Hand-written rather than derived: a derived clone would share the
+    /// [`TodoHandle`]'s `Arc`, so two sessions would write the same plan.
+    /// Deep-cloning the plan keeps per-session isolation — the same by-value
+    /// isolation the permission state gets for free.
+    fn clone(&self) -> Self {
+        Self {
+            messages: self.messages.clone(),
+            permissions: self.permissions.clone(),
+            seq: self.seq,
+            todos: self.todos.deep_clone(),
+        }
+    }
 }
 
 impl AgentSession {
@@ -32,6 +52,7 @@ impl AgentSession {
             messages: Vec::new(),
             permissions: PermissionSessionState::new(mode),
             seq: 0,
+            todos: TodoHandle::default(),
         }
     }
 
@@ -41,6 +62,7 @@ impl AgentSession {
             messages,
             permissions: PermissionSessionState::default(),
             seq: 0,
+            todos: TodoHandle::default(),
         }
     }
 
@@ -53,6 +75,25 @@ impl AgentSession {
     /// changes during a turn.
     pub fn permissions_mut(&mut self) -> &mut PermissionSessionState {
         &mut self.permissions
+    }
+
+    /// A shared clone of the session plan handle, for the runner to place on a
+    /// [`ToolContext`](crate::tool::ToolContext). Shares the same plan, so a
+    /// `todo_write` call writes back to this session.
+    pub fn todo_handle(&self) -> TodoHandle {
+        self.todos.clone()
+    }
+
+    /// The plan's write counter, for the runner to detect a change across a tool
+    /// call without recognizing `todo_write` by name.
+    pub fn todo_generation(&self) -> u64 {
+        self.todos.generation()
+    }
+
+    /// A snapshot of the current plan items, for emitting in a
+    /// [`TodoUpdate`](crate::observer::EventKind::TodoUpdate) event.
+    pub fn todos_snapshot(&self) -> Vec<TodoItem> {
+        self.todos.snapshot()
     }
 
     /// Appends a user turn to the transcript.

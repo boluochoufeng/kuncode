@@ -98,9 +98,10 @@ pub fn evaluate(
         return Verdict::Allow;
     }
 
-    // 6. Per-action default: reads are always free; writes/exec ask.
+    // 6. Per-action default: reads and side-effect-free meta ops are always
+    //    free; writes/exec ask.
     match req.action {
-        PermissionAction::Read => Verdict::Allow,
+        PermissionAction::Read | PermissionAction::Meta => Verdict::Allow,
         PermissionAction::Write | PermissionAction::Execute => Verdict::Ask,
     }
 }
@@ -143,6 +144,29 @@ mod tests {
             &req("read_file", PermissionAction::Read, Some("src/lib.rs")),
         );
         assert!(matches!(v, Verdict::Allow));
+    }
+
+    #[test]
+    fn meta_is_free_by_default_but_deny_still_wins() {
+        // A side-effect-free meta op (e.g. todo_write) is allowed with no prompt.
+        assert!(matches!(
+            evaluate(
+                &PermissionPolicy::new(),
+                &state(PermissionMode::Default),
+                &req("todo_write", PermissionAction::Meta, None),
+            ),
+            Verdict::Allow
+        ));
+        // An explicit deny rule can still block it — deny is unbypassable.
+        let p = policy(&[], &[], &["todo_write"]);
+        assert!(matches!(
+            evaluate(
+                &p,
+                &state(PermissionMode::BypassPermissions),
+                &req("todo_write", PermissionAction::Meta, None),
+            ),
+            Verdict::Deny(_)
+        ));
     }
 
     #[test]

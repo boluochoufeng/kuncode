@@ -193,6 +193,7 @@ fn action_str(action: PermissionAction) -> &'static str {
         PermissionAction::Read => "read",
         PermissionAction::Write => "write",
         PermissionAction::Execute => "execute",
+        PermissionAction::Meta => "meta",
     }
 }
 
