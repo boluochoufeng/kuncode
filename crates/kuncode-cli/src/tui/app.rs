@@ -253,6 +253,7 @@ pub fn mode_label(mode: PermissionMode) -> &'static str {
 mod tests {
     use super::*;
     use kuncode_agent::observer::ToolFailure;
+    use kuncode_agent::tool::ToolErrorKind;
 
     fn app() -> App {
         App::new("model", PermissionMode::Default)
@@ -299,7 +300,7 @@ mod tests {
             ok: false,
             truncated: false,
             error: Some(ToolFailure {
-                kind: "permission_denied".to_string(),
+                kind: ToolErrorKind::PermissionDenied,
                 message: "blocked".to_string(),
             }),
         });
@@ -323,7 +324,7 @@ mod tests {
             ok: false,
             truncated: false,
             error: Some(ToolFailure {
-                kind: "unknown_tool".to_string(),
+                kind: ToolErrorKind::UnknownTool,
                 message: "no such tool".to_string(),
             }),
         });

@@ -12,7 +12,7 @@ use std::{panic::AssertUnwindSafe, sync::Arc};
 use serde::{Deserialize, Serialize};
 
 use crate::todo::TodoItem;
-use crate::tool::ToolErrorPayload;
+use crate::tool::{ToolErrorKind, ToolErrorPayload};
 
 /// One event produced in order by the agent loop.
 ///
@@ -110,7 +110,7 @@ pub enum EventKind {
 /// ([`ToolErrorPayload`]).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ToolFailure {
-    pub kind: String,
+    pub kind: ToolErrorKind,
     pub message: String,
 }
 

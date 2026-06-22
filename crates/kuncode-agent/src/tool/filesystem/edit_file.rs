@@ -195,7 +195,10 @@ mod tests {
             .expect("no harness-level error");
 
         assert!(!output.ok);
-        assert_eq!(output.error.expect("error present").kind, "ambiguous_match");
+        assert_eq!(
+            output.error.expect("error present").kind.as_str(),
+            "ambiguous_match"
+        );
         // The file is left untouched when the match is ambiguous.
         assert_eq!(
             fs::read_to_string(tmp.path().join("notes.txt")).unwrap(),
@@ -222,6 +225,9 @@ mod tests {
             .expect("no harness-level error");
 
         assert!(!output.ok);
-        assert_eq!(output.error.expect("error present").kind, "text_not_found");
+        assert_eq!(
+            output.error.expect("error present").kind.as_str(),
+            "text_not_found"
+        );
     }
 }

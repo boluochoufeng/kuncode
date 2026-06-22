@@ -509,7 +509,7 @@ mod tests {
             .expect("no harness-level error");
 
         assert!(!output.ok);
-        assert_eq!(output.error.expect("error present").kind, "read");
+        assert_eq!(output.error.expect("error present").kind.as_str(), "read");
     }
 
     #[tokio::test]
@@ -529,7 +529,7 @@ mod tests {
 
         assert!(!output.ok);
         assert_eq!(
-            output.error.expect("error present").kind,
+            output.error.expect("error present").kind.as_str(),
             "invalid_arguments"
         );
     }
@@ -556,6 +556,9 @@ mod tests {
 
         let _ = fs::remove_file(outside);
         assert!(!output.ok);
-        assert_eq!(output.error.expect("error present").kind, "workspace_path");
+        assert_eq!(
+            output.error.expect("error present").kind.as_str(),
+            "workspace_path"
+        );
     }
 }

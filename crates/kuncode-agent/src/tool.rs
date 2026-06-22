@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use kuncode_core::completion::ToolDefinition;
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::DeserializeOwned};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
@@ -99,9 +99,100 @@ pub struct ToolOutput<D = serde_json::Value> {
     pub truncated: bool,
 }
 
+/// The `kind` tag on a [`ToolErrorPayload`] (and its event mirror
+/// [`ToolFailure`](crate::observer::ToolFailure)).
+///
+/// The harness produces a fixed protocol vocabulary — the named variants — that
+/// the runner, gate, and frontends recognize. Tools may report their own
+/// open-ended kinds (e.g. bash's `non_zero_exit`), which round-trip through
+/// [`Other`](Self::Other). So the harness vocabulary is type-checked in one
+/// place while the tool taxonomy stays open.
+///
+/// Serializes transparently to the snake_case wire string the model reads in its
+/// `tool_result` and audit records — the variants change nothing on the wire.
+/// [`From<&str>`](Self::from) canonicalizes a known string to its variant, so a
+/// tool that passes `"permission_denied"` and the gate that passes
+/// [`PermissionDenied`](Self::PermissionDenied) are indistinguishable downstream.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ToolErrorKind {
+    /// Arguments failed to parse or validate before the tool ran.
+    InvalidArguments,
+    /// No tool with the requested name is registered.
+    UnknownTool,
+    /// Blocked by a permission rule at the gate.
+    PermissionDenied,
+    /// Vetoed by a `PreToolUse` hook.
+    BlockedByHook,
+    /// The call was interrupted before the tool returned.
+    Cancelled,
+    /// A harness-boundary tool failure (e.g. output failed to serialize).
+    ToolError,
+    /// A tool-defined kind outside the harness vocabulary.
+    Other(String),
+}
+
+impl ToolErrorKind {
+    /// The wire / model-facing string for this kind.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::InvalidArguments => "invalid_arguments",
+            Self::UnknownTool => "unknown_tool",
+            Self::PermissionDenied => "permission_denied",
+            Self::BlockedByHook => "blocked_by_hook",
+            Self::Cancelled => "cancelled",
+            Self::ToolError => "tool_error",
+            Self::Other(kind) => kind,
+        }
+    }
+}
+
+impl From<&str> for ToolErrorKind {
+    fn from(kind: &str) -> Self {
+        match kind {
+            "invalid_arguments" => Self::InvalidArguments,
+            "unknown_tool" => Self::UnknownTool,
+            "permission_denied" => Self::PermissionDenied,
+            "blocked_by_hook" => Self::BlockedByHook,
+            "cancelled" => Self::Cancelled,
+            "tool_error" => Self::ToolError,
+            other => Self::Other(other.to_string()),
+        }
+    }
+}
+
+impl From<String> for ToolErrorKind {
+    fn from(kind: String) -> Self {
+        // Reuse the &str table; only an unknown string keeps its allocation.
+        match Self::from(kind.as_str()) {
+            Self::Other(_) => Self::Other(kind),
+            known => known,
+        }
+    }
+}
+
+impl std::fmt::Display for ToolErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+// Transparent (de)serialization: the wire form is just the kind string, so the
+// model-facing `tool_result` and serialized events are unchanged by the typing.
+impl Serialize for ToolErrorKind {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolErrorKind {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(Self::from(String::deserialize(deserializer)?))
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct ToolErrorPayload {
-    pub kind: String,
+    pub kind: ToolErrorKind,
     pub message: String,
 }
 
@@ -115,7 +206,7 @@ impl<D> ToolOutput<D> {
         }
     }
 
-    pub fn failure(kind: impl Into<String>, message: impl Into<String>) -> Self {
+    pub fn failure(kind: impl Into<ToolErrorKind>, message: impl Into<String>) -> Self {
         Self {
             ok: false,
             data: None,
@@ -268,7 +359,7 @@ where
         match serde_json::from_value::<T::Args>(args.clone()) {
             Ok(parsed) => Ok(TypedTool::permission(self, &parsed, ctx)),
             Err(err) => Err(ToolOutput::failure(
-                "invalid_arguments",
+                ToolErrorKind::InvalidArguments,
                 format!("failed to parse arguments: {err}"),
             )),
         }
