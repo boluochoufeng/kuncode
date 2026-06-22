@@ -201,12 +201,51 @@ fn handle_idle_key(app: &mut App, key: KeyEvent) -> Option<String> {
             app.should_quit = true;
             None
         }
+        // Emacs-style line motion, the muscle-memory aliases for Home/End.
+        (KeyModifiers::CONTROL, KeyCode::Char('a')) => {
+            app.move_home();
+            None
+        }
+        (KeyModifiers::CONTROL, KeyCode::Char('e')) => {
+            app.move_end();
+            None
+        }
         (_, KeyCode::PageUp) => {
             app.scroll_up(SCROLL_STEP);
             None
         }
         (_, KeyCode::PageDown) => {
             app.scroll_down(SCROLL_STEP);
+            None
+        }
+        // Cursor movement within the input box. Up/Down move by logical line;
+        // PageUp/PageDown (above) stay reserved for scrolling the conversation.
+        (_, KeyCode::Left) => {
+            app.move_left();
+            None
+        }
+        (_, KeyCode::Right) => {
+            app.move_right();
+            None
+        }
+        (_, KeyCode::Up) => {
+            app.move_up();
+            None
+        }
+        (_, KeyCode::Down) => {
+            app.move_down();
+            None
+        }
+        (_, KeyCode::Home) => {
+            app.move_home();
+            None
+        }
+        (_, KeyCode::End) => {
+            app.move_end();
+            None
+        }
+        (_, KeyCode::Delete) => {
+            app.delete();
             None
         }
         // Bare Enter submits; a modified Enter (Shift/Alt, where the terminal
