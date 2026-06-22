@@ -21,17 +21,15 @@ use crossterm::execute;
 use futures_util::StreamExt;
 use kuncode_agent::error::AgentError;
 use kuncode_agent::observer::AgentEvent;
-use kuncode_agent::permission::{PermissionMode, PermissionPolicy};
-use kuncode_agent::registry::ToolRegistry;
-use kuncode_agent::runner::{AgentConfig, AgentRunner};
+use kuncode_agent::runner::AgentRunner;
 use kuncode_agent::session::AgentSession;
-use kuncode_agent::system_prompt::SystemPrompt;
 use kuncode_core::completion::CompletionModel;
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 use tokio_util::sync::CancellationToken;
 
 use self::app::{App, Status};
 use self::bridge::{ApprovalRequest, TuiApprover, TuiObserver};
+use crate::runtime::CliRuntime;
 
 /// Rows scrolled per PageUp/PageDown.
 const SCROLL_STEP: u16 = 10;
@@ -45,27 +43,21 @@ const MOUSE_SCROLL_STEP: u16 = 3;
 /// then enters raw mode + the alternate screen via [`ratatui::init()`] (which also
 /// installs a panic hook that restores the terminal before unwinding) and
 /// guarantees [`ratatui::restore`] on every exit path.
-pub async fn run<M>(
-    model: M,
-    registry: ToolRegistry,
-    config: AgentConfig,
-    system_prompt: SystemPrompt,
-    policy: PermissionPolicy,
-    mode: PermissionMode,
-    model_name: String,
-) -> io::Result<()>
+pub async fn run<M>(runtime: CliRuntime<M>) -> io::Result<()>
 where
     M: CompletionModel,
 {
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let (approval_tx, mut approval_rx) = mpsc::unbounded_channel();
 
-    let runner = AgentRunner::with_config(model, registry, config)
-        .with_system_prompt(system_prompt)
-        .with_policy(policy)
-        .with_approver(Arc::new(TuiApprover::new(approval_tx)))
-        .with_observer(Arc::new(TuiObserver::new(event_tx)));
-    let mut session = AgentSession::with_mode(mode);
+    // Read the frontend-facing bits before `into_runner` consumes the runtime.
+    let model_name = runtime.model_name().to_string();
+    let mode = runtime.mode();
+    let mut session = runtime.session();
+    let runner = runtime.into_runner(
+        Arc::new(TuiApprover::new(approval_tx)),
+        Arc::new(TuiObserver::new(event_tx)),
+    );
     let mut app = App::new(model_name, mode);
 
     let mut terminal = ratatui::init();
@@ -276,6 +268,8 @@ fn handle_scroll(app: &mut App, mouse: MouseEvent) {
 
 #[cfg(test)]
 mod tests {
+    use kuncode_agent::permission::PermissionMode;
+
     use super::*;
 
     fn typing(app: &mut App, text: &str) {
