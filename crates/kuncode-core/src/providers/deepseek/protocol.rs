@@ -19,6 +19,8 @@ use crate::{
     non_empty_vec::NonEmptyVec,
 };
 
+pub(crate) mod streaming;
+
 /// DeepSeek wire message serialized by `role`.
 ///
 /// This is flatter than the domain-side [`message::Message`]: `content` is a
@@ -272,7 +274,12 @@ impl From<completion::ToolDefinition> for ToolDefinition {
 ///
 /// In addition to OpenAI-compatible fields, DeepSeek reports cache hit/miss
 /// prompt tokens.
+///
+/// `#[serde(default)]`: token accounting is best-effort, and streaming usage
+/// frames may carry a subset of fields. A missing sub-field defaults to zero
+/// rather than failing the whole response/chunk parse.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct Usage {
     /// Generated output tokens.
     pub completion_tokens: u32,
@@ -553,6 +560,18 @@ impl TryFrom<completion::CompletionRequest> for DeepSeekCompletionRequest {
             reasoning_effort,
             response_format: None,
         })
+    }
+}
+
+impl DeepSeekCompletionRequest {
+    /// Marks this request as streaming, asking the provider to include token
+    /// usage in the final SSE frame. The completion path leaves both unset.
+    pub(crate) fn into_streaming(mut self) -> Self {
+        self.stream = Some(true);
+        self.stream_options = Some(StreamOptions {
+            include_usage: true,
+        });
+        self
     }
 }
 

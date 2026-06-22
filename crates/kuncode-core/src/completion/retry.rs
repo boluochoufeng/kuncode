@@ -74,11 +74,15 @@ fn is_retryable(err: &CompletionError) -> bool {
     }
 }
 
-/// Wraps a [`CompletionModel`], retrying transient
-/// [`completion`](CompletionModel::completion) failures per a [`RetryPolicy`].
+/// Wraps a [`CompletionModel`], retrying transient failures per a
+/// [`RetryPolicy`].
 ///
-/// [`stream`](CompletionModel::stream) is delegated untouched: retrying a
-/// half-consumed stream is a distinct problem left for the streaming work.
+/// Both [`completion`](CompletionModel::completion) and
+/// [`stream`](CompletionModel::stream) are retried, but `stream` only retries
+/// *connection establishment* — the outer `Result` that fails before any event
+/// is yielded. Once the stream is producing items, a mid-stream failure is an
+/// item in the stream, not the outer `Result`, and is left untouched: retrying a
+/// half-consumed stream would replay already-emitted output.
 #[derive(Clone)]
 pub struct RetryModel<M> {
     inner: M,
@@ -126,6 +130,17 @@ impl<M: CompletionModel> CompletionModel for RetryModel<M> {
         &self,
         request: CompletionRequest,
     ) -> Result<CompletionStream, CompletionError> {
+        // Mirrors `completion`, but retries only the establishment of the stream
+        // (the outer `Result`); errors within an open stream are its items.
+        for attempt in 0..self.policy.max_retries {
+            match self.inner.stream(request.clone()).await {
+                Ok(stream) => return Ok(stream),
+                Err(err) if is_retryable(&err) => {
+                    tokio::time::sleep(self.policy.delay_for(attempt + 1)).await;
+                }
+                Err(err) => return Err(err),
+            }
+        }
         self.inner.stream(request).await
     }
 }
@@ -137,16 +152,21 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use crate::completion::{AssistantContent, CompletionRequestBuilder, Message, Usage};
+    use crate::completion::{
+        AssistantContent, CompletionRequestBuilder, Message, StreamEvent, Usage,
+    };
     use crate::non_empty_vec::NonEmptyVec;
 
-    /// A model that returns scripted outcomes on successive `completion` calls
-    /// and counts how many it received. Outcomes past the script default to
-    /// success (so over-calling surfaces as a wrong count, not a panic).
+    /// A model that returns scripted outcomes on successive `completion` /
+    /// `stream` calls and counts how many it received. Outcomes past the script
+    /// default to success (so over-calling surfaces as a wrong count, not a
+    /// panic).
     #[derive(Clone)]
     struct ScriptedModel {
         outcomes: std::sync::Arc<Mutex<VecDeque<Result<(), CompletionError>>>>,
         calls: std::sync::Arc<AtomicUsize>,
+        stream_outcomes: std::sync::Arc<Mutex<VecDeque<Result<(), CompletionError>>>>,
+        stream_calls: std::sync::Arc<AtomicUsize>,
     }
 
     impl ScriptedModel {
@@ -154,12 +174,34 @@ mod tests {
             Self {
                 outcomes: std::sync::Arc::new(Mutex::new(outcomes.into())),
                 calls: std::sync::Arc::new(AtomicUsize::new(0)),
+                stream_outcomes: std::sync::Arc::new(Mutex::new(VecDeque::new())),
+                stream_calls: std::sync::Arc::new(AtomicUsize::new(0)),
             }
+        }
+
+        /// Scripts the outer `Result` of successive `stream` calls (connection
+        /// establishment), leaving `completion` unscripted.
+        fn streaming(stream_outcomes: Vec<Result<(), CompletionError>>) -> Self {
+            let model = Self::new(vec![]);
+            *model.stream_outcomes.lock().expect("mutex") = stream_outcomes.into();
+            model
         }
 
         fn calls(&self) -> usize {
             self.calls.load(Ordering::SeqCst)
         }
+
+        fn stream_calls(&self) -> usize {
+            self.stream_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    /// A trivial non-empty stream; its content is irrelevant to retry-count
+    /// tests, the annotation pins the item type for the empty generator.
+    fn one_event_stream() -> CompletionStream {
+        Box::pin(async_stream::stream! {
+            yield Ok(StreamEvent::TextDelta(String::new()));
+        })
     }
 
     fn ok_response() -> CompletionResponse<()> {
@@ -196,7 +238,12 @@ mod tests {
             &self,
             _request: CompletionRequest,
         ) -> Result<CompletionStream, CompletionError> {
-            unimplemented!("retry tests never stream")
+            self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            let next = self.stream_outcomes.lock().expect("mutex").pop_front();
+            match next {
+                Some(Ok(())) | None => Ok(one_event_stream()),
+                Some(Err(err)) => Err(err),
+            }
         }
     }
 
@@ -277,6 +324,35 @@ mod tests {
 
         assert!(matches!(err, CompletionError::ApiError { status: 503, .. }));
         assert_eq!(inner.calls(), 1, "max_retries=0 means exactly one attempt");
+    }
+
+    #[tokio::test]
+    async fn stream_retries_connection_establishment_then_succeeds() {
+        let inner = ScriptedModel::streaming(vec![Err(api_error(503)), Ok(())]);
+        let model = RetryModel::with_policy(inner.clone(), instant_policy(3));
+
+        assert!(
+            model.stream(request()).await.is_ok(),
+            "establishes after one retry"
+        );
+        assert_eq!(
+            inner.stream_calls(),
+            2,
+            "one failed connect then one success"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_does_not_retry_permanent_errors() {
+        let inner = ScriptedModel::streaming(vec![Err(api_error(400))]);
+        let model = RetryModel::with_policy(inner.clone(), instant_policy(3));
+
+        assert!(model.stream(request()).await.is_err(), "4xx is permanent");
+        assert_eq!(
+            inner.stream_calls(),
+            1,
+            "connection 4xx must not be retried"
+        );
     }
 
     #[test]
