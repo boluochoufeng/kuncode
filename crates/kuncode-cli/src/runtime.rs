@@ -21,7 +21,7 @@ use kuncode_agent::system_prompt::{
     EnvironmentSection, IdentitySection, SystemPrompt, ToolsSection,
 };
 use kuncode_agent::workspace::Workspace;
-use kuncode_core::completion::CompletionModel;
+use kuncode_core::completion::{CompletionModel, RetryModel, RetryPolicy};
 use kuncode_core::providers::deepseek::{DeepSeekClient, DeepSeekCompletionModel};
 
 use crate::Cli;
@@ -41,7 +41,8 @@ Keep working until the task is done, then give a short, direct final answer.";
 /// observer + approver, plus the bits a frontend renders directly
 /// ([`model_name`](Self::model_name), [`mode`](Self::mode)). Generic over the
 /// model so a test or a future provider can supply its own `M`; [`assemble`]
-/// pins it to the CLI's [`DeepSeekCompletionModel`].
+/// pins it to the CLI's [`DeepSeekCompletionModel`] wrapped in a
+/// [`RetryModel`] so transient provider failures are retried transparently.
 ///
 /// [`assemble`]: Self::assemble
 pub struct CliRuntime<M> {
@@ -54,7 +55,7 @@ pub struct CliRuntime<M> {
     model_name: String,
 }
 
-impl CliRuntime<DeepSeekCompletionModel> {
+impl CliRuntime<RetryModel<DeepSeekCompletionModel>> {
     /// Builds the runtime from parsed CLI args and the project settings file.
     ///
     /// Resolves permissions from built-in ∪ project file ∪ CLI flags (mode
@@ -91,7 +92,12 @@ impl CliRuntime<DeepSeekCompletionModel> {
         let client = DeepSeekClient::from_env()?;
         let model_name =
             std::env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| "deepseek-v4-flash".to_string());
-        let model = DeepSeekCompletionModel::make(&client, model_name.clone());
+        // Wrap the provider so transient failures (timeouts, 429/5xx) are
+        // retried with backoff; every model call the runner makes inherits it.
+        let model = RetryModel::with_policy(
+            DeepSeekCompletionModel::make(&client, model_name.clone()),
+            RetryPolicy::default(),
+        );
         let registry = ToolRegistry::with_default_workspace_tools(workspace);
         let config = AgentConfig {
             // Nudge the model to keep its plan current after a few quiet calls;

@@ -7,6 +7,7 @@ use thiserror::Error;
 
 pub mod message;
 pub mod request;
+pub mod retry;
 pub mod streaming;
 
 pub use message::{
@@ -18,6 +19,8 @@ pub use request::{
     CompletionModel, CompletionRequest, CompletionRequestBuilder, CompletionResponse,
     ProviderToolDefinition, ReasoningEffort, ToolDefinition, Usage,
 };
+
+pub use retry::{RetryModel, RetryPolicy};
 
 pub use streaming::{CompletionStream, FinishReason, StreamEvent};
 
