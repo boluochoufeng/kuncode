@@ -394,6 +394,7 @@ fn draw_approval(frame: &mut Frame, approval: &ApprovalRequest, area: Rect) {
 mod tests {
     use super::*;
     use crate::tui::app::{Item, ToolState};
+    use kuncode_agent::observer::EventKind;
     use kuncode_agent::permission::PermissionMode;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -424,6 +425,30 @@ mod tests {
             "status line should show model"
         );
         assert!(rendered.contains("Bash"), "tool call should be visible");
+    }
+
+    #[test]
+    fn streamed_preview_renders_answer_and_reasoning_below_the_log() {
+        let mut app = App::new("model-x", PermissionMode::Default);
+        app.apply_event(EventKind::ReasoningDelta {
+            text: "weighing options".to_string(),
+        });
+        app.apply_event(EventKind::TextDelta {
+            text: "partial answer".to_string(),
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 16)).expect("test terminal");
+        terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
+
+        let rendered = format!("{}", terminal.backend());
+        assert!(
+            rendered.contains("partial answer"),
+            "in-progress answer should render live"
+        );
+        assert!(
+            rendered.contains("weighing options"),
+            "in-progress reasoning should render live"
+        );
     }
 
     #[test]
