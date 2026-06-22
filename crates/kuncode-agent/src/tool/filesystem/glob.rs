@@ -387,7 +387,7 @@ mod tests {
 
         assert!(!output.ok);
         assert_eq!(
-            output.error.expect("error present").kind,
+            output.error.expect("error present").kind.as_str(),
             "invalid_arguments"
         );
     }

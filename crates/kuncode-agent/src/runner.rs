@@ -22,7 +22,7 @@ use crate::{
     registry::ToolRegistry,
     session::AgentSession,
     system_prompt::{PromptContext, SystemPrompt},
-    tool::{ToolContext, ToolError, ToolOutput},
+    tool::{ToolContext, ToolError, ToolErrorKind, ToolOutput},
 };
 
 const DEFAULT_MAX_ITERATIONS: usize = 50;
@@ -521,7 +521,7 @@ where
                     // "cancelled"); a cancel/abort did not run.
                     let failed = match &error {
                         AgentError::Tool { source, .. } => {
-                            ToolOutput::failure("tool_error", source.to_string())
+                            ToolOutput::failure(ToolErrorKind::ToolError, source.to_string())
                         }
                         _ => interrupted_tool_output(),
                     };
@@ -680,7 +680,7 @@ where
                 Some(PreToolOutcome::Proceed) => {}
                 Some(PreToolOutcome::Deny { message }) => {
                     return Ok(CallOutcome {
-                        output: ToolOutput::failure("blocked_by_hook", message),
+                        output: ToolOutput::failure(ToolErrorKind::BlockedByHook, message),
                         executed: false,
                     });
                 }
@@ -828,7 +828,7 @@ fn tool_result_message(id: String, call_id: Option<String>, content: String) -> 
 /// the same value feeds both the transcript and its mirrored `ToolEnd`.
 fn interrupted_tool_output() -> ToolOutput {
     ToolOutput::failure(
-        "cancelled",
+        ToolErrorKind::Cancelled,
         "Tool call not executed: the turn was interrupted before this tool returned.",
     )
 }
@@ -1936,7 +1936,10 @@ mod tests {
                     tool_call_id,
                     error,
                     ..
-                } => Some((tool_call_id.clone(), error.as_ref().map(|f| f.kind.clone()))),
+                } => Some((
+                    tool_call_id.clone(),
+                    error.as_ref().map(|f| f.kind.to_string()),
+                )),
                 _ => None,
             })
             .collect();
@@ -1996,7 +1999,7 @@ mod tests {
         assert_eq!(tool_ends.len(), 1);
         assert!(matches!(
             &tool_ends[0].kind,
-            EventKind::ToolEnd { ok: false, error: Some(f), .. } if f.kind == "unknown_tool"
+            EventKind::ToolEnd { ok: false, error: Some(f), .. } if f.kind.as_str() == "unknown_tool"
         ));
     }
 
@@ -2041,7 +2044,7 @@ mod tests {
             })
             .collect();
         assert_eq!(tool_ends.len(), 1);
-        assert!(matches!(&tool_ends[0], Some(f) if f.kind == "permission_denied"));
+        assert!(matches!(&tool_ends[0], Some(f) if f.kind.as_str() == "permission_denied"));
     }
 
     #[tokio::test]
@@ -2262,7 +2265,7 @@ mod tests {
             })
             .collect();
         assert_eq!(tool_ends.len(), 1);
-        assert!(matches!(&tool_ends[0], Some(f) if f.kind == "blocked_by_hook"));
+        assert!(matches!(&tool_ends[0], Some(f) if f.kind.as_str() == "blocked_by_hook"));
     }
 
     #[tokio::test]

@@ -122,7 +122,7 @@ impl TypedTool for Bash {
                 None
             } else {
                 Some(ToolErrorPayload {
-                    kind: "non_zero_exit".to_string(),
+                    kind: "non_zero_exit".into(),
                     message: match exit_code {
                         Some(code) => format!("command exited with status {code}"),
                         None => "command terminated by signal".to_string(),
@@ -205,7 +205,10 @@ mod tests {
             .expect("bad arguments are model-recoverable, not a harness error");
 
         assert!(!out.ok);
-        assert_eq!(out.error.expect("error payload").kind, "invalid_arguments");
+        assert_eq!(
+            out.error.expect("error payload").kind.as_str(),
+            "invalid_arguments"
+        );
     }
 
     #[tokio::test]

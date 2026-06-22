@@ -29,7 +29,7 @@ use crate::{
         PermissionSessionState, RuleOrigin, Verdict, evaluate,
     },
     registry::ToolRegistry,
-    tool::{Tool, ToolContext, ToolOutput},
+    tool::{Tool, ToolContext, ToolErrorKind, ToolOutput},
 };
 
 /// Borrowed view over the inputs one permission decision needs. Cheap to build
@@ -84,7 +84,7 @@ impl PermissionGate<'_> {
     pub fn prepare(&self, name: &str, args: serde_json::Value, ctx: &ToolContext) -> Prepared {
         let Some(tool) = self.registry.get(name) else {
             return Prepared::Rejected(ToolOutput::failure(
-                "unknown_tool",
+                ToolErrorKind::UnknownTool,
                 format!("tool `{name}` is not registered"),
             ));
         };
@@ -175,7 +175,7 @@ fn audit(request: &PermissionRequest, resource: &str, decision: &str, rule: Opti
 /// the model not to retry — denial is a clear result, like a non-zero exit.
 fn rule_denied_output(reason: &DenyReason) -> ToolOutput {
     ToolOutput::failure(
-        "permission_denied",
+        ToolErrorKind::PermissionDenied,
         format!(
             "blocked by {} rule `{}`. Do not retry; choose a different approach or ask the user.",
             origin_label(reason.origin),
@@ -193,7 +193,7 @@ fn user_denied_output(always: bool) -> ToolOutput {
         "The user denied this action."
     };
     ToolOutput::failure(
-        "permission_denied",
+        ToolErrorKind::PermissionDenied,
         format!("{lead} Do not retry; choose a different approach or ask the user."),
     )
 }
@@ -256,7 +256,12 @@ mod tests {
     }
 
     fn error_kind(output: &ToolOutput) -> String {
-        output.error.as_ref().expect("error payload").kind.clone()
+        output
+            .error
+            .as_ref()
+            .expect("error payload")
+            .kind
+            .to_string()
     }
 
     /// An approver that never answers — only a cancelled token resolves the race.

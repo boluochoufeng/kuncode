@@ -9,6 +9,7 @@
 
 use kuncode_agent::observer::{EventKind, ToolFailure};
 use kuncode_agent::todo::TodoItem;
+use kuncode_agent::tool::ToolErrorKind;
 
 /// How a finished tool call reads, independent of how it is drawn.
 #[derive(Debug, PartialEq, Eq)]
@@ -93,7 +94,7 @@ fn tool_outcome(ok: bool, truncated: bool, error: Option<ToolFailure>) -> ToolOu
         return ToolOutcome::Ok { truncated };
     }
     match error {
-        Some(f) if f.kind == "permission_denied" => ToolOutcome::Denied(f.message),
+        Some(f) if f.kind == ToolErrorKind::PermissionDenied => ToolOutcome::Denied(f.message),
         Some(f) => ToolOutcome::Failed(format!("{}: {}", f.kind, f.message)),
         None => ToolOutcome::Failed("failed".to_string()),
     }
@@ -140,7 +141,7 @@ mod tests {
             ok: false,
             truncated: false,
             error: Some(ToolFailure {
-                kind: "permission_denied".to_string(),
+                kind: ToolErrorKind::PermissionDenied,
                 message: "blocked by Bash(curl*)".to_string(),
             }),
         });
@@ -160,7 +161,7 @@ mod tests {
             ok: false,
             truncated: false,
             error: Some(ToolFailure {
-                kind: "non_zero_exit".to_string(),
+                kind: ToolErrorKind::Other("non_zero_exit".to_string()),
                 message: "exit 1".to_string(),
             }),
         });

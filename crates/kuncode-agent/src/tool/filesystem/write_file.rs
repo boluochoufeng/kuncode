@@ -137,7 +137,10 @@ mod tests {
             .expect("no harness-level error");
 
         assert!(!output.ok);
-        assert_eq!(output.error.expect("error present").kind, "workspace_path");
+        assert_eq!(
+            output.error.expect("error present").kind.as_str(),
+            "workspace_path"
+        );
     }
 
     #[tokio::test]
