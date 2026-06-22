@@ -3,6 +3,7 @@ mod config;
 mod observer;
 mod settings;
 mod tui;
+mod view;
 
 use std::{
     io::{self, IsTerminal},
