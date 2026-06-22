@@ -50,7 +50,9 @@ pub enum ViewEffect {
 ///
 /// `ModelStart` (no spinner yet) and the turn-terminal `Error` (rendered by the
 /// turn driver / `main`, not the event stream) produce nothing, as does a
-/// call-free or empty `Assistant`.
+/// call-free or empty `Assistant`. The streaming `TextDelta`/`ReasoningDelta`
+/// are also `None` here: live incremental rendering is the TUI's concern (it
+/// intercepts them before this reducer), and the plain CLI does not stream.
 pub fn view(kind: EventKind) -> Option<ViewEffect> {
     match kind {
         // Narration shows only when it accompanies tool calls; the call-free
@@ -81,7 +83,11 @@ pub fn view(kind: EventKind) -> Option<ViewEffect> {
         // Always surfaced, even when empty: the TUI needs the empty snapshot to
         // clear its plan panel (the plain renderer just prints nothing).
         EventKind::TodoUpdate { todos } => Some(ViewEffect::Plan(todos)),
-        EventKind::ModelStart | EventKind::Assistant { .. } | EventKind::Error { .. } => None,
+        EventKind::ModelStart
+        | EventKind::TextDelta { .. }
+        | EventKind::ReasoningDelta { .. }
+        | EventKind::Assistant { .. }
+        | EventKind::Error { .. } => None,
     }
 }
 
@@ -209,6 +215,24 @@ mod tests {
             view(EventKind::Error {
                 kind: "completion".to_string(),
                 message: "boom".to_string(),
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn streaming_deltas_have_no_view_effect() {
+        // Live incremental rendering is the TUI's own concern; the shared reducer
+        // (and thus the plain CLI) ignores deltas.
+        assert_eq!(
+            view(EventKind::TextDelta {
+                text: "Hel".to_string(),
+            }),
+            None
+        );
+        assert_eq!(
+            view(EventKind::ReasoningDelta {
+                text: "think".to_string(),
             }),
             None
         );

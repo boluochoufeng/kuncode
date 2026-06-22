@@ -54,6 +54,16 @@ pub enum EventKind {
     /// model-stage failure/cancel the turn-level [`Error`](Self::Error) closes
     /// it instead, so a "thinking" indicator always gets cleared.
     ModelStart,
+    /// A chunk of the visible answer produced while streaming, for live
+    /// rendering. Presentation-only with no transcript counterpart: the
+    /// authoritative text arrives in the turn-final [`Assistant`](Self::Assistant)
+    /// and the transcript. A renderer accumulates these into the in-progress
+    /// answer, then lets `Assistant` finalize it.
+    TextDelta { text: String },
+    /// A chunk of the model's reasoning/thinking produced while streaming, kept
+    /// separate from [`TextDelta`](Self::TextDelta) so a renderer can show it in
+    /// a distinct (e.g. dimmed) channel. Also presentation-only.
+    ReasoningDelta { text: String },
     /// One assistant message. `tool_calls` empty ⟺ this turn is the final
     /// answer; non-empty ⟺ `text` is intermediate narration alongside calls.
     Assistant {

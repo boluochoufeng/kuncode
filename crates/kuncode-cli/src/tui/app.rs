@@ -59,6 +59,16 @@ pub struct App {
     /// boundary so `insert`/`remove`/slicing never split a multi-byte char.
     pub cursor: usize,
     pub status: Status,
+    /// Live answer text accumulated from [`TextDelta`](EventKind::TextDelta)
+    /// while the model streams, rendered below the log as an in-progress bubble.
+    /// Ephemeral: cleared once the iteration's text is committed (narration via
+    /// the `Assistant` event, the final answer via [`push_assistant`](Self::push_assistant)),
+    /// so the streamed preview is never double-shown alongside the committed item.
+    pub stream_answer: String,
+    /// Live reasoning text accumulated from
+    /// [`ReasoningDelta`](EventKind::ReasoningDelta), rendered in a dimmed channel
+    /// separate from [`stream_answer`](Self::stream_answer). Cleared with it.
+    pub stream_reasoning: String,
     /// Set while a `PreToolUse` approval is pending; renders as a panel in the
     /// input box's place that captures keys until the user answers.
     pub approval: Option<ApprovalRequest>,
@@ -80,6 +90,8 @@ impl App {
             input: String::new(),
             cursor: 0,
             status: Status::Idle,
+            stream_answer: String::new(),
+            stream_reasoning: String::new(),
             approval: None,
             scroll: 0,
             follow: true,
@@ -235,16 +247,24 @@ impl App {
         self.conversation.push(Item::User(text));
     }
 
-    /// Pushes the turn's final answer. Empty answers (e.g. a cancelled turn)
-    /// leave no entry.
+    /// Pushes the turn's final answer, committing (and clearing) any streamed
+    /// preview. Empty answers (e.g. a cancelled turn) leave no entry.
     pub fn push_assistant(&mut self, text: String) {
+        self.clear_stream_preview();
         if !text.trim().is_empty() {
             self.conversation.push(Item::Assistant(text));
         }
     }
 
     pub fn push_error(&mut self, text: String) {
+        // A turn that errored/cancelled mid-stream drops its live preview.
+        self.clear_stream_preview();
         self.conversation.push(Item::Error(text));
+    }
+
+    fn clear_stream_preview(&mut self) {
+        self.stream_answer.clear();
+        self.stream_reasoning.clear();
     }
 
     /// Folds one agent event into the conversation log. The event's *meaning* is
@@ -253,6 +273,34 @@ impl App {
     /// visible effect (`ModelStart`, the turn-terminal `Error` rendered via
     /// [`push_error`](Self::push_error)) yield `None`.
     pub fn apply_event(&mut self, kind: EventKind) {
+        // Streaming deltas are TUI-only live rendering, intercepted before the
+        // shared `view` reducer (which treats them as no-ops). They accumulate
+        // into the ephemeral preview buffers; commit paths clear them.
+        match &kind {
+            EventKind::ModelStart => {
+                // A new model call: drop any leftover preview from the last one.
+                self.clear_stream_preview();
+                return;
+            }
+            EventKind::TextDelta { text } => {
+                self.stream_answer.push_str(text);
+                return;
+            }
+            EventKind::ReasoningDelta { text } => {
+                self.stream_reasoning.push_str(text);
+                return;
+            }
+            // Narration (text alongside tool calls) commits as an `Assistant`
+            // item via `view` below, so retire the preview now. The call-free
+            // final answer is committed instead by the turn driver via
+            // `push_assistant`, which clears the preview then — leave it until, to
+            // avoid a blank frame between here and that commit.
+            EventKind::Assistant { tool_calls, .. } if !tool_calls.is_empty() => {
+                self.clear_stream_preview();
+            }
+            _ => {}
+        }
+
         let Some(effect) = view(kind) else {
             return;
         };
@@ -515,6 +563,79 @@ mod tests {
             [Item::Assistant(text)] => assert_eq!(text, "let me check"),
             _ => panic!("narration not logged"),
         }
+    }
+
+    #[test]
+    fn streamed_deltas_preview_then_finalize_without_duplication() {
+        let mut app = app();
+        app.apply_event(EventKind::ModelStart);
+        app.apply_event(EventKind::TextDelta {
+            text: "Hel".to_string(),
+        });
+        app.apply_event(EventKind::TextDelta {
+            text: "lo".to_string(),
+        });
+        // Live preview accumulates; nothing committed to the log yet.
+        assert_eq!(app.stream_answer, "Hello");
+        assert!(app.conversation.is_empty());
+
+        // The call-free `Assistant` event is ignored (preview kept to avoid a
+        // blank frame); the turn driver commits the final answer.
+        app.apply_event(EventKind::Assistant {
+            text: "Hello".to_string(),
+            tool_calls: vec![],
+        });
+        assert_eq!(app.stream_answer, "Hello", "preview survives until commit");
+
+        app.push_assistant("Hello".to_string());
+        assert!(app.stream_answer.is_empty(), "commit clears the preview");
+        match app.conversation.as_slice() {
+            [Item::Assistant(text)] => assert_eq!(text, "Hello"),
+            _ => panic!("final answer should be the single committed item"),
+        }
+    }
+
+    #[test]
+    fn reasoning_streams_into_its_own_buffer() {
+        let mut app = app();
+        app.apply_event(EventKind::ReasoningDelta {
+            text: "think ".to_string(),
+        });
+        app.apply_event(EventKind::ReasoningDelta {
+            text: "hard".to_string(),
+        });
+        assert_eq!(app.stream_reasoning, "think hard");
+        assert!(
+            app.stream_answer.is_empty(),
+            "reasoning is a separate channel"
+        );
+    }
+
+    #[test]
+    fn narration_event_clears_the_streamed_preview() {
+        let mut app = app();
+        app.apply_event(EventKind::TextDelta {
+            text: "let me check".to_string(),
+        });
+        app.apply_event(EventKind::Assistant {
+            text: "let me check".to_string(),
+            tool_calls: vec!["1".to_string()],
+        });
+        // Narration commits as one item; the preview is gone (not double-shown).
+        assert!(app.stream_answer.is_empty());
+        match app.conversation.as_slice() {
+            [Item::Assistant(text)] => assert_eq!(text, "let me check"),
+            _ => panic!("narration not committed exactly once"),
+        }
+    }
+
+    #[test]
+    fn model_start_clears_a_stale_preview() {
+        let mut app = app();
+        app.stream_answer = "leftover".to_string();
+        app.stream_reasoning = "stale".to_string();
+        app.apply_event(EventKind::ModelStart);
+        assert!(app.stream_answer.is_empty() && app.stream_reasoning.is_empty());
     }
 
     #[test]
