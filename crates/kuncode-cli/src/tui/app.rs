@@ -140,7 +140,7 @@ impl App {
     }
 
     /// Folds one agent event into the conversation log. The event's *meaning* is
-    /// decided once in [`view`](crate::view::view), shared with `CliObserver`;
+    /// decided once in [`view`], shared with `CliObserver`;
     /// this only maps that meaning onto the TUI's display model. Events with no
     /// visible effect (`ModelStart`, the turn-terminal `Error` rendered via
     /// [`push_error`](Self::push_error)) yield `None`.

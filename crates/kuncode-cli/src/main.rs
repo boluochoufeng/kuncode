@@ -1,6 +1,7 @@
 mod approver;
 mod config;
 mod observer;
+mod runtime;
 mod settings;
 mod tui;
 mod view;
@@ -11,53 +12,36 @@ use std::{
 };
 
 use clap::Parser;
-use kuncode_agent::{
-    error::AgentError,
-    registry::ToolRegistry,
-    runner::{AgentConfig, AgentRunner},
-    session::AgentSession,
-    system_prompt::{EnvironmentSection, IdentitySection, SystemPrompt, ToolsSection},
-    workspace::Workspace,
-};
-use kuncode_core::{
-    completion::CompletionModel,
-    providers::deepseek::{DeepSeekClient, DeepSeekCompletionModel},
-};
+use kuncode_agent::{error::AgentError, runner::AgentRunner, session::AgentSession};
+use kuncode_core::completion::CompletionModel;
 use tokio_util::sync::CancellationToken;
 
-use crate::{
-    approver::TerminalApprover,
-    config::{PermissionFlags, resolve_permissions},
-    settings::load_project_settings,
-};
+use crate::{approver::TerminalApprover, runtime::CliRuntime};
 
 /// kuncode — a coding agent operating in your shell.
+///
+/// Parsing lives here (a `main` concern); turning these args into a configured
+/// run is [`CliRuntime::assemble`]. Fields read by the runtime are
+/// `pub(crate)`; `prompt` stays private (only `main` dispatches on it).
 #[derive(Parser, Debug)]
 #[command(name = "kuncode", about = "A coding agent in your shell")]
-struct Cli {
+pub(crate) struct Cli {
     /// Allow rule, e.g. `Bash(cargo *)` or `Read` (repeatable).
     #[arg(long = "allow", value_name = "RULE")]
-    allow: Vec<String>,
+    pub(crate) allow: Vec<String>,
     /// Always-ask rule, e.g. `Edit(.env)` (repeatable).
     #[arg(long = "ask", value_name = "RULE")]
-    ask: Vec<String>,
+    pub(crate) ask: Vec<String>,
     /// Deny rule, e.g. `Bash(curl *)` (repeatable).
     #[arg(long = "deny", value_name = "RULE")]
-    deny: Vec<String>,
+    pub(crate) deny: Vec<String>,
     /// Permission mode: `default`, `accept-edits`, or `bypass`.
     #[arg(long = "mode", value_name = "MODE")]
-    mode: Option<String>,
+    pub(crate) mode: Option<String>,
     /// Prompt to run. Omit to start an interactive session.
     #[arg(trailing_var_arg = true)]
     prompt: Vec<String>,
 }
-
-/// Identity and behavioral instructions rendered as the first system-prompt
-/// block. Folds in guidance to maintain a plan via `todo_write`.
-const IDENTITY: &str = "You are kuncode, a coding agent operating in the user's \
-shell. Use the available tools when needed. For multi-step work, maintain a plan \
-with todo_write and keep it current, marking steps completed as you finish them. \
-Keep working until the task is done, then give a short, direct final answer.";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -71,52 +55,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cli = Cli::parse();
 
-    let workspace = Workspace::from_current_dir().await?;
-
-    // Resolve permissions from built-in ∪ project file ∪ CLI flags, with mode
-    // precedence CLI > project > Default. The merge is pure and tested in `config`;
-    // loading the project file (I/O) stays in `settings`.
-    let project = load_project_settings(workspace.root())?;
-    let flags = PermissionFlags {
-        allow: &cli.allow,
-        ask: &cli.ask,
-        deny: &cli.deny,
-        mode: cli.mode.as_deref(),
-    };
-    let resolved = resolve_permissions(project, &flags)?;
-
-    // Assembled at request time from these sections (identity, environment,
-    // tools). Built before `workspace` is moved into the registry below; moved
-    // into whichever run path executes.
-    let system_prompt = SystemPrompt::new(vec![
-        Box::new(IdentitySection::new(IDENTITY)),
-        Box::new(EnvironmentSection::new(workspace.root().to_path_buf())),
-        Box::new(ToolsSection),
-    ]);
-
-    let client = DeepSeekClient::from_env()?;
-    let model_name =
-        std::env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| "deepseek-v4-flash".to_string());
-    let model = DeepSeekCompletionModel::make(&client, model_name.clone());
-    let registry = ToolRegistry::with_default_workspace_tools(workspace);
-    let config = AgentConfig {
-        // Nudge the model to keep its plan current after a few quiet calls; the
-        // library leaves this off, the CLI opts in.
-        todo_reminder_interval: Some(3),
-        ..AgentConfig::default()
-    };
+    // All assembly (workspace, settings, permissions, prompt, model, tools)
+    // lives in `CliRuntime`; `main` only parses, dispatches, and owns the
+    // one-shot turn's terminal line.
+    let runtime = CliRuntime::assemble(&cli).await?;
 
     let initial_prompt = cli.prompt.join(" ");
 
     // A prompt on argv (or a non-TTY pipe) runs one-shot on the plain
     // line-by-line renderer; only the bare interactive session enters the TUI.
     if !initial_prompt.trim().is_empty() {
-        let runner = AgentRunner::with_config(model, registry, config)
-            .with_system_prompt(system_prompt)
-            .with_policy(resolved.policy)
-            .with_approver(Arc::new(TerminalApprover))
-            .with_observer(Arc::new(observer::CliObserver));
-        let mut session = AgentSession::with_mode(resolved.mode);
+        let mut session = runtime.session();
+        let runner =
+            runtime.into_runner(Arc::new(TerminalApprover), Arc::new(observer::CliObserver));
 
         match run_turn(&runner, &mut session, initial_prompt).await {
             Ok(text) => println!("\n{text}"),
@@ -136,18 +87,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // Interactive: hand the assembled runner pieces to the TUI, which wraps them
-    // with its own observer + approver before driving the event loop.
-    tui::run(
-        model,
-        registry,
-        config,
-        system_prompt,
-        resolved.policy,
-        resolved.mode,
-        model_name,
-    )
-    .await?;
+    // Interactive: the TUI wraps the runtime with its own observer + approver
+    // before driving the event loop.
+    tui::run(runtime).await?;
     Ok(())
 }
 
