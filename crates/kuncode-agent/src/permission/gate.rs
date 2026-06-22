@@ -29,7 +29,7 @@ use crate::{
         PermissionSessionState, RuleOrigin, Verdict, evaluate,
     },
     registry::ToolRegistry,
-    tool::{PreparedToolCall, Tool, ToolContext, ToolErrorKind, ToolOutput},
+    tool::{Tool, ToolContext, ToolErrorKind, ToolOutput},
 };
 
 /// Borrowed view over the inputs one permission decision needs. Cheap to build
@@ -46,16 +46,19 @@ pub struct PermissionGate<'a> {
 /// Outcome of [`PermissionGate::prepare`].
 pub enum Prepared {
     /// Tool resolved and arguments parsed. The runner emits `ToolStart` from
-    /// `prepared.request`, then calls [`decide`](PermissionGate::decide); on
-    /// [`Decision::Allow`] it hands `prepared` to `tool`'s
-    /// [`dispatch`](Tool::dispatch) — no re-parse.
+    /// `request`, then calls [`decide`](PermissionGate::decide); on
+    /// [`Decision::Allow`] it dispatches `tool` with `args`.
     Ready {
-        /// Resolved tool handle, shared with the gate's lookup. Dispatches
-        /// `prepared` (which only this tool can downcast — see
-        /// [`PreparedToolCall`]).
+        /// Resolved tool handle, shared with the gate's lookup.
         tool: Arc<dyn Tool>,
-        /// The parsed, ready-to-run call: request to gate on + parsed arguments.
-        prepared: PreparedToolCall,
+        /// The raw arguments — the single currency carried through the gate.
+        /// Re-parsed by `call` at execution (the request was projected from the
+        /// same raw above). Keeping raw, not a parsed value, is what lets a
+        /// future arg-rewriting hook re-project the request and re-gate; see the
+        /// note on the blanket [`Tool::permission`].
+        args: serde_json::Value,
+        /// The computed permission request, projected from `args`.
+        request: PermissionRequest,
     },
     /// An unknown tool or unparseable arguments — a model-recoverable failure
     /// that never reached a request, so the runner gives it no `ToolStart`.
@@ -89,8 +92,12 @@ impl PermissionGate<'_> {
             ));
         };
 
-        match tool.prepare(args, ctx) {
-            Ok(prepared) => Prepared::Ready { tool, prepared },
+        match tool.permission(&args, ctx) {
+            Ok(request) => Prepared::Ready {
+                tool,
+                args,
+                request,
+            },
             Err(failure) => Prepared::Rejected(failure),
         }
     }
@@ -322,13 +329,13 @@ mod tests {
             registry: &registry,
         };
 
-        let Prepared::Ready { prepared, .. } =
+        let Prepared::Ready { request, .. } =
             gate.prepare("bash", json!({ "cmd": "ls -la" }), &ToolContext::new())
         else {
             panic!("a known tool with valid arguments should be Ready");
         };
-        assert_eq!(prepared.request.tool, "bash");
-        assert_eq!(prepared.request.action, PermissionAction::Execute);
+        assert_eq!(request.tool, "bash");
+        assert_eq!(request.action, PermissionAction::Execute);
     }
 
     // ---- decide ----
