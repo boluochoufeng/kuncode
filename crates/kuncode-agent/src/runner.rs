@@ -633,8 +633,12 @@ where
 
         // prepare: resolve + parse. An unknown tool / bad arguments never produce
         // a request, so they short-circuit here with no `ToolStart`.
-        let (tool, prepared) = match gate.prepare(name, arguments, ctx) {
-            Prepared::Ready { tool, prepared } => (tool, prepared),
+        let (tool, arguments, request) = match gate.prepare(name, arguments, ctx) {
+            Prepared::Ready {
+                tool,
+                args,
+                request,
+            } => (tool, args, request),
             Prepared::Rejected(output) => {
                 return Ok(CallOutcome {
                     output,
@@ -651,8 +655,8 @@ where
             Some(iteration),
             EventKind::ToolStart {
                 tool_call_id: tool_call_id.to_string(),
-                tool: prepared.request.tool.clone(),
-                summary: prepared.request.summary.clone(),
+                tool: request.tool.clone(),
+                summary: request.summary.clone(),
             },
         );
 
@@ -664,8 +668,8 @@ where
         if !self.hooks.is_empty() {
             let pre = {
                 let cx = PreToolCx {
-                    request: &prepared.request,
-                    args: &prepared.raw,
+                    request: &request,
+                    args: &arguments,
                     messages: session.messages(),
                     iteration,
                 };
@@ -683,10 +687,7 @@ where
             }
         }
 
-        match gate
-            .decide(&prepared.request, session.permissions_mut(), ctx)
-            .await
-        {
+        match gate.decide(&request, session.permissions_mut(), ctx).await {
             Decision::Deny(output) => Ok(CallOutcome {
                 output,
                 executed: false,
@@ -694,7 +695,7 @@ where
             Decision::Abort => Err(AgentError::Cancelled),
             // Execute, racing cancellation so a long tool can be interrupted.
             Decision::Allow => {
-                match cancellable(&ctx.cancel, tool.dispatch(prepared, ctx)).await {
+                match cancellable(&ctx.cancel, tool.call(arguments, ctx)).await {
                     None => Err(AgentError::Cancelled),
                     Some(Ok(output)) => Ok(CallOutcome {
                         output,
@@ -909,8 +910,8 @@ mod tests {
         session::AgentSession,
         system_prompt::{IdentitySection, SystemPrompt},
         tool::{
-            PreparedToolCall, Tool, ToolContext, ToolError, ToolOutput, TypedTool, bash::Bash,
-            definition_for, todo_write::TodoWrite,
+            Tool, ToolContext, ToolError, ToolOutput, TypedTool, bash::Bash, definition_for,
+            todo_write::TodoWrite,
         },
     };
 
@@ -1530,16 +1531,20 @@ mod tests {
             &self.definition
         }
 
-        fn prepare(&self, args: Value, _ctx: &ToolContext) -> Result<PreparedToolCall, ToolOutput> {
-            let request = PermissionRequest::new("broken", PermissionAction::Read, None, "broken");
-            Ok(PreparedToolCall::new(request, args, ()))
+        fn permission(
+            &self,
+            _args: &Value,
+            _ctx: &ToolContext,
+        ) -> Result<PermissionRequest, ToolOutput> {
+            Ok(PermissionRequest::new(
+                "broken",
+                PermissionAction::Read,
+                None,
+                "broken",
+            ))
         }
 
-        async fn dispatch(
-            &self,
-            _prepared: PreparedToolCall,
-            _ctx: &ToolContext,
-        ) -> Result<ToolOutput, ToolError> {
+        async fn call(&self, _args: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
             Err(ToolError::Internal("kaboom".to_string()))
         }
     }

@@ -116,7 +116,7 @@ mod tests {
     use kuncode_core::completion::ToolDefinition;
 
     use crate::permission::{PermissionAction, PermissionRequest};
-    use crate::tool::{PreparedToolCall, Tool, ToolContext, ToolError, ToolOutput, bash::Bash};
+    use crate::tool::{Tool, ToolContext, ToolOutput, bash::Bash};
     use crate::workspace::Workspace;
 
     async fn bash() -> Bash {
@@ -147,25 +147,24 @@ mod tests {
             &self.definition
         }
 
-        fn prepare(
+        fn permission(
             &self,
-            args: serde_json::Value,
+            _args: &serde_json::Value,
             _ctx: &ToolContext,
-        ) -> Result<PreparedToolCall, ToolOutput> {
-            let request = PermissionRequest::new(
+        ) -> Result<PermissionRequest, ToolOutput> {
+            Ok(PermissionRequest::new(
                 self.definition.name.clone(),
                 PermissionAction::Read,
                 None,
                 "test tool",
-            );
-            Ok(PreparedToolCall::new(request, args, ()))
+            ))
         }
 
-        async fn dispatch(
+        async fn call(
             &self,
-            _prepared: PreparedToolCall,
+            _args: serde_json::Value,
             _ctx: &ToolContext,
-        ) -> Result<ToolOutput, ToolError> {
+        ) -> Result<ToolOutput, crate::tool::ToolError> {
             Ok(ToolOutput::success(serde_json::json!({
                 "name": self.definition.name
             })))
