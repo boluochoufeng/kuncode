@@ -29,7 +29,7 @@ use crate::{
         PermissionSessionState, RuleOrigin, Verdict, evaluate,
     },
     registry::ToolRegistry,
-    tool::{Tool, ToolContext, ToolErrorKind, ToolOutput},
+    tool::{PreparedToolCall, Tool, ToolContext, ToolErrorKind, ToolOutput},
 };
 
 /// Borrowed view over the inputs one permission decision needs. Cheap to build
@@ -46,16 +46,16 @@ pub struct PermissionGate<'a> {
 /// Outcome of [`PermissionGate::prepare`].
 pub enum Prepared {
     /// Tool resolved and arguments parsed. The runner emits `ToolStart` from
-    /// `request`, then calls [`decide`](PermissionGate::decide); on
-    /// [`Decision::Allow`] it dispatches `tool` with `args`.
+    /// `prepared.request`, then calls [`decide`](PermissionGate::decide); on
+    /// [`Decision::Allow`] it hands `prepared` to `tool`'s
+    /// [`dispatch`](Tool::dispatch) — no re-parse.
     Ready {
-        /// Resolved tool handle, shared with the gate's lookup.
+        /// Resolved tool handle, shared with the gate's lookup. Dispatches
+        /// `prepared` (which only this tool can downcast — see
+        /// [`PreparedToolCall`]).
         tool: Arc<dyn Tool>,
-        /// The raw arguments, threaded through to dispatch (parsed again there —
-        /// an accepted double-parse).
-        args: serde_json::Value,
-        /// The computed permission request.
-        request: PermissionRequest,
+        /// The parsed, ready-to-run call: request to gate on + parsed arguments.
+        prepared: PreparedToolCall,
     },
     /// An unknown tool or unparseable arguments — a model-recoverable failure
     /// that never reached a request, so the runner gives it no `ToolStart`.
@@ -89,12 +89,8 @@ impl PermissionGate<'_> {
             ));
         };
 
-        match tool.permission(&args, ctx) {
-            Ok(request) => Prepared::Ready {
-                tool,
-                args,
-                request,
-            },
+        match tool.prepare(args, ctx) {
+            Ok(prepared) => Prepared::Ready { tool, prepared },
             Err(failure) => Prepared::Rejected(failure),
         }
     }
@@ -326,13 +322,13 @@ mod tests {
             registry: &registry,
         };
 
-        let Prepared::Ready { request, .. } =
+        let Prepared::Ready { prepared, .. } =
             gate.prepare("bash", json!({ "cmd": "ls -la" }), &ToolContext::new())
         else {
             panic!("a known tool with valid arguments should be Ready");
         };
-        assert_eq!(request.tool, "bash");
-        assert_eq!(request.action, PermissionAction::Execute);
+        assert_eq!(prepared.request.tool, "bash");
+        assert_eq!(prepared.request.action, PermissionAction::Execute);
     }
 
     // ---- decide ----
