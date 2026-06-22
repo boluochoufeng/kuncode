@@ -222,7 +222,27 @@ fn conversation_lines(app: &App) -> Vec<Line<'static>> {
         }
         lines.push(Line::from(""));
     }
+    append_stream_preview(&mut lines, app);
     lines
+}
+
+/// Appends the in-progress streamed answer/reasoning below the committed log.
+///
+/// Reasoning renders first, dimmed, as a separate "thinking" channel; the answer
+/// follows in the normal assistant style. Both are ephemeral — the next commit
+/// clears [`App::stream_answer`]/[`App::stream_reasoning`] and they vanish,
+/// replaced by the committed item.
+fn append_stream_preview(lines: &mut Vec<Line<'static>>, app: &App) {
+    if !app.stream_reasoning.is_empty() {
+        for raw in app.stream_reasoning.split('\n') {
+            lines.push(Line::from(raw.to_string()).dim());
+        }
+    }
+    if !app.stream_answer.is_empty() {
+        for raw in app.stream_answer.split('\n') {
+            lines.push(Line::from(raw.to_string()));
+        }
+    }
 }
 
 /// One checklist row for the plan panel: the shared status glyph + text, colored

@@ -2,10 +2,12 @@
 
 use std::{future::Future, panic::AssertUnwindSafe, sync::Arc};
 
+use futures_util::StreamExt;
 use kuncode_core::{
     completion::{
-        AssistantContent, CompletionModel, CompletionRequest, CompletionRequestBuilder, Message,
-        ReasoningEffort, ToolChoice, ToolResult, ToolResultContent, Usage, UserContent,
+        AssistantContent, CompletionError, CompletionModel, CompletionRequest,
+        CompletionRequestBuilder, Message, ReasoningEffort, StreamEvent, ToolChoice, ToolResult,
+        ToolResultContent, Usage, UserContent,
     },
     non_empty_vec::NonEmptyVec,
 };
@@ -412,20 +414,22 @@ where
         // failure never started a model call). On completion error/cancel the
         // turn-terminal `Error` closes it; on success the `Assistant` below does.
         self.emit(session, Some(iteration), EventKind::ModelStart);
-        // Race the model call against cancellation. Waiting on the model is the
-        // most common place a user hits Ctrl-C, so the token must cover it — not
-        // just the later tool approval/execution. Dropping the future cancels
-        // the in-flight request (e.g. the provider's HTTP call).
-        let response = match cancellable(cancel, self.model.completion(request)).await {
-            Some(result) => result?,
-            None => return Err(AgentError::Cancelled),
-        };
+        // Race the whole stream (establish + consume) against cancellation.
+        // Waiting on the model is the most common place a user hits Ctrl-C, so
+        // the token must cover it — not just the later tool approval/execution.
+        // Dropping the future drops the stream, which closes the in-flight HTTP
+        // response and halts generation.
+        let (choice, usage) =
+            match cancellable(cancel, self.stream_completion(session, iteration, request)).await {
+                Some(result) => result?,
+                None => return Err(AgentError::Cancelled),
+            };
 
-        let tool_calls = pending_tool_calls(&response.choice);
-        let usage = response.usage;
-        // Build the event payload before moving `response.choice` into the
-        // transcript; `Assistant` doubles as the `ModelStart` close.
-        let text = assistant_text(&response.choice);
+        let tool_calls = pending_tool_calls(&choice);
+        // Build the event payload before moving `choice` into the transcript;
+        // `Assistant` doubles as the `ModelStart` close and finalizes the
+        // streamed deltas with the authoritative text.
+        let text = assistant_text(&choice);
         let tool_call_ids: Vec<String> = tool_calls.iter().map(|call| call.id.clone()).collect();
         self.emit(
             session,
@@ -436,9 +440,10 @@ where
             },
         );
 
+        // Streaming carries no message id (unlike OpenAI-Responses-style APIs).
         session.push(Message::Assistant {
-            id: response.message_id,
-            content: response.choice,
+            id: None,
+            content: choice,
         });
 
         Ok(IterationResult {
@@ -446,6 +451,44 @@ where
             usage,
             tool_calls,
         })
+    }
+
+    /// Drives the model's stream to its terminal [`StreamEvent::Completed`],
+    /// emitting render deltas (text/reasoning) to the observer as they arrive.
+    ///
+    /// Returns the fully-assembled assistant content and token usage. The loop
+    /// branches on the content (tool calls vs final answer), so the stream's
+    /// `finish_reason` is not consumed here.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a model/transport [`CompletionError`], or a `ResponseError` if
+    /// the stream ends without a `Completed` event.
+    async fn stream_completion(
+        &self,
+        session: &mut AgentSession,
+        iteration: usize,
+        request: CompletionRequest,
+    ) -> Result<(NonEmptyVec<AssistantContent>, Usage), AgentError> {
+        let mut stream = self.model.stream(request).await?;
+        while let Some(event) = stream.next().await {
+            match event? {
+                StreamEvent::TextDelta(text) => {
+                    self.emit(session, Some(iteration), EventKind::TextDelta { text });
+                }
+                StreamEvent::ReasoningDelta(text) => {
+                    self.emit(session, Some(iteration), EventKind::ReasoningDelta { text });
+                }
+                // The "calling X" hint is surfaced by `ToolStart` after the turn
+                // completes and the call is gated; ignore the earlier signal.
+                StreamEvent::ToolCallStart { .. } => {}
+                StreamEvent::Completed { content, usage, .. } => return Ok((content, usage)),
+            }
+        }
+        Err(
+            CompletionError::ResponseError("stream ended without a completion event".to_string())
+                .into(),
+        )
     }
 
     async fn execute_tool_calls(
@@ -886,7 +929,7 @@ mod tests {
     use async_trait::async_trait;
     use kuncode_core::completion::{
         AssistantContent, CompletionError, CompletionRequest, CompletionResponse, CompletionStream,
-        Message, ToolDefinition, ToolResultContent, Usage, UserContent,
+        FinishReason, Message, StreamEvent, ToolDefinition, ToolResultContent, Usage, UserContent,
     };
     use kuncode_core::non_empty_vec::NonEmptyVec;
     use schemars::JsonSchema;
@@ -981,7 +1024,9 @@ mod tests {
             &self,
             _request: CompletionRequest,
         ) -> Result<CompletionStream, CompletionError> {
-            unimplemented!("hang model does not stream")
+            // Hang while establishing the stream so cancellation tests still
+            // race a never-resolving model call.
+            std::future::pending().await
         }
     }
 
@@ -1060,10 +1105,114 @@ mod tests {
 
         async fn stream(
             &self,
+            request: CompletionRequest,
+        ) -> Result<CompletionStream, CompletionError> {
+            // Mirror `completion`: record the request, pop the queued response,
+            // and replay it as a single terminal `Completed` event so the runner
+            // exercises its streaming path against the same scripted responses.
+            self.requests.lock().expect("requests lock").push(request);
+            let response = self
+                .responses
+                .lock()
+                .expect("responses lock")
+                .pop_front()
+                .expect("fake response queued");
+            Ok(completed_stream(response))
+        }
+    }
+
+    /// Replays a [`CompletionResponse`] as a one-event stream ending in
+    /// [`StreamEvent::Completed`], for test models that script whole responses.
+    /// `finish_reason` is irrelevant — the runner branches on the content.
+    fn completed_stream<T>(response: CompletionResponse<T>) -> CompletionStream {
+        let CompletionResponse { choice, usage, .. } = response;
+        Box::pin(futures_util::stream::once(async move {
+            Ok(StreamEvent::Completed {
+                content: choice,
+                usage,
+                finish_reason: FinishReason::Stop,
+            })
+        }))
+    }
+
+    /// A model that streams reasoning + text deltas before the final answer, for
+    /// asserting the runner forwards render deltas and still finalizes with
+    /// `Assistant`.
+    #[derive(Clone)]
+    struct DeltaModel;
+
+    impl kuncode_core::completion::CompletionModel for DeltaModel {
+        type Response = Value;
+        type Client = ();
+
+        fn make(_client: &Self::Client, _model: impl Into<String>) -> Self {
+            Self
+        }
+
+        async fn completion(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
+            unimplemented!("delta model only streams")
+        }
+
+        async fn stream(
+            &self,
             _request: CompletionRequest,
         ) -> Result<CompletionStream, CompletionError> {
-            unimplemented!("fake model does not stream")
+            let events = vec![
+                Ok(StreamEvent::ReasoningDelta("hmm".to_string())),
+                Ok(StreamEvent::TextDelta("Hel".to_string())),
+                Ok(StreamEvent::TextDelta("lo".to_string())),
+                Ok(StreamEvent::Completed {
+                    content: NonEmptyVec::new(AssistantContent::text("Hello")),
+                    usage: Usage::default(),
+                    finish_reason: FinishReason::Stop,
+                }),
+            ];
+            Ok(Box::pin(futures_util::stream::iter(events)))
         }
+    }
+
+    #[tokio::test]
+    async fn streaming_forwards_deltas_then_finalizes_with_assistant() {
+        let observer = Arc::new(CollectingObserver::default());
+        let runner =
+            AgentRunner::new(DeltaModel, ToolRegistry::new()).with_observer(observer.clone());
+        let mut session = AgentSession::new();
+
+        runner
+            .run_turn(&mut session, "hi")
+            .await
+            .expect("agent run should complete");
+
+        let events = observer.events();
+        let kinds: Vec<_> = events.iter().map(|e| event_label(&e.kind)).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "model_start",
+                "reasoning_delta",
+                "text_delta",
+                "text_delta",
+                "assistant",
+            ],
+        );
+
+        // Deltas carry the streamed fragments; the final Assistant carries the
+        // authoritative assembled text.
+        let text_deltas: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::TextDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text_deltas, ["Hel", "lo"]);
+        assert!(matches!(
+            &events[4].kind,
+            EventKind::Assistant { text, tool_calls } if text == "Hello" && tool_calls.is_empty()
+        ));
     }
 
     fn response(content: AssistantContent) -> CompletionResponse<Value> {
@@ -1506,7 +1655,9 @@ mod tests {
             &self,
             _request: CompletionRequest,
         ) -> Result<CompletionStream, CompletionError> {
-            unimplemented!("error model does not stream")
+            // A connection-level failure surfaces as the outer `Err`, exactly as
+            // `completion` fails.
+            Err(CompletionError::ResponseError("boom".to_string()))
         }
     }
 
@@ -1553,6 +1704,8 @@ mod tests {
     fn event_label(kind: &EventKind) -> &'static str {
         match kind {
             EventKind::ModelStart => "model_start",
+            EventKind::TextDelta { .. } => "text_delta",
+            EventKind::ReasoningDelta { .. } => "reasoning_delta",
             EventKind::Assistant { .. } => "assistant",
             EventKind::ToolStart { .. } => "tool_start",
             EventKind::ToolEnd { .. } => "tool_end",
