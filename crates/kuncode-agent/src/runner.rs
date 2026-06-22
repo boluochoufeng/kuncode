@@ -1,6 +1,6 @@
 //! Agent loop entry point.
 
-use std::{panic::AssertUnwindSafe, sync::Arc};
+use std::{future::Future, panic::AssertUnwindSafe, sync::Arc};
 
 use kuncode_core::{
     completion::{
@@ -261,11 +261,7 @@ where
                     prompt: &prompt,
                     messages: session.messages(),
                 };
-                tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => None,
-                    outcome = self.hooks.user_prompt_submit(&cx) => Some(outcome),
-                }
+                cancellable(&cancel, self.hooks.user_prompt_submit(&cx)).await
             };
             match outcome {
                 None => return Err(self.terminal_error(session, None, AgentError::Cancelled)),
@@ -370,11 +366,7 @@ where
                             messages: session.messages(),
                             iteration,
                         };
-                        tokio::select! {
-                            biased;
-                            _ = cancel.cancelled() => None,
-                            outcome = self.hooks.stop(&cx) => Some(outcome),
-                        }
+                        cancellable(cancel, self.hooks.stop(&cx)).await
                     };
                     match outcome {
                         None => return Err((Some(iteration), AgentError::Cancelled)),
@@ -424,9 +416,9 @@ where
         // most common place a user hits Ctrl-C, so the token must cover it — not
         // just the later tool approval/execution. Dropping the future cancels
         // the in-flight request (e.g. the provider's HTTP call).
-        let response = tokio::select! {
-            result = self.model.completion(request) => result?,
-            _ = cancel.cancelled() => return Err(AgentError::Cancelled),
+        let response = match cancellable(cancel, self.model.completion(request)).await {
+            Some(result) => result?,
+            None => return Err(AgentError::Cancelled),
         };
 
         let tool_calls = pending_tool_calls(&response.choice);
@@ -506,11 +498,7 @@ where
                                 messages: session.messages(),
                                 iteration,
                             };
-                            tokio::select! {
-                                biased;
-                                _ = cancel.cancelled() => None,
-                                outcome = self.hooks.post_tool_use(&cx) => Some(outcome),
-                            }
+                            cancellable(cancel, self.hooks.post_tool_use(&cx)).await
                         };
                         match outcome {
                             // Cancelled mid-batch: this tool's result is already
@@ -685,11 +673,7 @@ where
                     messages: session.messages(),
                     iteration,
                 };
-                tokio::select! {
-                    biased;
-                    _ = ctx.cancel.cancelled() => None,
-                    outcome = self.hooks.pre_tool_use(&cx) => Some(outcome),
-                }
+                cancellable(&ctx.cancel, self.hooks.pre_tool_use(&cx)).await
             };
             match pre {
                 None => return Err(AgentError::Cancelled),
@@ -711,17 +695,18 @@ where
             Decision::Abort => Err(AgentError::Cancelled),
             // Execute, racing cancellation so a long tool can be interrupted.
             Decision::Allow => {
-                let result = tokio::select! {
-                    result = tool.call(arguments, ctx) => result,
-                    _ = ctx.cancel.cancelled() => Err(ToolError::Cancelled),
-                };
-                match result {
-                    Ok(output) => Ok(CallOutcome {
+                match cancellable(&ctx.cancel, tool.call(arguments, ctx)).await {
+                    None => Err(AgentError::Cancelled),
+                    Some(Ok(output)) => Ok(CallOutcome {
                         output,
                         executed: true,
                     }),
-                    Err(ToolError::Cancelled) => Err(AgentError::Cancelled),
-                    Err(source) => Err(AgentError::Tool {
+                    // A tool that surfaces its own cancellation is still a
+                    // turn-level interrupt. The harness no longer synthesizes this
+                    // (a cancelled token loses the race to `None` above), so this is
+                    // a defensive arm for a tool that returns it itself.
+                    Some(Err(ToolError::Cancelled)) => Err(AgentError::Cancelled),
+                    Some(Err(source)) => Err(AgentError::Tool {
                         name: name.to_string(),
                         source,
                     }),
@@ -758,6 +743,28 @@ where
         .reasoning(self.config.reasoning)
         .tool_choice(self.config.tool_choice.clone())
         .build())
+    }
+}
+
+/// Races `fut` against `cancel`, returning `None` if the token fires first and
+/// `Some(output)` otherwise.
+///
+/// The single home for the loop's cancellation race: every interruptible await
+/// point (model request, tool execution, each hook) goes through here, so the
+/// contract lives in one place rather than re-spelled at each site:
+///
+/// - **`biased`** — the cancel branch is polled first, so an already-cancelled
+///   token wins deterministically and the future is never started.
+/// - **drop cancels** — losing the race drops `fut`, cancelling any in-flight
+///   work it owns (the provider's HTTP call, a child process, a hook's shell-out).
+/// - **`None` means cancelled** — the caller owns what to do then (unwind, pair
+///   remaining tool_calls, emit a terminal error); this helper deliberately does
+///   no cleanup, since each site's is different.
+async fn cancellable<T>(cancel: &CancellationToken, fut: impl Future<Output = T>) -> Option<T> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => None,
+        output = fut => Some(output),
     }
 }
 
@@ -887,7 +894,7 @@ mod tests {
     use serde_json::Value;
     use tokio_util::sync::CancellationToken;
 
-    use super::{AgentConfig, AgentRunner, TODO_REMINDER};
+    use super::{AgentConfig, AgentRunner, TODO_REMINDER, cancellable};
     use crate::{
         error::AgentError,
         hook::{
@@ -1415,6 +1422,38 @@ mod tests {
         // The turn aborted before any assistant message was appended: only the
         // user prompt is in the transcript.
         assert_eq!(session.messages().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancellable_yields_some_when_the_future_wins() {
+        let cancel = CancellationToken::new();
+        // An un-cancelled token never fires, so the ready future wins the race.
+        assert_eq!(cancellable(&cancel, async { 42 }).await, Some(42));
+    }
+
+    #[tokio::test]
+    async fn cancellable_is_biased_toward_an_already_cancelled_token() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        // Even against an immediately-ready future, a pre-cancelled token wins:
+        // `biased` polls the cancel branch first. This is the determinism the six
+        // call sites rely on; a non-biased `select!` could pick either branch.
+        assert_eq!(cancellable(&cancel, async { 42 }).await, None);
+    }
+
+    #[tokio::test]
+    async fn cancellable_yields_none_when_cancelled_while_pending() {
+        let cancel = CancellationToken::new();
+        // Cancel from inside the racing future, then never return: the cancel
+        // branch is the only one that can resolve, so the race ends in `None`.
+        let fut = {
+            let cancel = cancel.clone();
+            async move {
+                cancel.cancel();
+                std::future::pending::<i32>().await
+            }
+        };
+        assert_eq!(cancellable(&cancel, fut).await, None);
     }
 
     /// Records every event so a test can assert on the full stream.
