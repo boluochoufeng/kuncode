@@ -6,62 +6,44 @@
 //! turn's terminal line. Writes are light, so
 //! running synchronously on the loop task is fine.
 
-use kuncode_agent::observer::{AgentEvent, AgentObserver, EventKind};
+use kuncode_agent::observer::{AgentEvent, AgentObserver};
 use kuncode_agent::todo::{TodoItem, TodoStatus};
+
+use crate::view::{ToolOutcome, ViewEffect, view};
 
 /// Renders intermediate narration, tool starts, and tool results to stdout.
 pub struct CliObserver;
 
 impl AgentObserver for CliObserver {
     fn on_event(&self, event: &AgentEvent) {
-        match &event.kind {
-            // No persistent line: a future spinner would start here and be
-            // cleared by the next `Assistant`/`Error`.
-            EventKind::ModelStart => {}
-            // Print narration only when it accompanies tool calls — the final,
-            // call-free answer is `main.rs`'s job, so this won't double it.
-            EventKind::Assistant { text, tool_calls }
-                if !text.is_empty() && !tool_calls.is_empty() =>
-            {
-                println!("{text}");
-            }
-            EventKind::ToolStart { summary, .. } => println!("⏺ {summary}"),
-            EventKind::ToolEnd {
-                ok: true,
-                truncated,
-                ..
-            } => println!("  ⎿ ✓{}", if *truncated { " (truncated)" } else { "" }),
-            // A denial is an expected outcome, not a crash; flag it apart from
-            // genuine failures so the user reads it as "blocked", not "broke".
-            EventKind::ToolEnd {
-                error: Some(failure),
-                ..
-            } if failure.kind == "permission_denied" => {
-                println!("  ⎿ ⛔ {}", failure.message);
-            }
-            EventKind::ToolEnd { error, .. } => println!(
-                "  ⎿ ✗ {}",
-                error
-                    .as_ref()
-                    .map(|f| format!("{}: {}", f.kind, f.message))
-                    .unwrap_or_else(|| "failed".into())
-            ),
-            // The plan changed: print the whole checklist (it is small). Each
-            // update reprints — there is no in-place cursor model here, unlike the
-            // TUI, so a fresh block is the honest non-TUI rendering. A cleared
-            // (empty) plan prints nothing, so there is no lone header.
-            EventKind::TodoUpdate { todos } if !todos.is_empty() => {
-                println!("⏺ 任务计划");
-                for todo in todos {
-                    let (glyph, text) = todo_glyph_and_text(todo);
-                    println!("  ⎿ {glyph} {text}");
+        // What each event *means* is decided once in `view`; this renderer only
+        // draws the result. Events with no visible effect (`ModelStart`, the
+        // turn-terminal `Error` whose footer `main.rs` owns) yield `None`.
+        let Some(effect) = view(event.kind.clone()) else {
+            return;
+        };
+        match effect {
+            ViewEffect::Narration(text) => println!("{text}"),
+            ViewEffect::ToolOpened { summary, .. } => println!("⏺ {summary}"),
+            ViewEffect::ToolClosed { outcome, .. } => match outcome {
+                ToolOutcome::Ok { truncated } => {
+                    println!("  ⎿ ✓{}", if truncated { " (truncated)" } else { "" });
+                }
+                // A denial reads apart from a genuine failure: "blocked", not "broke".
+                ToolOutcome::Denied(message) => println!("  ⎿ ⛔ {message}"),
+                ToolOutcome::Failed(message) => println!("  ⎿ ✗ {message}"),
+            },
+            // Reprint the whole checklist (it is small): no in-place cursor model
+            // here, unlike the TUI. An empty plan prints nothing, so no lone header.
+            ViewEffect::Plan(todos) => {
+                if !todos.is_empty() {
+                    println!("⏺ 任务计划");
+                    for todo in &todos {
+                        let (glyph, text) = todo_glyph_and_text(todo);
+                        println!("  ⎿ {glyph} {text}");
+                    }
                 }
             }
-            // Turn-terminal backstop: only clear any open progress state. The
-            // cancel/error footer is `main.rs`'s (it also drives the exit code),
-            // so printing here would duplicate its `^C cancelled` / `error: ..`.
-            EventKind::Error { .. } => {}
-            _ => {}
         }
     }
 }

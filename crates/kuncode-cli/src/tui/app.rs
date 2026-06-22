@@ -6,6 +6,7 @@ use kuncode_agent::permission::{ApprovalOutcome, PermissionMode};
 use kuncode_agent::todo::TodoItem;
 
 use super::bridge::ApprovalRequest;
+use crate::view::{ToolOutcome, ViewEffect, view};
 
 /// Whether a turn is in flight. Gates input submission (one turn at a time) and
 /// whether the input box / cursor is shown.
@@ -138,67 +139,51 @@ impl App {
         self.conversation.push(Item::Error(text));
     }
 
-    /// Folds one agent event into the conversation log. Mirrors `CliObserver`:
-    /// only narration that *accompanies* tool calls is shown here; the call-free
-    /// final answer arrives via [`push_assistant`](Self::push_assistant), so it
-    /// is not doubled.
+    /// Folds one agent event into the conversation log. The event's *meaning* is
+    /// decided once in [`view`](crate::view::view), shared with `CliObserver`;
+    /// this only maps that meaning onto the TUI's display model. Events with no
+    /// visible effect (`ModelStart`, the turn-terminal `Error` rendered via
+    /// [`push_error`](Self::push_error)) yield `None`.
     pub fn apply_event(&mut self, kind: EventKind) {
-        match kind {
-            EventKind::Assistant { text, tool_calls }
-                if !text.is_empty() && !tool_calls.is_empty() =>
-            {
-                self.conversation.push(Item::Assistant(text));
-            }
-            EventKind::ToolStart {
-                tool_call_id,
-                tool,
-                summary,
-            } => {
+        let Some(effect) = view(kind) else {
+            return;
+        };
+        match effect {
+            ViewEffect::Narration(text) => self.conversation.push(Item::Assistant(text)),
+            ViewEffect::ToolOpened { id, tool, summary } => {
                 self.conversation.push(Item::Tool {
-                    id: tool_call_id,
+                    id,
                     name: tool,
                     summary,
                     state: ToolState::Running,
                 });
             }
-            EventKind::ToolEnd {
-                tool_call_id,
-                tool,
-                ok,
-                truncated,
-                error,
-            } => {
-                let state = match (ok, error) {
-                    (true, _) => ToolState::Ok { truncated },
-                    (false, Some(f)) if f.kind == "permission_denied" => {
-                        ToolState::Denied(f.message)
-                    }
-                    (false, Some(f)) => ToolState::Failed(format!("{}: {}", f.kind, f.message)),
-                    (false, None) => ToolState::Failed("failed".to_string()),
+            ViewEffect::ToolClosed { id, tool, outcome } => {
+                let state = match outcome {
+                    ToolOutcome::Ok { truncated } => ToolState::Ok { truncated },
+                    ToolOutcome::Denied(message) => ToolState::Denied(message),
+                    ToolOutcome::Failed(message) => ToolState::Failed(message),
                 };
-                if let Some(existing) = self.tool_state_mut(&tool_call_id) {
+                if let Some(existing) = self.tool_state_mut(&id) {
                     *existing = state;
                 } else {
-                    // A `ToolEnd` with no preceding `ToolStart`: the runner rejects
-                    // an unknown tool / bad arguments before a row is opened. Add
-                    // its own entry so the failure isn't silently dropped.
+                    // A `ToolClosed` with no preceding `ToolOpened`: the runner
+                    // rejects an unknown tool / bad arguments before a row is
+                    // opened. Add its own entry so the failure isn't dropped.
                     self.conversation.push(Item::Tool {
-                        id: tool_call_id,
+                        id,
                         name: tool,
                         summary: String::new(),
                         state,
                     });
                 }
             }
-            EventKind::TodoUpdate { todos } => {
+            ViewEffect::Plan(todos) => {
                 // The plan is a sticky panel, not a log entry, so a wholesale
                 // replace keeps it pinned below the latest activity regardless of
                 // what else streams in. An empty plan hides the panel.
                 self.plan = todos;
             }
-            // `ModelStart` (no spinner yet) and the turn-terminal `Error` (handled
-            // by the turn driver via `push_error`) need no log entry here.
-            _ => {}
         }
     }
 
