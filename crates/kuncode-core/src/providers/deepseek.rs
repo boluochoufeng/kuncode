@@ -150,9 +150,37 @@ impl CompletionModel for DeepSeekCompletionModel {
 
     async fn stream(
         &self,
-        _request: crate::completion::CompletionRequest,
+        request: crate::completion::CompletionRequest,
     ) -> Result<crate::completion::CompletionStream, crate::completion::CompletionError> {
-        todo!()
+        let mut request = request;
+        request.model.get_or_insert_with(|| self.model.clone());
+
+        let extra_params = request.additional_params.take();
+        let request = DeepSeekCompletionRequest::try_from(request)?.into_streaming();
+
+        let request_builder = self.client.post("/chat/completions");
+        let response = match extra_params {
+            Some(extra) => {
+                let body = json_utils::merge(serde_json::to_value(&request)?, extra);
+                request_builder.json(&body).send().await?
+            }
+            None => request_builder.json(&request).send().await?,
+        };
+
+        // Surface a connection-level failure (auth, rate limit, 5xx) as the outer
+        // `Err` *before* any event is yielded, so `RetryModel` can safely retry
+        // establishing the stream. Once the body streams, a mid-stream failure is
+        // an `Err` item instead, which is not retried.
+        let status = response.status();
+        if !status.is_success() {
+            let message = response.text().await.unwrap_or_default();
+            return Err(CompletionError::ApiError {
+                status: status.as_u16(),
+                message,
+            });
+        }
+
+        Ok(protocol::streaming::stream_events(response))
     }
 }
 
