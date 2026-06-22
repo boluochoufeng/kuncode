@@ -1,5 +1,7 @@
 //! Tool interface exposed by the agent runtime.
 
+use std::any::Any;
+
 use async_trait::async_trait;
 use kuncode_core::completion::ToolDefinition;
 use schemars::JsonSchema;
@@ -27,7 +29,7 @@ pub mod todo_write;
 #[derive(Clone, Debug, Default)]
 pub struct ToolContext {
     /// Cancelled by the runner (user interrupt / shutdown). A tool may observe
-    /// it for cooperative cancellation, but the runner also races `call`
+    /// it for cooperative cancellation, but the runner also races `dispatch`
     /// against it, so most tools can ignore it.
     pub cancel: CancellationToken,
     /// Handle to the current session's task plan. The runner clones in the
@@ -64,11 +66,12 @@ impl ToolContext {
 /// failures the model can react to, which are reported inside [`ToolOutput`].
 ///
 /// [`ToolError::Cancelled`] is surfaced by the runner, which races
-/// [`Tool::call`] against the [`ToolContext`] cancellation token (user
+/// [`Tool::dispatch`] against the [`ToolContext`] cancellation token (user
 /// interrupt / shutdown) and maps a token win onto
 /// [`AgentError::Cancelled`](crate::error::AgentError::Cancelled).
-/// [`ToolError::Internal`] is produced when a tool's typed output fails to
-/// serialize at the dispatch boundary.
+/// [`ToolError::Internal`] is produced at the dispatch boundary when a tool's
+/// typed output fails to serialize, or a prepared call is routed to the wrong
+/// tool (see [`PreparedToolCall`]).
 #[derive(Debug, Error)]
 pub enum ToolError {
     /// The tool was cancelled before completing (user interrupt or shutdown).
@@ -258,6 +261,53 @@ impl<D: Serialize> ToolOutput<D> {
     }
 }
 
+/// A parsed, gate-pending tool call: everything needed to run a tool exactly
+/// once, produced by [`Tool::prepare`] and consumed by [`Tool::dispatch`].
+///
+/// Splitting preparation from dispatch lets the runner gate the call — and run
+/// `PreToolUse` hooks — *between* the two without re-parsing the arguments.
+///
+/// # Invariants
+///
+/// - **Dispatch by the preparing tool only.** [`dispatch`](Tool::dispatch)
+///   downcasts the erased arguments back to its own `Args`; routing a prepared
+///   call to a *different* tool is a harness bug and fails with
+///   [`ToolError::Internal`], not a model-recoverable error.
+/// - **`parsed` is authoritative for execution; `raw` is advisory.** The tool
+///   runs the parsed arguments, not [`raw`](Self::raw). `raw` is kept so
+///   hooks/audit can read the model's wire form. If a future `PreToolUse` hook
+///   ever *rewrites* arguments it must re-[`prepare`](Tool::prepare) the call —
+///   mutating `raw` alone is silently ignored at dispatch.
+/// - **Single-use.** The erased `parsed` payload is not `Clone`; a prepared
+///   call is dispatched at most once.
+pub struct PreparedToolCall {
+    /// The permission request to gate on; also carries the human summary the
+    /// runner shows in `ToolStart`.
+    pub request: PermissionRequest,
+    /// The model's original JSON arguments, retained for hooks and audit. Not
+    /// the execution source of truth — see the type-level invariants.
+    pub raw: serde_json::Value,
+    /// Parsed `Args`, type-erased to ride through the `dyn Tool` boundary.
+    /// Downcast back by the originating tool in [`dispatch`](Tool::dispatch).
+    parsed: Box<dyn Any + Send>,
+}
+
+impl PreparedToolCall {
+    /// Bundles a gate request with the raw + parsed arguments. `parsed` is the
+    /// tool's own `Args`; the matching [`Tool::dispatch`] downcasts it back.
+    pub fn new(
+        request: PermissionRequest,
+        raw: serde_json::Value,
+        parsed: impl Any + Send,
+    ) -> Self {
+        Self {
+            request,
+            raw,
+            parsed: Box::new(parsed),
+        }
+    }
+}
+
 /// Object-safe tool interface used to register and dispatch tools.
 ///
 /// Most tools should implement [`TypedTool`] instead — it provides this trait
@@ -275,29 +325,53 @@ pub trait Tool: Send + Sync {
         &self.definition().name
     }
 
-    /// Computes the permission request for a call, *before* it runs.
+    /// Parses arguments into a [`PreparedToolCall`], *before* the call runs —
+    /// the first half of the gated execution path.
     ///
     /// Parses and lexically inspects the arguments only — no filesystem access.
     /// A parse failure returns `Err(ToolOutput)` (an `invalid_arguments`
     /// failure) so bad arguments are reported to the model and **never reach the
-    /// approver**.
-    fn permission(
+    /// approver**. On success the returned call carries the request to gate on
+    /// plus the parsed arguments, so [`dispatch`](Self::dispatch) needs no
+    /// re-parse.
+    fn prepare(
         &self,
-        args: &serde_json::Value,
+        args: serde_json::Value,
         ctx: &ToolContext,
-    ) -> Result<PermissionRequest, ToolOutput>;
+    ) -> Result<PreparedToolCall, ToolOutput>;
 
-    /// Invoke the tool with the raw JSON arguments produced by the model.
+    /// Runs a call already parsed by [`prepare`](Self::prepare) — the second
+    /// half, invoked after the gate allows it.
     ///
-    /// Two error channels: failures the model can react to (bad arguments,
-    /// non-zero exit, …) are reported in [`ToolOutput`] so the loop can feed
-    /// them back for a retry, while [`ToolError`] is for harness-level failures
-    /// (cancellation, internal bugs) the loop handles itself.
+    /// Two error channels: failures the model can react to (non-zero exit, …)
+    /// are reported in [`ToolOutput`] so the loop can feed them back for a
+    /// retry, while [`ToolError`] is for harness-level failures (cancellation,
+    /// internal bugs) the loop handles itself. A `prepared` built by a
+    /// *different* tool fails with [`ToolError::Internal`] (see
+    /// [`PreparedToolCall`] invariants).
+    async fn dispatch(
+        &self,
+        prepared: PreparedToolCall,
+        ctx: &ToolContext,
+    ) -> Result<ToolOutput, ToolError>;
+
+    /// Parses and runs a call in one step, **without consulting policy**.
+    ///
+    /// A convenience for non-gated callers and tests: exactly
+    /// [`prepare`](Self::prepare) then [`dispatch`](Self::dispatch), discarding
+    /// the permission request. The gated path the runner uses is `gate.prepare`
+    /// → `decide` → [`dispatch`](Self::dispatch); do **not** wire `call` into a
+    /// permission-sensitive path.
     async fn call(
         &self,
         args: serde_json::Value,
         ctx: &ToolContext,
-    ) -> Result<ToolOutput, ToolError>;
+    ) -> Result<ToolOutput, ToolError> {
+        match self.prepare(args, ctx) {
+            Ok(prepared) => self.dispatch(prepared, ctx).await,
+            Err(rejected) => Ok(rejected),
+        }
+    }
 }
 
 /// Ergonomic tool definition with strongly-typed arguments and output.
@@ -314,7 +388,10 @@ pub trait Tool: Send + Sync {
 #[async_trait]
 pub trait TypedTool: Send + Sync {
     /// Deserializable, schema-describable argument type for this tool.
-    type Args: DeserializeOwned + JsonSchema + Send;
+    ///
+    /// `'static` so a parsed value can be type-erased into a
+    /// [`PreparedToolCall`] and downcast back at [`dispatch`](Tool::dispatch).
+    type Args: DeserializeOwned + JsonSchema + Send + 'static;
 
     /// Serializable `data` payload returned to the model — and available to
     /// Rust callers (sub-agents, todo, …) without re-parsing JSON.
@@ -347,40 +424,42 @@ where
         TypedTool::definition(self)
     }
 
-    fn permission(
-        &self,
-        args: &serde_json::Value,
-        ctx: &ToolContext,
-    ) -> Result<PermissionRequest, ToolOutput> {
-        // Parse once for the gate so bad arguments fail here as
-        // `invalid_arguments` and never reach the approver. `call` parses again
-        // (double-parse is the accepted trade-off; a `PreparedToolCall` that
-        // parses once is a later optimization).
-        match serde_json::from_value::<T::Args>(args.clone()) {
-            Ok(parsed) => Ok(TypedTool::permission(self, &parsed, ctx)),
-            Err(err) => Err(ToolOutput::failure(
-                ToolErrorKind::InvalidArguments,
-                format!("failed to parse arguments: {err}"),
-            )),
-        }
-    }
-
-    async fn call(
+    fn prepare(
         &self,
         args: serde_json::Value,
         ctx: &ToolContext,
-    ) -> Result<ToolOutput, ToolError> {
-        let output = match serde_json::from_value::<T::Args>(args) {
-            Ok(args) => self.run(args, ctx).await,
+    ) -> Result<PreparedToolCall, ToolOutput> {
+        // Parse once, by reference, so `raw` stays intact for hooks/audit and
+        // `dispatch` never re-parses. A parse failure fails here as
+        // `invalid_arguments` and never reaches the approver.
+        let parsed = match T::Args::deserialize(&args) {
+            Ok(parsed) => parsed,
             Err(err) => {
-                return Ok(ToolOutput::failure(
-                    "invalid_arguments",
+                return Err(ToolOutput::failure(
+                    ToolErrorKind::InvalidArguments,
                     format!("failed to parse arguments: {err}"),
                 ));
             }
         };
+        let request = TypedTool::permission(self, &parsed, ctx);
+        Ok(PreparedToolCall::new(request, args, parsed))
+    }
 
-        output.erase()
+    async fn dispatch(
+        &self,
+        prepared: PreparedToolCall,
+        ctx: &ToolContext,
+    ) -> Result<ToolOutput, ToolError> {
+        // Downcast back to this tool's own `Args`. Paired correctly by the
+        // runner this never fails; a mismatch means a prepared call was routed
+        // to the wrong tool — a harness bug, surfaced (not panicked) as Internal.
+        let parsed = prepared.parsed.downcast::<T::Args>().map_err(|_| {
+            ToolError::Internal(format!(
+                "prepared call routed to the wrong tool `{}`",
+                TypedTool::definition(self).name
+            ))
+        })?;
+        self.run(*parsed, ctx).await.erase()
     }
 }
 

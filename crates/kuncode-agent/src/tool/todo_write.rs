@@ -190,13 +190,13 @@ mod tests {
     #[test]
     fn permission_is_meta_and_unscoped() {
         let tool = TodoWrite::new();
-        let request = Tool::permission(
+        let prepared = Tool::prepare(
             &tool,
-            &serde_json::json!({ "todos": [] }),
+            serde_json::json!({ "todos": [] }),
             &ToolContext::new(),
         )
         .expect("valid args");
-        assert_eq!(request.action, PermissionAction::Meta);
-        assert!(request.resource.is_none());
+        assert_eq!(prepared.request.action, PermissionAction::Meta);
+        assert!(prepared.request.resource.is_none());
     }
 }
