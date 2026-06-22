@@ -292,7 +292,9 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
         .collect();
     let wrapped = wrap_lines(logical, inner_width);
 
-    let (caret_row, caret_col) = caret_position(&app.input, inner_width);
+    // Caret sits at the cursor, not the end: greedy char-wrap is prefix-determined,
+    // so wrapping `input[..cursor]` yields the cursor's exact (row, col).
+    let (caret_row, caret_col) = caret_position(&app.input[..app.cursor], inner_width);
     // Scroll so the caret's row is the bottom visible row of the box.
     let scroll = caret_row.saturating_sub(inner_height - 1);
 
@@ -499,6 +501,27 @@ mod tests {
                 "{input:?}: caret row {row} >= {rendered} rows"
             );
         }
+    }
+
+    #[test]
+    fn cursor_renders_at_the_edit_position_not_the_end() {
+        let mut app = App::new("m", PermissionMode::Default);
+        for c in "hello".chars() {
+            app.insert_char(c);
+        }
+        app.move_left();
+        app.move_left(); // cursor between the two 'l's → column 3
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 10)).expect("terminal");
+        terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
+
+        // Full-width box at x=0: caret column 3 renders at x = 0 + border(1) + 3.
+        // Were the caret still pinned to the input's end it would sit at x=6.
+        let pos = terminal.get_cursor_position().expect("cursor position");
+        assert_eq!(
+            pos.x, 4,
+            "cursor sits at the edit column, not the input end"
+        );
     }
 
     #[test]
