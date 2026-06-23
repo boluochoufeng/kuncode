@@ -23,6 +23,21 @@ struct StreamChunk {
     choices: Vec<ChunkChoice>,
     /// Present only on the final frame when `stream_options.include_usage` is set.
     usage: Option<Usage>,
+    /// Set when the endpoint reports a failure *mid-stream* as a data frame
+    /// instead of via HTTP status; see [`StreamErrorBody`].
+    error: Option<StreamErrorBody>,
+}
+
+/// An OpenAI-compatible error object some endpoints emit as a `data: {"error":
+/// {...}}` frame after generation has begun (e.g. rate-limit / overload), rather
+/// than failing the HTTP status. Captured so it surfaces as a stream error: left
+/// in `StreamChunk` only, it would parse as an empty chunk and be dropped,
+/// letting [`StreamAssembler::finish`] report the partial answer as a clean stop.
+#[derive(Debug, Deserialize)]
+struct StreamErrorBody {
+    message: String,
+    #[serde(rename = "type")]
+    kind: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -158,8 +173,10 @@ impl StreamAssembler {
     }
 
     fn ingest_tool_call(&mut self, delta: ToolCallDelta, events: &mut Vec<StreamEvent>) {
-        let call = match self.tool_calls.iter_mut().find(|c| c.index == delta.index) {
-            Some(existing) => existing,
+        // Resolve to an index first so the new-call branch needs no fallible
+        // re-borrow (the just-pushed element is at `len - 1`).
+        let pos = match self.tool_calls.iter().position(|c| c.index == delta.index) {
+            Some(pos) => pos,
             None => {
                 self.tool_calls.push(PartialToolCall {
                     index: delta.index,
@@ -168,9 +185,10 @@ impl StreamAssembler {
                     arguments: String::new(),
                     announced: false,
                 });
-                self.tool_calls.last_mut().expect("just pushed")
+                self.tool_calls.len() - 1
             }
         };
+        let call = &mut self.tool_calls[pos];
         if let Some(id) = delta.id {
             call.id = id;
         }
@@ -239,6 +257,15 @@ impl StreamAssembler {
     }
 }
 
+/// Wraps a mid-stream provider [`StreamErrorBody`] as a [`CompletionError`].
+fn stream_error(error: StreamErrorBody) -> CompletionError {
+    let detail = match error.kind {
+        Some(kind) => format!("{} ({kind})", error.message),
+        None => error.message,
+    };
+    CompletionError::ResponseError(format!("provider reported a mid-stream error: {detail}"))
+}
+
 /// Maps DeepSeek's stop-reason string onto the neutral [`FinishReason`]. A
 /// missing reason (stream ended without one) reads as a natural stop.
 fn map_finish_reason(reason: Option<&str>) -> FinishReason {
@@ -268,7 +295,13 @@ pub(crate) fn stream_events(mut response: reqwest::Response) -> CompletionStream
                 match event {
                     SseEvent::Done => break 'body,
                     SseEvent::Data(payload) => {
-                        let chunk: StreamChunk = serde_json::from_str(&payload)?;
+                        let mut chunk: StreamChunk = serde_json::from_str(&payload)?;
+                        // A mid-stream error frame ends the stream with an error;
+                        // otherwise the partial answer would be assembled and
+                        // reported as a clean completion.
+                        if let Some(error) = chunk.error.take() {
+                            Err::<(), CompletionError>(stream_error(error))?;
+                        }
                         for delta in assembler.ingest(chunk) {
                             yield delta;
                         }
@@ -458,5 +491,53 @@ data: [DONE]
             assembler.finish(),
             Err(CompletionError::ResponseError(_))
         ));
+    }
+
+    #[test]
+    fn mid_stream_error_frame_surfaces_as_error() {
+        // Some content, then a `data: {"error":...}` frame, then a graceful close
+        // with no `[DONE]` — mirrors `stream_events`' per-chunk handling.
+        let sse = "\
+data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}
+
+data: {\"error\":{\"message\":\"rate limited\",\"type\":\"server_error\"}}
+
+";
+        let mut decoder = SseDecoder::new();
+        let mut assembler = StreamAssembler::default();
+        let mut deltas = Vec::new();
+        let mut error = None;
+        'outer: for piece in sse.as_bytes().chunks(4096) {
+            for ev in decoder.push(piece) {
+                if let SseEvent::Data(payload) = ev {
+                    let mut chunk: StreamChunk =
+                        serde_json::from_str(&payload).expect("chunk json");
+                    if let Some(err) = chunk.error.take() {
+                        error = Some(stream_error(err));
+                        break 'outer;
+                    }
+                    deltas.extend(assembler.ingest(chunk));
+                }
+            }
+        }
+        // The partial content streamed as a delta...
+        assert!(matches!(deltas.as_slice(), [StreamEvent::TextDelta(t)] if t == "Hel"));
+        // ...but the turn ends in an error, not a silent clean completion.
+        assert!(matches!(
+            error,
+            Some(CompletionError::ResponseError(m)) if m.contains("rate limited")
+        ));
+    }
+
+    #[test]
+    fn usage_frame_missing_a_core_count_is_rejected() {
+        // The standard trio is required: a usage object missing one is malformed
+        // and must fail the parse, not silently read as zero.
+        let bad = r#"{"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":2}}"#;
+        assert!(serde_json::from_str::<StreamChunk>(bad).is_err());
+        // The DeepSeek cache extensions, by contrast, may be omitted.
+        let ok =
+            r#"{"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}"#;
+        assert!(serde_json::from_str::<StreamChunk>(ok).is_ok());
     }
 }

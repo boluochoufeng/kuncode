@@ -22,6 +22,18 @@ const DEEPSEEK_API_BASE_URL: &str = "https://api.deepseek.com";
 #[cfg(test)]
 const DEEPSEEK_V4_FLASH: &str = "deepseek-v4-flash";
 
+/// Bound on dialing the endpoint.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Maximum idle gap while reading a response body. Resets on each chunk, so it
+/// catches a stalled connection *without* capping how long a (streaming)
+/// generation may run — a total request deadline would instead abort a long but
+/// healthy stream mid-flight.
+const READ_TIMEOUT: Duration = Duration::from_secs(360);
+/// Total deadline (connect → full body) for a *non-streaming* request. Applied
+/// per-request to `completion()` only; a stream's length is unbounded by design,
+/// so it relies on [`READ_TIMEOUT`] instead.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(360);
+
 /// Errors produced while constructing a DeepSeek client.
 #[derive(Debug, Error)]
 pub enum Error {
@@ -42,8 +54,11 @@ pub enum Error {
 
 /// Authenticated DeepSeek HTTP client shared by model handles.
 ///
-/// The client uses finite request/connect timeouts so provider calls cannot
-/// hang indefinitely.
+/// Timeouts are finite so provider calls cannot hang: a connect timeout on
+/// dialing and a per-read idle timeout on the body. The read timeout (not a
+/// total deadline) is what makes long streaming generations safe — it catches a
+/// stalled connection while letting a healthy stream run as long as it needs.
+/// `completion()` additionally imposes a total request deadline.
 #[derive(Clone)]
 pub struct DeepSeekClient {
     http_client: reqwest::Client,
@@ -59,8 +74,8 @@ impl DeepSeekClient {
     /// Returns [`Error::ClientError`] if the HTTP client cannot be configured.
     pub fn new(api_key: impl Into<String>) -> Result<Self, Error> {
         let http_client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(360))
-            .connect_timeout(Duration::from_secs(10))
+            .read_timeout(READ_TIMEOUT)
+            .connect_timeout(CONNECT_TIMEOUT)
             .build()
             .map_err(|err| Error::ClientError(err.into()))?;
         Ok(Self {
@@ -125,7 +140,12 @@ impl CompletionModel for DeepSeekCompletionModel {
         let extra_params = request.additional_params.take();
         let request = DeepSeekCompletionRequest::try_from(request)?;
 
-        let request_builder = self.client.post("/chat/completions");
+        // A non-streaming call reads the whole body at once, so a total deadline
+        // is the right bound (the streaming path deliberately omits it).
+        let request_builder = self
+            .client
+            .post("/chat/completions")
+            .timeout(REQUEST_TIMEOUT);
         let response = match extra_params {
             Some(extra) => {
                 let body = json_utils::merge(serde_json::to_value(&request)?, extra);
