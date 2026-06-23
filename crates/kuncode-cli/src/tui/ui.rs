@@ -232,14 +232,19 @@ fn conversation_lines(app: &App) -> Vec<Line<'static>> {
 /// follows in the normal assistant style. Both are ephemeral — the next commit
 /// clears [`App::stream_answer`]/[`App::stream_reasoning`] and they vanish,
 /// replaced by the committed item.
+///
+/// Only the typewriter-revealed prefix is drawn (see [`App::advance_reveal`]), so
+/// a fast stream types out at a readable pace instead of flooding in at once.
 fn append_stream_preview(lines: &mut Vec<Line<'static>>, app: &App) {
-    if !app.stream_reasoning.is_empty() {
-        for raw in app.stream_reasoning.split('\n') {
+    let reasoning = &app.stream_reasoning[..app.reasoning_revealed];
+    if !reasoning.is_empty() {
+        for raw in reasoning.split('\n') {
             lines.push(Line::from(raw.to_string()).dim());
         }
     }
-    if !app.stream_answer.is_empty() {
-        for raw in app.stream_answer.split('\n') {
+    let answer = &app.stream_answer[..app.answer_revealed];
+    if !answer.is_empty() {
+        for raw in answer.split('\n') {
             lines.push(Line::from(raw.to_string()));
         }
     }
@@ -436,6 +441,9 @@ mod tests {
         app.apply_event(EventKind::TextDelta {
             text: "partial answer".to_string(),
         });
+        // Only the revealed prefix draws; a huge budget reveals everything for
+        // this assertion (the typewriter pacing itself is tested in app.rs).
+        app.advance_reveal(std::time::Duration::from_secs(1), 100_000);
 
         let mut terminal = Terminal::new(TestBackend::new(60, 16)).expect("test terminal");
         terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
