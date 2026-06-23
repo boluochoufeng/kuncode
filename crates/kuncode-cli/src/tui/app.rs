@@ -1,5 +1,7 @@
 //! TUI application state and the agent-event reducer.
 
+use std::time::Duration;
+
 use crossterm::event::{KeyCode, KeyEvent};
 use kuncode_agent::observer::EventKind;
 use kuncode_agent::permission::{ApprovalOutcome, PermissionMode};
@@ -64,11 +66,21 @@ pub struct App {
     /// Ephemeral: cleared once the iteration's text is committed (narration via
     /// the `Assistant` event, the final answer via [`push_assistant`](Self::push_assistant)),
     /// so the streamed preview is never double-shown alongside the committed item.
+    ///
+    /// Only the [`answer_revealed`](Self::answer_revealed) prefix is drawn: the
+    /// model streams faster than is comfortable to read, so a typewriter advances
+    /// the reveal at a fixed rate while the full text accumulates here.
     pub stream_answer: String,
+    /// Byte offset (char boundary) up to which [`stream_answer`](Self::stream_answer)
+    /// is currently shown. Advanced by [`advance_reveal`](Self::advance_reveal).
+    pub answer_revealed: usize,
     /// Live reasoning text accumulated from
     /// [`ReasoningDelta`](EventKind::ReasoningDelta), rendered in a dimmed channel
     /// separate from [`stream_answer`](Self::stream_answer). Cleared with it.
     pub stream_reasoning: String,
+    /// Reveal offset for [`stream_reasoning`](Self::stream_reasoning), the dual of
+    /// [`answer_revealed`](Self::answer_revealed).
+    pub reasoning_revealed: usize,
     /// Set while a `PreToolUse` approval is pending; renders as a panel in the
     /// input box's place that captures keys until the user answers.
     pub approval: Option<ApprovalRequest>,
@@ -91,7 +103,9 @@ impl App {
             cursor: 0,
             status: Status::Idle,
             stream_answer: String::new(),
+            answer_revealed: 0,
             stream_reasoning: String::new(),
+            reasoning_revealed: 0,
             approval: None,
             scroll: 0,
             follow: true,
@@ -265,6 +279,46 @@ impl App {
     fn clear_stream_preview(&mut self) {
         self.stream_answer.clear();
         self.stream_reasoning.clear();
+        self.answer_revealed = 0;
+        self.reasoning_revealed = 0;
+    }
+
+    /// Whether either preview channel still has un-revealed text — i.e. the
+    /// typewriter has more to type. Drives both whether a tick needs to redraw
+    /// and whether the turn should keep ticking before committing the answer.
+    pub fn has_pending_reveal(&self) -> bool {
+        self.answer_revealed < self.stream_answer.len()
+            || self.reasoning_revealed < self.stream_reasoning.len()
+    }
+
+    /// Advances the typewriter by up to `cps` chars/second over `elapsed`,
+    /// revealing reasoning first (it streams before the answer) then the answer.
+    /// Returns whether anything was revealed, so the caller can skip an
+    /// unnecessary redraw.
+    ///
+    /// When the model streams slower than `cps` the reveal simply catches up to
+    /// what has arrived and idles, so a slow stream is shown as-is rather than
+    /// being held back; only a faster-than-`cps` burst is paced.
+    pub fn advance_reveal(&mut self, elapsed: Duration, cps: u32) -> bool {
+        // At least one char per tick so progress never stalls on rounding.
+        let mut budget = ((cps as f64) * elapsed.as_secs_f64()).round().max(1.0) as usize;
+        let mut revealed = false;
+        for (text, cursor) in [
+            (&self.stream_reasoning, &mut self.reasoning_revealed),
+            (&self.stream_answer, &mut self.answer_revealed),
+        ] {
+            if budget == 0 || *cursor >= text.len() {
+                continue;
+            }
+            let stepped = advance_by_chars(text, *cursor, budget);
+            let consumed = text[*cursor..stepped].chars().count();
+            if stepped != *cursor {
+                *cursor = stepped;
+                revealed = true;
+            }
+            budget = budget.saturating_sub(consumed);
+        }
+        revealed
     }
 
     /// Folds one agent event into the conversation log. The event's *meaning* is
@@ -383,6 +437,16 @@ impl App {
             Choice::Abort => ApprovalOutcome::Abort,
         };
         let _ = req.respond.send(outcome);
+    }
+}
+
+/// Byte offset reached by stepping `chars` chars forward from `from` in `text`,
+/// or `text.len()` if fewer remain. Always lands on a char boundary so slicing
+/// `text[..offset]` never splits a multi-byte character.
+fn advance_by_chars(text: &str, from: usize, chars: usize) -> usize {
+    match text[from..].char_indices().nth(chars) {
+        Some((rel, _)) => from + rel,
+        None => text.len(),
     }
 }
 
@@ -636,6 +700,52 @@ mod tests {
         app.stream_reasoning = "stale".to_string();
         app.apply_event(EventKind::ModelStart);
         assert!(app.stream_answer.is_empty() && app.stream_reasoning.is_empty());
+    }
+
+    #[test]
+    fn reveal_paces_at_the_rate_and_caps_at_received() {
+        let mut app = app();
+        app.apply_event(EventKind::TextDelta {
+            text: "abcdef".to_string(),
+        });
+        // 120 cps over 33ms ≈ 4 chars per tick.
+        assert!(app.advance_reveal(Duration::from_millis(33), 120));
+        assert_eq!(&app.stream_answer[..app.answer_revealed], "abcd");
+        assert!(app.advance_reveal(Duration::from_millis(33), 120));
+        assert_eq!(&app.stream_answer[..app.answer_revealed], "abcdef");
+        // Caught up: nothing left to reveal, so no redraw is requested.
+        assert!(!app.advance_reveal(Duration::from_millis(33), 120));
+        assert!(!app.has_pending_reveal());
+    }
+
+    #[test]
+    fn reveal_spends_budget_on_reasoning_before_the_answer() {
+        let mut app = app();
+        app.apply_event(EventKind::ReasoningDelta {
+            text: "rr".to_string(),
+        });
+        app.apply_event(EventKind::TextDelta {
+            text: "aaaa".to_string(),
+        });
+        // Budget of 3: 2 chars finish reasoning, the remaining 1 starts the answer.
+        app.advance_reveal(Duration::from_secs(1), 3);
+        assert_eq!(&app.stream_reasoning[..app.reasoning_revealed], "rr");
+        assert_eq!(&app.stream_answer[..app.answer_revealed], "a");
+    }
+
+    #[test]
+    fn reveal_never_splits_a_multibyte_char() {
+        let mut app = app();
+        app.apply_event(EventKind::TextDelta {
+            text: "héllo".to_string(), // 'é' is two bytes
+        });
+        // One char per tick, walking across the multi-byte boundary; the slice
+        // must always stay valid UTF-8 (would panic otherwise).
+        for _ in 0..6 {
+            app.advance_reveal(Duration::from_millis(1), 1);
+            let _shown = &app.stream_answer[..app.answer_revealed];
+        }
+        assert_eq!(&app.stream_answer[..app.answer_revealed], "héllo");
     }
 
     #[test]

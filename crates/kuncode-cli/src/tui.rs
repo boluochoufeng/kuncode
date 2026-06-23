@@ -12,6 +12,7 @@ mod ui;
 
 use std::io;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyEventKind,
@@ -36,6 +37,20 @@ const SCROLL_STEP: u16 = 10;
 
 /// Rows scrolled per mouse-wheel notch.
 const MOUSE_SCROLL_STEP: u16 = 3;
+
+/// Redraw cadence while a turn streams (~30fps). This is the *only* redraw path
+/// during a turn, so the screen refreshes at a fixed rate instead of once per
+/// streamed token (the model pushes deltas far faster); it also paces the
+/// typewriter via [`App::advance_reveal`](app::App::advance_reveal).
+const FRAME_INTERVAL: Duration = Duration::from_millis(33);
+
+/// Typewriter reveal speed for streamed output, in chars/second.
+const REVEAL_CPS: u32 = 80;
+
+/// Cap on how long a turn keeps typing out a buffered tail after the model has
+/// finished, before snapping to the full answer — so a long fast burst can't
+/// delay the commit by more than this.
+const MAX_DRAIN: Duration = Duration::from_millis(3000);
 
 /// Runs the interactive TUI until the user quits.
 ///
@@ -145,13 +160,25 @@ async fn run_one_turn<M: CompletionModel>(
     // `None` can't busy-spin the loop until the turn finishes.
     let mut events_closed = false;
 
+    // A steady frame clock owns redraws for the whole turn (loop + final drain),
+    // decoupling the screen refresh rate from the much faster delta arrival.
+    let mut frame = tokio::time::interval(FRAME_INTERVAL);
+    frame.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     {
         let mut turn = Box::pin(runner.run_turn_with(session, input, cancel.clone()));
+        // Paint the running state immediately; subsequent redraws ride the clock.
+        terminal.draw(|frame| ui::draw(frame, app))?;
         while outcome.is_none() {
-            terminal.draw(|frame| ui::draw(frame, app))?;
-
             tokio::select! {
                 result = &mut turn => outcome = Some(result),
+                // The frame tick is the only redraw path: deltas merely accumulate
+                // into the preview, and the typewriter + repaint happen here at a
+                // fixed cadence rather than once per streamed token.
+                _ = frame.tick() => {
+                    app.advance_reveal(FRAME_INTERVAL, REVEAL_CPS);
+                    terminal.draw(|frame| ui::draw(frame, app))?;
+                }
                 Some(event) = event_rx.recv() => app.apply_event(event.kind),
                 Some(req) = approval_rx.recv() => app.set_approval(req),
                 maybe = events.next(), if !events_closed => {
@@ -184,6 +211,16 @@ async fn run_one_turn<M: CompletionModel>(
     match outcome.expect("loop exits only once outcome is set") {
         Ok(turn) => {
             let text = turn.final_text(session);
+            // Keep typing out whatever the typewriter hasn't shown yet, so a fast
+            // stream finishes at the reading pace instead of snapping to the full
+            // answer — but cap the wait so a long tail can't stall the commit.
+            let mut waited = Duration::ZERO;
+            while app.has_pending_reveal() && waited < MAX_DRAIN {
+                frame.tick().await;
+                app.advance_reveal(FRAME_INTERVAL, REVEAL_CPS);
+                terminal.draw(|frame| ui::draw(frame, app))?;
+                waited += FRAME_INTERVAL;
+            }
             app.push_assistant(text);
         }
         Err(AgentError::Cancelled) => app.push_error("已取消".to_string()),
