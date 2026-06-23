@@ -275,19 +275,25 @@ impl From<completion::ToolDefinition> for ToolDefinition {
 /// In addition to OpenAI-compatible fields, DeepSeek reports cache hit/miss
 /// prompt tokens.
 ///
-/// `#[serde(default)]`: token accounting is best-effort, and streaming usage
-/// frames may carry a subset of fields. A missing sub-field defaults to zero
-/// rather than failing the whole response/chunk parse.
+/// Only the DeepSeek-specific cache fields default: an OpenAI-compatible endpoint
+/// may omit them. The standard trio (`prompt_tokens` / `completion_tokens` /
+/// `total_tokens`) stays required — whenever a `usage` object is present (the
+/// non-streaming response, or the streaming `include_usage` frame) these are
+/// always reported, so a missing one means a malformed body and should fail the
+/// parse rather than silently read as zero and corrupt token accounting.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(default)]
 pub struct Usage {
     /// Generated output tokens.
     pub completion_tokens: u32,
     /// Prompt/context input tokens.
     pub prompt_tokens: u32,
-    /// Prompt tokens served from context cache.
+    /// Prompt tokens served from context cache. DeepSeek extension; zero on
+    /// endpoints that don't report it.
+    #[serde(default)]
     pub prompt_cache_hit_tokens: u32,
-    /// Prompt tokens not served from context cache.
+    /// Prompt tokens not served from context cache. DeepSeek extension; zero on
+    /// endpoints that don't report it.
+    #[serde(default)]
     pub prompt_cache_miss_tokens: u32,
     /// Provider-reported total token count.
     pub total_tokens: u32,
