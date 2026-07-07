@@ -75,24 +75,22 @@ impl AgentSession {
     /// Creates an empty session starting in `mode`.
     pub fn with_mode(mode: PermissionMode) -> Self {
         Self {
-            messages: Vec::new(),
             permissions: PermissionSessionState::new(mode),
-            seq: 0,
-            todos: TodoHandle::default(),
-            transcript: None,
-            tool_results_dir: None,
+            ..Self::default()
         }
     }
 
     /// Starts a session from an existing transcript in the default mode.
+    ///
+    /// The messages become in-memory history only: no disk mirror is attached
+    /// here and nothing is replayed into one later — a caller resuming a
+    /// persisted session must still call
+    /// [`attach_transcript`](Self::attach_transcript), and only messages
+    /// pushed *after* that attach reach the new log.
     pub fn from_messages(messages: Vec<Message>) -> Self {
         Self {
             messages,
-            permissions: PermissionSessionState::default(),
-            seq: 0,
-            todos: TodoHandle::default(),
-            transcript: None,
-            tool_results_dir: None,
+            ..Self::default()
         }
     }
 
@@ -193,7 +191,7 @@ impl AgentSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transcript::test_support::{TestDir, log_lines};
+    use crate::test_support::{TestDir, log_lines};
 
     /// `push_user` funnels through `push`, the single append chokepoint, so
     /// an attached log sees user turns too.

@@ -147,7 +147,7 @@ mod tests {
     use std::fs;
 
     use super::EditFile;
-    use crate::tool::filesystem::test_support::TestDir;
+    use crate::test_support::TestDir;
     use crate::tool::{Tool, ToolContext};
 
     #[tokio::test]

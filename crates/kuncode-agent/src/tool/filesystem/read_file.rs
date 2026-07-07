@@ -271,7 +271,7 @@ mod tests {
     use std::fs;
 
     use super::{MAX_LINE_BYTES, ReadFile};
-    use crate::tool::filesystem::test_support::TestDir;
+    use crate::test_support::TestDir;
     use crate::tool::{Tool, ToolContext};
 
     #[tokio::test]

@@ -17,6 +17,15 @@
 //! re-reporting every message would be noise — the stored error is handed out
 //! exactly once via [`TranscriptLog::take_error`] so the runner can surface a
 //! single warning.
+//!
+//! Appends are synchronous on the caller's thread: a buffered write plus an
+//! OS-level flush per message, accepted so the mirror can never lag the
+//! in-memory history — the cost only becomes visible when the disk itself
+//! stalls. Readers of the log must in turn tolerate two artifacts of this
+//! design: a torn final line (process killed mid-write) and a zero-byte
+//! `.jsonl` file (the file was claimed but the first line never landed).
+//! Skip what does not parse; cleanup of empty files is a garbage-collection
+//! concern, not the writer's.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
@@ -32,9 +41,10 @@ use serde::Serialize;
 /// changing the log format and must come with a bump here.
 const FORMAT_VERSION: u32 = 1;
 
-/// How many `-2`, `-3`, … suffixes to try when the timestamp+pid filename
-/// already exists (the same process opening several sessions within one
-/// second) before giving up with the underlying `AlreadyExists` error.
+/// Total file names tried when the timestamp+pid name is taken (the same
+/// process opening several sessions within one second): the bare base plus
+/// `-2` … `-100` counter suffixes. Past that, give up with the underlying
+/// `AlreadyExists` error.
 const COLLISION_CAP: u32 = 100;
 
 /// One log line: a thin envelope around the domain [`Message`].
@@ -133,6 +143,16 @@ impl TranscriptLog {
     }
 }
 
+/// The global bucket for one project's session logs:
+/// `<home>/.kuncode/sessions/<project-slug>`. Lives here rather than in the
+/// CLI because a future resume stage must compute the same path to find the
+/// logs again.
+pub fn sessions_dir_for(home: &Path, root: &Path) -> PathBuf {
+    home.join(".kuncode")
+        .join("sessions")
+        .join(project_slug(root))
+}
+
 /// Derives the per-project bucket name under the global sessions directory
 /// from the workspace root: every character outside `[A-Za-z0-9._]` becomes
 /// `-`, so `/home/x/proj` → `-home-x-proj`. An allowlist rather than a
@@ -145,10 +165,7 @@ impl TranscriptLog {
 /// names still never collide (`create_new`), an escaping scheme would orphan
 /// every existing bucket, and a future resume stage can disambiguate by
 /// reading the logs themselves.
-///
-/// Lives here rather than in the CLI because a future resume stage must
-/// compute the same slug to find the logs again.
-pub fn project_slug(root: &Path) -> String {
+fn project_slug(root: &Path) -> String {
     root.to_string_lossy()
         .chars()
         .map(|c| {
@@ -166,22 +183,27 @@ pub fn project_slug(root: &Path) -> String {
 fn write_or_poison(mut writer: BufWriter<File>, message: &Message) -> State {
     match write_line(&mut writer, message) {
         Ok(()) => State::Open { writer },
-        Err(error) => State::Poisoned { error: Some(error) },
+        Err(error) => State::Poisoned {
+            error: Some(error.to_string()),
+        },
     }
 }
 
-fn write_line(writer: &mut BufWriter<File>, message: &Message) -> Result<(), String> {
+fn write_line(writer: &mut BufWriter<File>, message: &Message) -> std::io::Result<()> {
     let envelope = Envelope {
         v: FORMAT_VERSION,
         ts: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
         message,
     };
-    let line = serde_json::to_string(&envelope).map_err(|e| e.to_string())?;
-    writeln!(writer, "{line}").map_err(|e| e.to_string())?;
+    // `serde_json::Error` converts into `io::Error`, so serialization and
+    // write failures share one channel; serializing straight into the writer
+    // also skips building the whole line as an intermediate `String`.
+    serde_json::to_writer(&mut *writer, &envelope)?;
+    writer.write_all(b"\n")?;
     // Flush to the OS after every message so a process crash loses at most
     // the line being written. Deliberately no fsync: power loss may drop the
     // tail line, an accepted cost for a best-effort audit log.
-    writer.flush().map_err(|e| e.to_string())
+    writer.flush()
 }
 
 /// Creates the session directory and opens a fresh log file named
@@ -224,70 +246,10 @@ fn open_with_base(dir: &Path, base: &str) -> std::io::Result<BufWriter<File>> {
     }
 }
 
-/// Scaffolding shared with the `session` / `runner` transcript tests.
-#[cfg(test)]
-pub(crate) mod test_support {
-    use std::fs;
-    use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    /// Unique, self-cleaning temp directory; mirrors the filesystem tools'
-    /// test scaffolding (pid + timestamp across runs, a process-wide counter
-    /// across parallel tests within one run).
-    pub(crate) struct TestDir {
-        path: PathBuf,
-    }
-
-    impl TestDir {
-        pub(crate) fn new() -> Self {
-            static SEQ: AtomicU64 = AtomicU64::new(0);
-            let stamp = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system time should be after unix epoch")
-                .as_nanos();
-            let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "kuncode-transcript-test-{}-{stamp}-{seq}",
-                std::process::id()
-            ));
-            fs::create_dir_all(&path).expect("test directory should be created");
-            Self { path }
-        }
-
-        pub(crate) fn path(&self) -> &Path {
-            &self.path
-        }
-    }
-
-    impl Drop for TestDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.path);
-        }
-    }
-
-    /// All lines across every `.jsonl` file in `dir` (empty when the
-    /// directory does not exist yet — the lazy-init case).
-    pub(crate) fn log_lines(dir: &Path) -> Vec<String> {
-        let Ok(entries) = fs::read_dir(dir) else {
-            return Vec::new();
-        };
-        let mut lines = Vec::new();
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().is_some_and(|e| e == "jsonl") {
-                let content = fs::read_to_string(&path).expect("log file should be readable");
-                lines.extend(content.lines().map(str::to_string));
-            }
-        }
-        lines
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::test_support::{TestDir, log_lines};
     use super::*;
+    use crate::test_support::{TestDir, log_lines};
     use kuncode_core::completion::{AssistantContent, Message};
     use kuncode_core::non_empty_vec::NonEmptyVec;
 
@@ -368,6 +330,34 @@ mod tests {
 
         assert!(dir.exists());
         assert_eq!(log_lines(&dir).len(), 1);
+    }
+
+    /// One log claims exactly one file: later appends reuse the writer from
+    /// the first append instead of opening new timestamped names.
+    #[test]
+    fn one_session_writes_one_file() {
+        let root = TestDir::new();
+        let dir = root.path().join("bucket");
+        let mut log = TranscriptLog::new(dir.clone());
+
+        log.append(&Message::user("one"));
+        log.append(&Message::assistant("two"));
+        log.append(&Message::user("three"));
+
+        let files = std::fs::read_dir(&dir)
+            .expect("session dir should exist")
+            .count();
+        assert_eq!(files, 1, "one session must claim exactly one file");
+        assert_eq!(log_lines(&dir).len(), 3);
+    }
+
+    /// The resume-critical path shape: `<home>/.kuncode/sessions/<slug>`.
+    #[test]
+    fn sessions_dir_is_slug_bucket_under_home() {
+        assert_eq!(
+            sessions_dir_for(Path::new("/home/x"), Path::new("/home/x/proj")),
+            Path::new("/home/x/.kuncode/sessions/-home-x-proj")
+        );
     }
 
     #[test]

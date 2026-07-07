@@ -21,7 +21,7 @@ use kuncode_agent::session::AgentSession;
 use kuncode_agent::system_prompt::{
     EnvironmentSection, IdentitySection, SystemPrompt, ToolsSection,
 };
-use kuncode_agent::transcript::{TranscriptLog, project_slug};
+use kuncode_agent::transcript::{TranscriptLog, sessions_dir_for};
 use kuncode_agent::workspace::Workspace;
 use kuncode_core::completion::{CompletionModel, RetryModel, RetryPolicy};
 use kuncode_core::providers::deepseek::{DeepSeekClient, DeepSeekCompletionModel};
@@ -106,10 +106,8 @@ impl CliRuntime<RetryModel<DeepSeekCompletionModel>> {
         // that must survive a re-clone and stay out of tars/backups); large
         // tool results must stay *inside* the workspace, where the model's
         // own read_file/bash can reach them back.
-        let sessions_dir = std::env::home_dir().map(|home| {
-            home.join(".kuncode/sessions")
-                .join(project_slug(workspace.root()))
-        });
+        let sessions_dir =
+            std::env::home_dir().map(|home| sessions_dir_for(&home, workspace.root()));
         let tool_results_dir = workspace.root().join(".kuncode/tool-results");
 
         let client = DeepSeekClient::from_env()?;

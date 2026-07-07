@@ -11,9 +11,6 @@ mod helpers;
 mod read_file;
 mod write_file;
 
-#[cfg(test)]
-mod test_support;
-
 pub use self::edit_file::{EditFile, EditFileArgs, EditFileOutput};
 pub use self::glob::{Glob, GlobArgs, GlobOutput};
 pub use self::read_file::{ReadFile, ReadFileArgs, ReadFileOutput};

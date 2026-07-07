@@ -225,7 +225,7 @@ mod tests {
     use std::fs;
 
     use super::Glob;
-    use crate::tool::filesystem::test_support::TestDir;
+    use crate::test_support::TestDir;
     use crate::tool::{Tool, ToolContext};
 
     #[tokio::test]

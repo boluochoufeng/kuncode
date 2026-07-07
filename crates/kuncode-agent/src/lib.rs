@@ -11,6 +11,8 @@ pub mod registry;
 pub mod runner;
 pub mod session;
 pub mod system_prompt;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod todo;
 pub mod tool;
 pub mod transcript;

@@ -385,3 +385,70 @@ pub enum ReasoningContent {
     /// A short summary of a longer hidden reasoning trace.
     Summary(String),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn roundtrip(message: &Message) -> Message {
+        let json = serde_json::to_string(message).expect("message should serialize");
+        serde_json::from_str(&json).expect("message should deserialize")
+    }
+
+    /// Every shape these types can express must survive serialize →
+    /// deserialize unchanged. Callers persist messages through these derives,
+    /// and a tagging mismatch (e.g. an internally-tagged variant wrapping a
+    /// bare string) fails only at runtime — this test is the compile-time
+    /// check serde cannot give.
+    #[test]
+    fn every_message_shape_roundtrips() {
+        let messages = [
+            Message::system("be helpful"),
+            Message::user("fix the bug"),
+            Message::tool_result("call_1", "exit 0"),
+            Message::assistant("done"),
+            Message::Assistant {
+                id: Some("msg_1".into()),
+                content: NonEmptyVec::from_first_rest(
+                    AssistantContent::text("running"),
+                    vec![
+                        AssistantContent::tool_call_with_call_id(
+                            "call_1",
+                            "fc_1",
+                            "bash",
+                            serde_json::json!({ "cmd": "ls" }),
+                        ),
+                        AssistantContent::Reasoning(Reasoning::new_with_signature(
+                            "the user wants ls",
+                            Some("sig".into()),
+                        )),
+                        AssistantContent::Reasoning(Reasoning::redacted("blob")),
+                        AssistantContent::Reasoning(Reasoning::encrypted("cipher")),
+                        AssistantContent::Reasoning(
+                            Reasoning::summaries(vec!["s1".into(), "s2".into()])
+                                .with_id("r_1".to_string()),
+                        ),
+                    ],
+                ),
+            },
+        ];
+
+        for message in &messages {
+            assert_eq!(&roundtrip(message), message);
+        }
+    }
+
+    /// Pins the on-wire shape of tagged text blocks —
+    /// `{"type":"text","text":"…"}` — the exact JSON persisted logs contain.
+    #[test]
+    fn user_text_embeds_its_type_tag() {
+        let json = serde_json::to_value(Message::user("hi")).expect("message should serialize");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "role": "user",
+                "content": [{ "type": "text", "text": "hi" }]
+            })
+        );
+    }
+}
