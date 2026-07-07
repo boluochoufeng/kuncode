@@ -13,4 +13,5 @@ pub mod session;
 pub mod system_prompt;
 pub mod todo;
 pub mod tool;
+pub mod transcript;
 pub mod workspace;

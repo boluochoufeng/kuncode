@@ -10,6 +10,7 @@
 //! out of `main`, and gives each frontend a single argument instead of a long
 //! positional list.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use kuncode_agent::observer::AgentObserver;
@@ -20,6 +21,7 @@ use kuncode_agent::session::AgentSession;
 use kuncode_agent::system_prompt::{
     EnvironmentSection, IdentitySection, SystemPrompt, ToolsSection,
 };
+use kuncode_agent::transcript::{TranscriptLog, project_slug};
 use kuncode_agent::workspace::Workspace;
 use kuncode_core::completion::{CompletionModel, RetryModel, RetryPolicy};
 use kuncode_core::providers::deepseek::{DeepSeekClient, DeepSeekCompletionModel};
@@ -53,6 +55,16 @@ pub struct CliRuntime<M> {
     policy: PermissionPolicy,
     mode: PermissionMode,
     model_name: String,
+    /// Global per-project transcript bucket
+    /// (`~/.kuncode/sessions/<project-slug>`); `None` when no home directory
+    /// could be determined — [`session`](Self::session) then attaches a
+    /// pre-poisoned log so the failure surfaces as a one-shot warning instead
+    /// of silently dropping history.
+    sessions_dir: Option<PathBuf>,
+    /// Workspace-local tool-result persistence target
+    /// (`<workspace>/.kuncode/tool-results`); a pure path value, created by
+    /// its consumer on first use.
+    tool_results_dir: PathBuf,
 }
 
 impl CliRuntime<RetryModel<DeepSeekCompletionModel>> {
@@ -89,6 +101,17 @@ impl CliRuntime<RetryModel<DeepSeekCompletionModel>> {
             Box::new(ToolsSection),
         ]);
 
+        // Persistence roots, also captured before `workspace` moves. The
+        // transcript log lives in a *global* per-project bucket (a user asset
+        // that must survive a re-clone and stay out of tars/backups); large
+        // tool results must stay *inside* the workspace, where the model's
+        // own read_file/bash can reach them back.
+        let sessions_dir = std::env::home_dir().map(|home| {
+            home.join(".kuncode/sessions")
+                .join(project_slug(workspace.root()))
+        });
+        let tool_results_dir = workspace.root().join(".kuncode/tool-results");
+
         let client = DeepSeekClient::from_env()?;
         let model_name =
             std::env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| "deepseek-v4-flash".to_string());
@@ -114,6 +137,8 @@ impl CliRuntime<RetryModel<DeepSeekCompletionModel>> {
             policy: resolved.policy,
             mode: resolved.mode,
             model_name,
+            sessions_dir,
+            tool_results_dir,
         })
     }
 }
@@ -129,9 +154,23 @@ impl<M: CompletionModel> CliRuntime<M> {
         self.mode
     }
 
-    /// A fresh session seeded with the resolved permission mode.
+    /// A fresh session seeded with the resolved permission mode, with
+    /// transcript persistence attached (the library default is off; the CLI
+    /// opts in here). The log file itself is created lazily on the first
+    /// message, so an abandoned session leaves no disk trace.
     pub fn session(&self) -> AgentSession {
-        AgentSession::with_mode(self.mode)
+        let mut session = AgentSession::with_mode(self.mode);
+        session.attach_transcript(match &self.sessions_dir {
+            Some(dir) => TranscriptLog::new(dir.clone()),
+            // No home directory (bare container, scrubbed env): a
+            // pre-poisoned log routes the failure through the same one-shot
+            // warning channel instead of silently dropping history. The
+            // reason is bare — the report's exit point prefixes it with
+            // "transcript persistence failed: ".
+            None => TranscriptLog::poisoned("home directory unavailable"),
+        });
+        session.set_tool_results_dir(self.tool_results_dir.clone());
+        session
     }
 
     /// Consumes the runtime into a configured [`AgentRunner`], wiring the

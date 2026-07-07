@@ -1,9 +1,12 @@
 //! In-memory conversation state for agent turns.
 
+use std::path::PathBuf;
+
 use kuncode_core::completion::Message;
 
 use crate::permission::{PermissionMode, PermissionSessionState};
 use crate::todo::{TodoHandle, TodoItem};
+use crate::transcript::TranscriptLog;
 
 /// Conversation transcript owned by the caller between agent turns.
 ///
@@ -23,6 +26,20 @@ pub struct AgentSession {
     /// state. The runner clones this handle into each
     /// [`ToolContext`](crate::tool::ToolContext) so `todo_write` writes here.
     todos: TodoHandle,
+    /// Best-effort append-only disk mirror of the transcript (see
+    /// [`transcript`](crate::transcript)). Hooked into [`push`](Self::push) —
+    /// the single append chokepoint — so the on-disk log always holds the full
+    /// history ahead of any future in-memory compaction. `None` (the library
+    /// default) disables persistence: the library never writes a caller's
+    /// disk uninvited; the CLI opts in via
+    /// [`attach_transcript`](Self::attach_transcript).
+    transcript: Option<TranscriptLog>,
+    /// Where large tool results may be persisted inside the workspace
+    /// (`<workspace>/.kuncode/tool-results`). A pure path value: its consumer
+    /// creates the directory on first use, and it stays `Some` even when the
+    /// transcript log is poisoned — log health and tool-result persistence
+    /// are deliberately decoupled.
+    tool_results_dir: Option<PathBuf>,
 }
 
 impl Clone for AgentSession {
@@ -30,12 +47,21 @@ impl Clone for AgentSession {
     /// [`TodoHandle`]'s `Arc`, so two sessions would write the same plan.
     /// Deep-cloning the plan keeps per-session isolation — the same by-value
     /// isolation the permission state gets for free.
+    ///
+    /// The transcript writer is dropped (`None`), not shared: two sessions
+    /// appending to one file would interleave two timelines into an
+    /// unreadable log. A clone that wants persistence gets its own log
+    /// attached explicitly. `tool_results_dir` is a plain path and survives —
+    /// tool-result files are content-addressed, so two sessions writing the
+    /// same directory only deduplicate.
     fn clone(&self) -> Self {
         Self {
             messages: self.messages.clone(),
             permissions: self.permissions.clone(),
             seq: self.seq,
             todos: self.todos.deep_clone(),
+            transcript: None,
+            tool_results_dir: self.tool_results_dir.clone(),
         }
     }
 }
@@ -53,6 +79,8 @@ impl AgentSession {
             permissions: PermissionSessionState::new(mode),
             seq: 0,
             todos: TodoHandle::default(),
+            transcript: None,
+            tool_results_dir: None,
         }
     }
 
@@ -63,7 +91,35 @@ impl AgentSession {
             permissions: PermissionSessionState::default(),
             seq: 0,
             todos: TodoHandle::default(),
+            transcript: None,
+            tool_results_dir: None,
         }
+    }
+
+    /// Attaches the disk mirror: every message [`push`](Self::push)ed from now
+    /// on is also appended to `log`. The pre-existing messages (if any) are
+    /// *not* replayed — the log mirrors appends, it does not reconstruct.
+    pub fn attach_transcript(&mut self, log: TranscriptLog) {
+        self.transcript = Some(log);
+    }
+
+    /// Sets where large tool results may be persisted
+    /// (`<workspace>/.kuncode/tool-results`). A pure path value; nothing is
+    /// created here.
+    pub fn set_tool_results_dir(&mut self, dir: PathBuf) {
+        self.tool_results_dir = Some(dir);
+    }
+
+    /// The tool-result persistence directory, `None` when persistence was
+    /// never assembled. Independent of transcript-log health by design.
+    pub fn tool_results_dir(&self) -> Option<PathBuf> {
+        self.tool_results_dir.clone()
+    }
+
+    /// Hands out a transcript-persistence failure once (take-and-clear), so
+    /// the runner can surface exactly one warning per failure.
+    pub(crate) fn take_persistence_error(&mut self) -> Option<String> {
+        self.transcript.as_mut()?.take_error()
     }
 
     /// The session's permission state (mode + grants).
@@ -96,9 +152,10 @@ impl AgentSession {
         self.todos.snapshot()
     }
 
-    /// Appends a user turn to the transcript.
+    /// Appends a user turn to the transcript. Routes through
+    /// [`push`](Self::push) so the disk mirror sees every append.
     pub fn push_user(&mut self, prompt: impl Into<String>) {
-        self.messages.push(Message::user(prompt));
+        self.push(Message::user(prompt));
     }
 
     /// Returns the current transcript.
@@ -111,7 +168,13 @@ impl AgentSession {
         self.messages
     }
 
+    /// The single append chokepoint: every message enters the transcript here
+    /// (including [`push_user`](Self::push_user)), so the disk mirror — when
+    /// attached — is a faithful, append-ordered copy of the full history.
     pub(crate) fn push(&mut self, message: Message) {
+        if let Some(log) = &mut self.transcript {
+            log.append(&message);
+        }
         self.messages.push(message);
     }
 
@@ -124,5 +187,77 @@ impl AgentSession {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.messages.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transcript::test_support::{TestDir, log_lines};
+
+    /// `push_user` funnels through `push`, the single append chokepoint, so
+    /// an attached log sees user turns too.
+    #[test]
+    fn push_user_routes_through_push() {
+        let root = TestDir::new();
+        let dir = root.path().join("bucket");
+        let mut session = AgentSession::new();
+        session.attach_transcript(TranscriptLog::new(dir.clone()));
+
+        session.push_user("hello");
+
+        assert_eq!(session.messages().len(), 1);
+        assert_eq!(log_lines(&dir).len(), 1);
+    }
+
+    /// A cloned session must not append to the original's file (two writers
+    /// would interleave timelines); the original keeps writing.
+    #[test]
+    fn clone_does_not_carry_writer() {
+        let root = TestDir::new();
+        let dir = root.path().join("bucket");
+        let mut session = AgentSession::new();
+        session.attach_transcript(TranscriptLog::new(dir.clone()));
+        session.push_user("one");
+
+        let mut cloned = session.clone();
+        cloned.push_user("two");
+        assert_eq!(log_lines(&dir).len(), 1, "clone must not write the log");
+
+        session.push_user("three");
+        assert_eq!(log_lines(&dir).len(), 2, "original keeps writing");
+    }
+
+    /// The library default is persistence off: a plain session performs no
+    /// I/O and reports no persistence state.
+    #[test]
+    fn unattached_session_writes_nothing() {
+        let mut session = AgentSession::new();
+        session.push_user("hello");
+        assert_eq!(session.messages().len(), 1);
+        assert!(session.take_persistence_error().is_none());
+        assert!(session.tool_results_dir().is_none());
+    }
+
+    /// `tool_results_dir` is a pure path value: set → visible, poisoned log →
+    /// still visible (decoupled), clone → survives.
+    #[test]
+    fn tool_results_dir_derived_from_root() {
+        let mut session = AgentSession::new();
+        assert!(session.tool_results_dir().is_none());
+
+        let dir = PathBuf::from("/ws/.kuncode/tool-results");
+        session.set_tool_results_dir(dir.clone());
+        assert_eq!(session.tool_results_dir(), Some(dir.clone()));
+
+        session.attach_transcript(TranscriptLog::poisoned("disk on fire"));
+        assert_eq!(
+            session.tool_results_dir(),
+            Some(dir.clone()),
+            "log health must not hide the path value"
+        );
+
+        let cloned = session.clone();
+        assert_eq!(cloned.tool_results_dir(), Some(dir));
     }
 }

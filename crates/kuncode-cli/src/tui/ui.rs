@@ -219,6 +219,7 @@ fn conversation_lines(app: &App) -> Vec<Line<'static>> {
                 lines.push(tool_state_line(state));
             }
             Item::Error(text) => lines.push(Line::from(format!("✗ {text}")).red()),
+            Item::Warning(text) => lines.push(Line::from(format!("⚠ {text}")).yellow()),
         }
         lines.push(Line::from(""));
     }

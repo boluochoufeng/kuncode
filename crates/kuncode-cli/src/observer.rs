@@ -33,6 +33,8 @@ impl AgentObserver for CliObserver {
                 ToolOutcome::Denied(message) => println!("  ⎿ ⛔ {message}"),
                 ToolOutcome::Failed(message) => println!("  ⎿ ✗ {message}"),
             },
+            // A notice, not an error: the turn keeps going.
+            ViewEffect::Warning(text) => println!("⚠ {text}"),
             // Reprint the whole checklist (it is small): no in-place cursor model
             // here, unlike the TUI. An empty plan prints nothing, so no lone header.
             ViewEffect::Plan(todos) => {

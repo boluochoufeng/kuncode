@@ -301,9 +301,33 @@ where
         session: &mut AgentSession,
         cancel: CancellationToken,
     ) -> Result<AgentTurn, AgentError> {
-        match self.run_loop(session, &cancel).await {
+        let result = self.run_loop(session, &cancel).await;
+        // Drained here — after the loop, not per iteration — so the turn's
+        // *final* pushes (the closing assistant message, the last tool batch,
+        // pushes on an unwinding error path) are covered too. A one-shot run
+        // exits right after this turn; a loop-head check would let a failure
+        // in those last writes escape unreported forever.
+        self.warn_persistence(session);
+        match result {
             Ok(turn) => Ok(turn),
             Err((iteration, error)) => Err(self.terminal_error(session, iteration, error)),
+        }
+    }
+
+    /// Reports a transcript-persistence failure as a one-shot
+    /// [`Warning`](EventKind::Warning). `iteration` is `None`: the failure
+    /// belongs to a past push, not to any model call.
+    ///
+    /// With no observer attached the error is deliberately **left in the
+    /// session** — `take_persistence_error` is take-and-clear, so draining it
+    /// into a no-op emit would destroy the only report; leaving it lets a
+    /// later observer-bearing runner still surface it.
+    fn warn_persistence(&self, session: &mut AgentSession) {
+        if self.observer.is_none() {
+            return;
+        }
+        if let Some(message) = session.take_persistence_error() {
+            self.emit(session, None, EventKind::Warning { message });
         }
     }
 
@@ -956,6 +980,7 @@ mod tests {
             Tool, ToolContext, ToolError, ToolOutput, TypedTool, bash::Bash, definition_for,
             todo_write::TodoWrite,
         },
+        transcript::TranscriptLog,
     };
 
     /// A tool whose `run` never completes — used to test that a cancellation
@@ -1711,6 +1736,7 @@ mod tests {
             EventKind::ToolEnd { .. } => "tool_end",
             EventKind::Error { .. } => "error",
             EventKind::TodoUpdate { .. } => "todo_update",
+            EventKind::Warning { .. } => "warning",
         }
     }
 
@@ -1727,6 +1753,64 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// A poisoned transcript log warns exactly once — at the end of the turn
+    /// whose pushes hit the failure — and never again on later turns (the
+    /// take-and-clear contract), while the turns themselves stay unaffected.
+    /// `iteration` is `None`: the failure belongs to no model call.
+    #[tokio::test]
+    async fn persistence_failure_emits_warning_once() {
+        let model = FakeModel::new([
+            response(AssistantContent::text("first")),
+            response(AssistantContent::text("second")),
+        ]);
+        let observer = Arc::new(CollectingObserver::default());
+        let runner = AgentRunner::new(model, ToolRegistry::new()).with_observer(observer.clone());
+        let mut session = AgentSession::new();
+        session.attach_transcript(TranscriptLog::poisoned("disk on fire"));
+
+        runner
+            .run_turn(&mut session, "hi")
+            .await
+            .expect("first turn should complete despite the poisoned log");
+        runner
+            .run_turn(&mut session, "again")
+            .await
+            .expect("second turn should complete");
+
+        let warnings: Vec<_> = observer
+            .events()
+            .into_iter()
+            .filter(|e| matches!(e.kind, EventKind::Warning { .. }))
+            .collect();
+        assert_eq!(warnings.len(), 1, "one failure, one warning");
+        assert!(matches!(
+            &warnings[0].kind,
+            EventKind::Warning { message } if message.contains("disk on fire")
+        ));
+        assert_eq!(warnings[0].iteration, None);
+    }
+
+    /// With no observer there is nowhere to deliver the one-shot report, so
+    /// the runner must NOT drain it — the error stays in the session for a
+    /// later observer-bearing runner instead of vanishing into a no-op emit.
+    #[tokio::test]
+    async fn persistence_failure_survives_observerless_runner() {
+        let model = FakeModel::new([response(AssistantContent::text("done"))]);
+        let runner = AgentRunner::new(model, ToolRegistry::new());
+        let mut session = AgentSession::new();
+        session.attach_transcript(TranscriptLog::poisoned("disk on fire"));
+
+        runner
+            .run_turn(&mut session, "hi")
+            .await
+            .expect("turn should complete");
+
+        assert!(
+            session.take_persistence_error().is_some(),
+            "the un-reported error must remain takeable"
+        );
     }
 
     #[tokio::test]

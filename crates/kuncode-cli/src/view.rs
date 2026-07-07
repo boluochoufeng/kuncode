@@ -44,6 +44,10 @@ pub enum ViewEffect {
     },
     /// The task plan changed; carries the full snapshot (empty = cleared).
     Plan(Vec<TodoItem>),
+    /// A non-fatal harness degradation (e.g. transcript persistence stopped
+    /// working). Shown once — the emitter already de-duplicates — and the turn
+    /// continues, so it renders as a notice, not an error.
+    Warning(String),
 }
 
 /// Interprets one event into its visible effect, or `None` when it has none.
@@ -83,6 +87,7 @@ pub fn view(kind: EventKind) -> Option<ViewEffect> {
         // Always surfaced, even when empty: the TUI needs the empty snapshot to
         // clear its plan panel (the plain renderer just prints nothing).
         EventKind::TodoUpdate { todos } => Some(ViewEffect::Plan(todos)),
+        EventKind::Warning { message } => Some(ViewEffect::Warning(message)),
         EventKind::ModelStart
         | EventKind::TextDelta { .. }
         | EventKind::ReasoningDelta { .. }
@@ -235,6 +240,18 @@ mod tests {
                 text: "think".to_string(),
             }),
             None
+        );
+    }
+
+    #[test]
+    fn warning_passes_through() {
+        assert_eq!(
+            view(EventKind::Warning {
+                message: "transcript persistence failed: disk full".to_string(),
+            }),
+            Some(ViewEffect::Warning(
+                "transcript persistence failed: disk full".to_string()
+            ))
         );
     }
 

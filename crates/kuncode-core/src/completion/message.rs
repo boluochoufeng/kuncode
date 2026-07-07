@@ -202,20 +202,28 @@ impl AssistantContent {
 
 /// A plain-text content block.
 ///
-/// Wrapping `String` in a newtype keeps text blocks distinguishable from
-/// other string-bearing variants during (de)serialization.
+/// A named field rather than a newtype around `String`: the
+/// internally-tagged enums that carry it ([`UserContent`],
+/// [`ToolResultContent`]) must embed their `type` tag *into* the block, which
+/// serde cannot do when the content serializes to a bare string — a derived
+/// newtype here makes those variants fail at runtime on every
+/// serialize/deserialize. Callers persist and reload messages through these
+/// derives, so every variant must actually round-trip; the representation is
+/// `{"type":"text","text":"…"}`.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-pub struct Text(String);
+pub struct Text {
+    text: String,
+}
 
 impl Text {
     /// Returns the wrapped text as a string slice.
     pub fn text_ref(&self) -> &str {
-        &self.0
+        &self.text
     }
 
     /// Consumes the block and returns the wrapped text.
     pub fn text(self) -> String {
-        self.0
+        self.text
     }
 }
 
@@ -224,7 +232,7 @@ where
     T: Into<String>,
 {
     fn from(value: T) -> Self {
-        Text(value.into())
+        Text { text: value.into() }
     }
 }
 

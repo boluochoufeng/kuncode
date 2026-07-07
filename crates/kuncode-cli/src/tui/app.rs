@@ -42,6 +42,9 @@ pub enum Item {
         state: ToolState,
     },
     Error(String),
+    /// A non-fatal harness notice (e.g. transcript persistence degraded);
+    /// rendered apart from [`Error`](Self::Error) — the turn kept going.
+    Warning(String),
 }
 
 /// Mutable state driving the terminal UI.
@@ -394,6 +397,7 @@ impl App {
                 // what else streams in. An empty plan hides the panel.
                 self.plan = todos;
             }
+            ViewEffect::Warning(text) => self.conversation.push(Item::Warning(text)),
         }
     }
 
