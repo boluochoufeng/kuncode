@@ -10,7 +10,6 @@
 //! out of `main`, and gives each frontend a single argument instead of a long
 //! positional list.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use kuncode_agent::observer::AgentObserver;
@@ -18,10 +17,12 @@ use kuncode_agent::permission::{Approver, PermissionMode, PermissionPolicy};
 use kuncode_agent::registry::ToolRegistry;
 use kuncode_agent::runner::{AgentConfig, AgentRunner};
 use kuncode_agent::session::AgentSession;
+use kuncode_agent::session_store::{
+    NewSession, SessionStore, session_store_path, sqlite::SqliteSessionStore,
+};
 use kuncode_agent::system_prompt::{
     EnvironmentSection, IdentitySection, SystemPrompt, ToolsSection,
 };
-use kuncode_agent::transcript::{TranscriptLog, sessions_dir_for};
 use kuncode_agent::workspace::Workspace;
 use kuncode_core::completion::{CompletionModel, RetryModel, RetryPolicy};
 use kuncode_core::providers::deepseek::{DeepSeekClient, DeepSeekCompletionModel};
@@ -55,16 +56,9 @@ pub struct CliRuntime<M> {
     policy: PermissionPolicy,
     mode: PermissionMode,
     model_name: String,
-    /// Global per-project transcript bucket
-    /// (`~/.kuncode/sessions/<project-slug>`); `None` when no home directory
-    /// could be determined — [`session`](Self::session) then attaches a
-    /// pre-poisoned log so the failure surfaces as a one-shot warning instead
-    /// of silently dropping history.
-    sessions_dir: Option<PathBuf>,
-    /// Workspace-local tool-result persistence target
-    /// (`<workspace>/.kuncode/tool-results`); a pure path value, created by
-    /// its consumer on first use.
-    tool_results_dir: PathBuf,
+    project_root: std::path::PathBuf,
+    session_store: Option<Arc<SqliteSessionStore>>,
+    persistence_error: Option<String>,
 }
 
 impl CliRuntime<RetryModel<DeepSeekCompletionModel>> {
@@ -101,15 +95,14 @@ impl CliRuntime<RetryModel<DeepSeekCompletionModel>> {
             Box::new(ToolsSection),
         ]);
 
-        // Persistence roots, also captured before `workspace` moves. The
-        // transcript log lives in a *global* per-project bucket (a user asset
-        // that must survive a re-clone and stay out of tars/backups); large
-        // tool results must stay *inside* the workspace, where the model's
-        // own read_file/bash can reach them back.
-        let sessions_dir =
-            std::env::home_dir().map(|home| sessions_dir_for(&home, workspace.root()));
-        let tool_results_dir = workspace.root().join(".kuncode/tool-results");
-
+        let project_root = workspace.root().to_path_buf();
+        let (session_store, persistence_error) = match std::env::home_dir() {
+            Some(home) => match SqliteSessionStore::open(session_store_path(&home)).await {
+                Ok(store) => (Some(Arc::new(store)), None),
+                Err(error) => (None, Some(error.to_string())),
+            },
+            None => (None, Some("home directory unavailable".to_string())),
+        };
         let client = DeepSeekClient::from_env()?;
         let model_name =
             std::env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| "deepseek-v4-flash".to_string());
@@ -135,8 +128,9 @@ impl CliRuntime<RetryModel<DeepSeekCompletionModel>> {
             policy: resolved.policy,
             mode: resolved.mode,
             model_name,
-            sessions_dir,
-            tool_results_dir,
+            project_root,
+            session_store,
+            persistence_error,
         })
     }
 }
@@ -152,22 +146,19 @@ impl<M: CompletionModel> CliRuntime<M> {
         self.mode
     }
 
-    /// A fresh session seeded with the resolved permission mode, with
-    /// transcript persistence attached (the library default is off; the CLI
-    /// opts in here). The log file itself is created lazily on the first
-    /// message, so an abandoned session leaves no disk trace.
-    pub fn session(&self) -> AgentSession {
+    pub async fn session(&self) -> AgentSession {
         let mut session = AgentSession::with_mode(self.mode);
-        session.attach_transcript(match &self.sessions_dir {
-            Some(dir) => TranscriptLog::new(dir.clone()),
-            // No home directory (bare container, scrubbed env): a
-            // pre-poisoned log routes the failure through the same one-shot
-            // warning channel instead of silently dropping history. The
-            // reason is bare — the report's exit point prefixes it with
-            // "transcript persistence failed: ".
-            None => TranscriptLog::poisoned("home directory unavailable"),
-        });
-        session.set_tool_results_dir(self.tool_results_dir.clone());
+        match (&self.session_store, &self.persistence_error) {
+            (Some(store), _) => match store
+                .create_session(NewSession::new(self.project_root.clone()))
+                .await
+            {
+                Ok(id) => session.attach_session_id(id),
+                Err(error) => session.mark_persistence_failed(error.to_string()),
+            },
+            (None, Some(error)) => session.mark_persistence_failed(error.clone()),
+            (None, None) => {}
+        }
         session
     }
 
@@ -179,10 +170,16 @@ impl<M: CompletionModel> CliRuntime<M> {
         approver: Arc<dyn Approver>,
         observer: Arc<dyn AgentObserver>,
     ) -> AgentRunner<M> {
-        AgentRunner::with_config(self.model, self.registry, self.config)
+        let runner = AgentRunner::with_config(self.model, self.registry, self.config)
             .with_system_prompt(self.system_prompt)
             .with_policy(self.policy)
             .with_approver(approver)
-            .with_observer(observer)
+            .with_observer(observer);
+        if let Some(store) = self.session_store {
+            let store: Arc<dyn SessionStore> = store;
+            runner.with_session_store(store)
+        } else {
+            runner
+        }
     }
 }

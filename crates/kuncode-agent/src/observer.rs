@@ -115,15 +115,15 @@ pub enum EventKind {
     /// `ToolEnd`, and a plan is small and bounded.
     TodoUpdate { todos: Vec<TodoItem> },
     /// A non-fatal harness degradation the user should hear about — e.g.
-    /// transcript persistence stopped working (disk full, no home directory).
+    /// session persistence stopped working (disk full, no home directory).
     /// The turn itself continues unaffected.
     ///
     /// *Presentation-only*, like [`TodoUpdate`](Self::TodoUpdate): no
     /// transcript counterpart. Deliberately generic rather than one variant
     /// per source — every best-effort side channel that degrades shares this
     /// one rendering path, and the *emitter* is responsible for reporting a
-    /// given failure only once (see
-    /// [`transcript`](crate::transcript)'s take-and-clear contract).
+    /// given failure only once (see the session persistence take-and-clear
+    /// contract).
     Warning { message: String },
 }
 

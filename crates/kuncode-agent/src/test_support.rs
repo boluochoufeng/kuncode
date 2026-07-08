@@ -56,20 +56,3 @@ impl Drop for TestDir {
         let _ = fs::remove_dir_all(&self.path);
     }
 }
-
-/// All lines across every `.jsonl` file in `dir` (empty when the directory
-/// does not exist yet — the lazy-init case), for transcript-log assertions.
-pub(crate) fn log_lines(dir: &Path) -> Vec<String> {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut lines = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().is_some_and(|e| e == "jsonl") {
-            let content = fs::read_to_string(&path).expect("log file should be readable");
-            lines.extend(content.lines().map(str::to_string));
-        }
-    }
-    lines
-}

@@ -65,7 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // A prompt on argv (or a non-TTY pipe) runs one-shot on the plain
     // line-by-line renderer; only the bare interactive session enters the TUI.
     if !initial_prompt.trim().is_empty() {
-        let mut session = runtime.session();
+        let mut session = runtime.session().await;
         let runner =
             runtime.into_runner(Arc::new(TerminalApprover), Arc::new(observer::CliObserver));
 

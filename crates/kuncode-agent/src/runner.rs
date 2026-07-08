@@ -23,6 +23,7 @@ use crate::{
     permission::{Approver, AutoApprove, Decision, PermissionGate, PermissionPolicy, Prepared},
     registry::ToolRegistry,
     session::AgentSession,
+    session_store::{NewJournalEntry, SessionStore},
     system_prompt::{PromptContext, SystemPrompt},
     tool::{ToolContext, ToolError, ToolErrorKind, ToolOutput},
 };
@@ -69,7 +70,7 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             max_iterations: DEFAULT_MAX_ITERATIONS,
-            max_tokens: Some(4096),
+            max_tokens: Some(32768),
             reasoning: None,
             tool_choice: None,
             // Off by default: a library default that injects extra messages would
@@ -117,6 +118,7 @@ pub struct AgentRunner<M> {
     /// User-extensible loop intervention points. Empty by default, in which case
     /// every trigger site skips the hook machinery entirely (fast path).
     hooks: Arc<Hooks>,
+    session_store: Option<Arc<dyn SessionStore>>,
 }
 
 impl<M> AgentRunner<M>
@@ -143,6 +145,7 @@ where
             approver: Arc::new(AutoApprove),
             observer: None,
             hooks: Arc::new(Hooks::new()),
+            session_store: None,
         }
     }
 
@@ -182,6 +185,11 @@ where
         self
     }
 
+    pub fn with_session_store(mut self, store: Arc<dyn SessionStore>) -> Self {
+        self.session_store = Some(store);
+        self
+    }
+
     /// Emits one event, but only when an observer is attached — with none the
     /// `seq` is left untouched and nothing is dispatched. The `seq` is drawn at
     /// emit time, the single source of total ordering.
@@ -200,6 +208,27 @@ where
             };
             let _ = std::panic::catch_unwind(AssertUnwindSafe(|| observer.on_event(&event)));
         }
+    }
+
+    async fn push_user_message(&self, session: &mut AgentSession, prompt: impl Into<String>) {
+        self.push_message(session, Message::user(prompt)).await;
+    }
+
+    async fn push_message(&self, session: &mut AgentSession, message: Message) {
+        let session_id = session.session_id().cloned();
+        if let (Some(store), Some(session_id)) = (&self.session_store, session_id)
+            && session.is_durable()
+        {
+            match NewJournalEntry::message(&message) {
+                Ok(entry) => {
+                    if let Err(error) = store.append(&session_id, entry).await {
+                        session.mark_persistence_failed(error.to_string());
+                    }
+                }
+                Err(error) => session.mark_persistence_failed(error.to_string()),
+            }
+        }
+        session.push(message);
     }
 
     /// Emits the single turn-terminal [`Error`](EventKind::Error) for a failing
@@ -256,7 +285,7 @@ where
         // it behind to leak to the provider on a later turn. The cx borrows the
         // transcript, so it is scoped to end before any `push_user`.
         if self.hooks.is_empty() {
-            session.push_user(prompt);
+            self.push_user_message(session, prompt).await;
         } else {
             let outcome = {
                 let cx = PromptCx {
@@ -267,10 +296,10 @@ where
             };
             match outcome {
                 None => return Err(self.terminal_error(session, None, AgentError::Cancelled)),
-                Some(PromptOutcome::Proceed) => session.push_user(prompt),
+                Some(PromptOutcome::Proceed) => self.push_user_message(session, prompt).await,
                 Some(PromptOutcome::AddContext(context)) => {
-                    session.push_user(prompt);
-                    session.push_user(context);
+                    self.push_user_message(session, prompt).await;
+                    self.push_user_message(session, context).await;
                 }
                 Some(PromptOutcome::Block { reason }) => {
                     return Err(self.terminal_error(
@@ -314,7 +343,7 @@ where
         }
     }
 
-    /// Reports a transcript-persistence failure as a one-shot
+    /// Reports a session-persistence failure as a one-shot
     /// [`Warning`](EventKind::Warning). `iteration` is `None`: the failure
     /// belongs to a past push, not to any model call.
     ///
@@ -366,7 +395,8 @@ where
                 idle_iterations = 0;
             }
             if reminder_interval.is_some_and(|interval| idle_iterations >= interval) {
-                session.push_user(TODO_REMINDER.to_string());
+                self.push_user_message(session, TODO_REMINDER.to_string())
+                    .await;
                 idle_iterations = 0;
             }
             idle_iterations += 1;
@@ -399,7 +429,7 @@ where
                         Some(StopOutcome::Allow) => {}
                         Some(StopOutcome::Continue { message }) => {
                             stop_continuations += 1;
-                            session.push_user(message);
+                            self.push_user_message(session, message).await;
                             continue;
                         }
                     }
@@ -465,10 +495,14 @@ where
         );
 
         // Streaming carries no message id (unlike OpenAI-Responses-style APIs).
-        session.push(Message::Assistant {
-            id: None,
-            content: choice,
-        });
+        self.push_message(
+            session,
+            Message::Assistant {
+                id: None,
+                content: choice,
+            },
+        )
+        .await;
 
         Ok(IterationResult {
             assistant_message_index: session.messages().len() - 1,
@@ -546,7 +580,8 @@ where
                     // Snapshot the output for PostToolUse before record_result
                     // consumes it — only when a hook could actually use it.
                     let post_output = (executed && !self.hooks.is_empty()).then(|| output.clone());
-                    self.record_result(session, iteration, id, call_id, &name, output);
+                    self.record_result(session, iteration, id, call_id, &name, output)
+                        .await;
 
                     // The plan changed iff the generation advanced (a validation
                     // failure does not bump it, so a rejected `todo_write` emits
@@ -573,7 +608,8 @@ where
                             // (re-pairing `index` would double-write it). Buffered
                             // feedback is dropped — the turn is unwinding.
                             None => {
-                                self.pair_unpaired(session, iteration, &tool_calls[index + 1..]);
+                                self.pair_unpaired(session, iteration, &tool_calls[index + 1..])
+                                    .await;
                                 return Err(AgentError::Cancelled);
                             }
                             Some(PostToolOutcome::Proceed) => {}
@@ -592,8 +628,10 @@ where
                         }
                         _ => interrupted_tool_output(),
                     };
-                    self.record_result(session, iteration, id, call_id, &name, failed);
-                    self.pair_unpaired(session, iteration, &tool_calls[index + 1..]);
+                    self.record_result(session, iteration, id, call_id, &name, failed)
+                        .await;
+                    self.pair_unpaired(session, iteration, &tool_calls[index + 1..])
+                        .await;
                     // Buffered PostToolUse feedback is dropped here, same as the
                     // cancel branch above: the turn is unwinding, the end-of-loop
                     // flush is never reached, and a failed turn should not leave a
@@ -607,7 +645,7 @@ where
 
         // Flush buffered feedback after the batch's tool_results (see above).
         for text in feedback {
-            session.push_user(text);
+            self.push_user_message(session, text).await;
         }
 
         Ok(())
@@ -617,7 +655,7 @@ where
     /// result, so an unwinding turn never leaves an assistant tool_call
     /// dangling — most providers reject a request whose tool_call has no
     /// matching tool_result before the next user message.
-    fn pair_unpaired(
+    async fn pair_unpaired(
         &self,
         session: &mut AgentSession,
         iteration: usize,
@@ -631,7 +669,8 @@ where
                 call.call_id.clone(),
                 &call.name,
                 interrupted_tool_output(),
-            );
+            )
+            .await;
         }
     }
 
@@ -644,7 +683,7 @@ where
     /// is structural: a new result path calls this and cannot emit the event
     /// without the transcript write, or let the two describe different outcomes.
     /// Event before transcript so a UI row closes no later than the result lands.
-    fn record_result(
+    async fn record_result(
         &self,
         session: &mut AgentSession,
         iteration: usize,
@@ -664,7 +703,11 @@ where
                 error: output.error.as_ref().map(ToolFailure::from),
             },
         );
-        session.push(tool_result_message(id, call_id, output.to_model_content()));
+        self.push_message(
+            session,
+            tool_result_message(id, call_id, output.to_model_content()),
+        )
+        .await;
     }
 
     /// Gates a tool call, then dispatches. The gate races the approval prompt
@@ -975,12 +1018,13 @@ mod tests {
         },
         registry::ToolRegistry,
         session::AgentSession,
+        session_store::{NewSession, Seq, SessionStore, sqlite::SqliteSessionStore},
         system_prompt::{IdentitySection, SystemPrompt},
+        test_support::TestDir,
         tool::{
             Tool, ToolContext, ToolError, ToolOutput, TypedTool, bash::Bash, definition_for,
             todo_write::TodoWrite,
         },
-        transcript::TranscriptLog,
     };
 
     /// A tool whose `run` never completes — used to test that a cancellation
@@ -1755,7 +1799,7 @@ mod tests {
             .collect()
     }
 
-    /// A poisoned transcript log warns exactly once — at the end of the turn
+    /// A degraded session store warns exactly once — at the end of the turn
     /// whose pushes hit the failure — and never again on later turns (the
     /// take-and-clear contract), while the turns themselves stay unaffected.
     /// `iteration` is `None`: the failure belongs to no model call.
@@ -1768,12 +1812,12 @@ mod tests {
         let observer = Arc::new(CollectingObserver::default());
         let runner = AgentRunner::new(model, ToolRegistry::new()).with_observer(observer.clone());
         let mut session = AgentSession::new();
-        session.attach_transcript(TranscriptLog::poisoned("disk on fire"));
+        session.mark_persistence_failed("disk on fire");
 
         runner
             .run_turn(&mut session, "hi")
             .await
-            .expect("first turn should complete despite the poisoned log");
+            .expect("first turn should complete despite degraded persistence");
         runner
             .run_turn(&mut session, "again")
             .await
@@ -1800,7 +1844,7 @@ mod tests {
         let model = FakeModel::new([response(AssistantContent::text("done"))]);
         let runner = AgentRunner::new(model, ToolRegistry::new());
         let mut session = AgentSession::new();
-        session.attach_transcript(TranscriptLog::poisoned("disk on fire"));
+        session.mark_persistence_failed("disk on fire");
 
         runner
             .run_turn(&mut session, "hi")
@@ -1811,6 +1855,39 @@ mod tests {
             session.take_persistence_error().is_some(),
             "the un-reported error must remain takeable"
         );
+    }
+
+    #[tokio::test]
+    async fn run_turn_persists_messages_to_session_store() {
+        let root = TestDir::new();
+        let store = Arc::new(
+            SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+                .await
+                .expect("store should open"),
+        );
+        let session_id = store
+            .create_session(NewSession::new(root.path().to_path_buf()))
+            .await
+            .expect("session should be created");
+        let model = FakeModel::new([response(AssistantContent::text("done"))]);
+        let runner = AgentRunner::new(model, ToolRegistry::new()).with_session_store(store.clone());
+        let mut session = AgentSession::new();
+        session.attach_session_id(session_id.clone());
+
+        runner
+            .run_turn(&mut session, "hi")
+            .await
+            .expect("turn should complete");
+
+        let entries = store
+            .replay_after(&session_id, Seq::ZERO)
+            .await
+            .expect("journal should replay");
+        let messages: Vec<Message> = entries
+            .into_iter()
+            .map(|entry| entry.into_message().expect("message payload"))
+            .collect();
+        assert_eq!(messages, session.messages());
     }
 
     #[tokio::test]

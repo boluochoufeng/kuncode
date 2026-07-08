@@ -42,7 +42,7 @@ pub enum Item {
         state: ToolState,
     },
     Error(String),
-    /// A non-fatal harness notice (e.g. transcript persistence degraded);
+    /// A non-fatal harness notice (e.g. session persistence degraded);
     /// rendered apart from [`Error`](Self::Error) — the turn kept going.
     Warning(String),
 }

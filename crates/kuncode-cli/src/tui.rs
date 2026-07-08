@@ -68,7 +68,7 @@ where
     // Read the frontend-facing bits before `into_runner` consumes the runtime.
     let model_name = runtime.model_name().to_string();
     let mode = runtime.mode();
-    let mut session = runtime.session();
+    let mut session = runtime.session().await;
     let runner = runtime.into_runner(
         Arc::new(TuiApprover::new(approval_tx)),
         Arc::new(TuiObserver::new(event_tx)),
