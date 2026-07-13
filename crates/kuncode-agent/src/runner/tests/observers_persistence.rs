@@ -120,6 +120,11 @@ fn event_label(kind: &EventKind) -> &'static str {
         EventKind::Error { .. } => "error",
         EventKind::TodoUpdate { .. } => "todo_update",
         EventKind::Warning { .. } => "warning",
+        EventKind::CompactionStarted { .. } => "compaction_started",
+        EventKind::CompactionCompleted { .. } => "compaction_completed",
+        EventKind::CompactionSkipped { .. } => "compaction_skipped",
+        EventKind::CompactionObserved { .. } => "compaction_observed",
+        EventKind::CompactionFailed { .. } => "compaction_failed",
     }
 }
 

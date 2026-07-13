@@ -27,6 +27,13 @@ pub enum AgentError {
     #[error("agent transcript is empty")]
     EmptyTranscript,
 
+    /// Automatic compaction could not produce a request below the hard limit.
+    #[error("context compaction failed: {message}")]
+    Compaction {
+        /// Typed compaction failure rendered without exposing internal state.
+        message: String,
+    },
+
     /// The turn was cancelled — a user interrupt, or an `Abort` at an approval
     /// prompt. Distinct from a tool failure so callers (e.g. the CLI) can tell a
     /// deliberate Ctrl-C apart from a real error.

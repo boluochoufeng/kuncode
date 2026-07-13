@@ -8,7 +8,7 @@ use crate::{
     observer::EventKind,
     permission::{Decision, PermissionGate, Prepared},
     session::AgentSession,
-    tool::{ToolContext, ToolError, ToolErrorKind, ToolOutput},
+    tool::{ToolContext, ToolError, ToolErrorKind, ToolOutput, ToolResultRetention},
 };
 
 use super::{AgentRunner, CallOutcome, cancellation::cancellable};
@@ -60,6 +60,7 @@ where
                 return Ok(CallOutcome {
                     output,
                     executed: false,
+                    retention: ToolResultRetention::Verbatim,
                 });
             }
         };
@@ -99,6 +100,7 @@ where
                     return Ok(CallOutcome {
                         output: ToolOutput::failure(ToolErrorKind::BlockedByHook, message),
                         executed: false,
+                        retention: ToolResultRetention::Verbatim,
                     });
                 }
             }
@@ -108,16 +110,21 @@ where
             Decision::Deny(output) => Ok(CallOutcome {
                 output,
                 executed: false,
+                retention: ToolResultRetention::Verbatim,
             }),
             Decision::Abort => Err(AgentError::Cancelled),
             // Execute, racing cancellation so a long tool can be interrupted.
             Decision::Allow => {
-                match cancellable(&ctx.cancel, tool.call(arguments, ctx)).await {
+                match cancellable(&ctx.cancel, tool.call(arguments.clone(), ctx)).await {
                     None => Err(AgentError::Cancelled),
-                    Some(Ok(output)) => Ok(CallOutcome {
-                        output,
-                        executed: true,
-                    }),
+                    Some(Ok(output)) => {
+                        let retention = tool.result_retention(&arguments, &output);
+                        Ok(CallOutcome {
+                            output,
+                            executed: true,
+                            retention,
+                        })
+                    }
                     // A tool that surfaces its own cancellation is still a
                     // turn-level interrupt. The harness no longer synthesizes this
                     // (a cancelled token loses the race to `None` above), so this is

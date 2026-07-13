@@ -2,14 +2,23 @@
 
 use kuncode_core::completion::Message;
 
+#[cfg(test)]
+use crate::compaction::summary::ContinuitySummary;
 use crate::permission::{PermissionMode, PermissionSessionState};
-use crate::session_store::{CommittedCompaction, Seq, SessionId};
+use crate::session_store::{Seq, SessionId};
 use crate::todo::{TodoHandle, TodoItem};
+use crate::tool::ToolResultRetention;
 
 mod compaction;
+mod lineage;
+mod persistence;
 
 pub(crate) use compaction::SummarySourceBinding;
 pub use compaction::SummarySourceError;
+pub(crate) use lineage::{ActiveSummary, MessageCoverage, MessageLineage, PreparedActiveContext};
+pub(crate) use persistence::DurableSessionContext;
+#[cfg(test)]
+use persistence::SessionMutationError;
 
 /// Active conversation context owned by the caller between agent turns.
 ///
@@ -19,7 +28,8 @@ pub use compaction::SummarySourceError;
 #[derive(Debug, Default)]
 pub struct AgentSession {
     messages: Vec<Message>,
-    message_journal_seqs: Vec<Option<Seq>>,
+    message_lineage: Vec<MessageLineage>,
+    active_summary: Option<ActiveSummary>,
     permissions: PermissionSessionState,
     /// Monotonic counter handing out [`AgentEvent`](crate::observer::AgentEvent)
     /// sequence numbers. Lives on the session, not the `&self`/`Clone` runner,
@@ -36,24 +46,6 @@ pub struct AgentSession {
     non_durable: bool,
 }
 
-/// Borrowed proof derived only from a persistence-healthy [`AgentSession`].
-pub(crate) struct DurableSessionContext<'a> {
-    session_id: &'a SessionId,
-    frontier: Seq,
-}
-
-impl DurableSessionContext<'_> {
-    /// Returns the durable session whose journal must authorize compaction.
-    pub(crate) const fn session_id(&self) -> &SessionId {
-        self.session_id
-    }
-
-    /// Returns the latest journal sequence acknowledged by the active session.
-    pub(crate) const fn frontier(&self) -> Seq {
-        self.frontier
-    }
-}
-
 impl Clone for AgentSession {
     /// Hand-written rather than derived: a derived clone would share the
     /// [`TodoHandle`]'s `Arc`, so two sessions would write the same plan.
@@ -65,7 +57,8 @@ impl Clone for AgentSession {
     fn clone(&self) -> Self {
         let messages = self.messages.clone();
         Self {
-            message_journal_seqs: vec![None; messages.len()],
+            message_lineage: lineage::untrusted_lineage(messages.len()),
+            active_summary: None,
             messages,
             permissions: self.permissions.clone(),
             seq: self.seq,
@@ -99,105 +92,11 @@ impl AgentSession {
     /// returned session id separately.
     pub fn from_messages(messages: Vec<Message>) -> Self {
         Self {
-            message_journal_seqs: vec![None; messages.len()],
+            message_lineage: lineage::untrusted_lineage(messages.len()),
+            active_summary: None,
             messages,
             ..Self::default()
         }
-    }
-
-    pub fn attach_session_id(&mut self, id: SessionId) {
-        self.session_id = Some(id);
-        self.last_durable_seq = Some(Seq::ZERO);
-        self.non_durable = false;
-    }
-
-    pub fn session_id(&self) -> Option<&SessionId> {
-        self.session_id.as_ref()
-    }
-
-    pub(crate) fn is_durable(&self) -> bool {
-        self.session_id.is_some() && self.last_durable_seq.is_some() && !self.non_durable
-    }
-
-    /// Derives compaction authority only while persistence remains healthy.
-    pub(crate) fn durable_context(&self) -> Option<DurableSessionContext<'_>> {
-        if !self.is_durable() {
-            return None;
-        }
-        Some(DurableSessionContext {
-            session_id: self.session_id.as_ref()?,
-            frontier: self.last_durable_seq?,
-        })
-    }
-
-    /// Returns the latest journal sequence acknowledged by the store.
-    pub fn durable_seq(&self) -> Option<Seq> {
-        self.last_durable_seq
-    }
-
-    pub(crate) fn advance_durable_seq(&mut self, seq: Seq) {
-        if let Some(current) = &mut self.last_durable_seq
-            && seq > *current
-        {
-            *current = seq;
-        }
-    }
-
-    /// Installs a lossy candidate using a commit receipt bound to this session.
-    ///
-    /// # Errors
-    /// Rejects the candidate without changing the active context when the
-    /// session is non-durable, the receipt belongs to another session, or the
-    /// receipt predates the current durable frontier.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Stage 1 establishes the commit boundary before the compaction orchestrator consumes it"
-        )
-    )]
-    pub(crate) fn install_compacted_context(
-        &mut self,
-        messages: Vec<Message>,
-        committed: CommittedCompaction,
-    ) -> Result<(), SessionMutationError> {
-        if !self.is_durable() {
-            return Err(SessionMutationError::NonDurable);
-        }
-        let current = self
-            .last_durable_seq
-            .ok_or(SessionMutationError::NonDurable)?;
-        let session_id = self
-            .session_id
-            .as_ref()
-            .ok_or(SessionMutationError::NonDurable)?;
-        if committed.session_id() != session_id {
-            return Err(SessionMutationError::SessionMismatch);
-        }
-        let committed_head = committed.journal_head();
-        if committed_head < current {
-            return Err(SessionMutationError::StaleCommit {
-                committed: committed_head.get(),
-                current: current.get(),
-            });
-        }
-        self.messages = messages;
-        self.message_journal_seqs = vec![None; self.messages.len()];
-        self.last_durable_seq = Some(committed_head);
-        Ok(())
-    }
-
-    pub fn mark_persistence_failed(&mut self, reason: impl Into<String>) {
-        self.non_durable = true;
-        if self.persistence_error.is_none() {
-            self.persistence_error = Some(format!("session persistence failed: {}", reason.into()));
-        }
-    }
-
-    /// Hands out a session-persistence failure once (take-and-clear), so
-    /// the runner can surface exactly one warning per failure.
-    pub(crate) fn take_persistence_error(&mut self) -> Option<String> {
-        self.persistence_error.take()
     }
 
     /// The session's permission state (mode + grants).
@@ -251,11 +150,69 @@ impl AgentSession {
     }
 
     pub(crate) fn push_with_journal_seq(&mut self, message: Message, journal_seq: Option<Seq>) {
+        self.push_with_lineage(message, journal_seq, false);
+    }
+
+    pub(crate) fn push_human_with_journal_seq(
+        &mut self,
+        message: Message,
+        journal_seq: Option<Seq>,
+    ) {
+        self.push_with_lineage(message, journal_seq, true);
+    }
+
+    pub(crate) fn push_tool_result_with_journal_seq(
+        &mut self,
+        message: Message,
+        journal_seq: Option<Seq>,
+        retention: ToolResultRetention,
+    ) {
         if let Some(seq) = journal_seq {
             self.advance_durable_seq(seq);
         }
         self.messages.push(message);
-        self.message_journal_seqs.push(journal_seq);
+        self.message_lineage.push(
+            MessageLineage::appended(journal_seq, false).with_tool_result_retention(retention),
+        );
+    }
+
+    fn push_with_lineage(
+        &mut self,
+        message: Message,
+        journal_seq: Option<Seq>,
+        human_authored: bool,
+    ) {
+        if let Some(seq) = journal_seq {
+            self.advance_durable_seq(seq);
+        }
+        self.messages.push(message);
+        self.message_lineage
+            .push(MessageLineage::appended(journal_seq, human_authored));
+    }
+
+    /// Returns provenance aligned one-for-one with [`Self::messages`].
+    pub(crate) fn message_lineage(&self) -> &[MessageLineage] {
+        &self.message_lineage
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn active_summary(&self) -> Option<&ContinuitySummary> {
+        match self.active_summary.as_ref() {
+            Some(active) => Some(active.summary()),
+            None => None,
+        }
+    }
+
+    pub(crate) const fn active_summary_record(&self) -> Option<&ActiveSummary> {
+        self.active_summary.as_ref()
+    }
+
+    /// Returns only indices marked at the direct human-input boundary.
+    pub(crate) fn trusted_human_message_indices(&self) -> impl Iterator<Item = usize> + '_ {
+        self.message_lineage
+            .iter()
+            .enumerate()
+            .filter_map(|(index, lineage)| lineage.human_authored().then_some(index))
     }
 
     /// Hands out the next event sequence number, then advances. Starts at `0`.
@@ -268,20 +225,6 @@ impl AgentSession {
     pub(crate) fn is_empty(&self) -> bool {
         self.messages.is_empty()
     }
-}
-
-/// Prevents active-context replacement across an unproven durability boundary.
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub(crate) enum SessionMutationError {
-    /// The session lacks a provably complete durable journal.
-    #[error("cannot replace active context for a non-durable session")]
-    NonDurable,
-    /// The receipt cannot be reused across sessions.
-    #[error("compaction receipt belongs to a different session")]
-    SessionMismatch,
-    /// The receipt predates the current durable frontier.
-    #[error("compaction commit {committed} is older than durable journal head {current}")]
-    StaleCommit { committed: i64, current: i64 },
 }
 
 #[cfg(test)]

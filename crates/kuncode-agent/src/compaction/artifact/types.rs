@@ -5,9 +5,10 @@ use thiserror::Error;
 use crate::{
     compaction::protocol::ProtocolGroup,
     session_store::{
-        Checkpoint, CommittedArtifact, JournalEntry, NewToolArtifact, Seq, SessionId, SessionStore,
+        CommittedArtifact, JournalEntry, NewToolArtifact, Seq, SessionId, SessionStore,
         SessionStoreError,
     },
+    tool::ToolResultRetention,
 };
 
 /// Exact source position for one artifact-pass decision.
@@ -50,15 +51,6 @@ impl ArtifactTokenCounterError {
 /// Narrow durable-write seam used by the deterministic spill pass.
 #[async_trait]
 pub trait ArtifactStore: Send + Sync {
-    /// Reads the newest active-context baseline for checkpoint-aware replay.
-    ///
-    /// # Errors
-    /// Returns [`SessionStoreError`] when the durable checkpoint cannot be read.
-    async fn latest_checkpoint(
-        &self,
-        session: &SessionId,
-    ) -> Result<Option<Checkpoint>, SessionStoreError>;
-
     /// Reads the authoritative journal before any lossy candidate is produced.
     ///
     /// # Errors
@@ -87,13 +79,6 @@ impl<T> ArtifactStore for T
 where
     T: SessionStore + ?Sized,
 {
-    async fn latest_checkpoint(
-        &self,
-        session: &SessionId,
-    ) -> Result<Option<Checkpoint>, SessionStoreError> {
-        SessionStore::latest_checkpoint(self, session).await
-    }
-
     async fn replay(
         &self,
         session: &SessionId,
@@ -180,6 +165,7 @@ pub struct BelowThresholdArtifact {
     tokens: u64,
     source_hash: String,
     source_journal_seq: Option<Seq>,
+    retention: ToolResultRetention,
 }
 
 impl BelowThresholdArtifact {
@@ -189,6 +175,7 @@ impl BelowThresholdArtifact {
         tokens: u64,
         source_hash: String,
         source_journal_seq: Option<Seq>,
+        retention: ToolResultRetention,
     ) -> Self {
         Self {
             location,
@@ -196,6 +183,7 @@ impl BelowThresholdArtifact {
             tokens,
             source_hash,
             source_journal_seq,
+            retention,
         }
     }
 
@@ -217,6 +205,10 @@ impl BelowThresholdArtifact {
     /// Returns durable per-message lineage when the journal exposes it.
     pub const fn source_journal_seq(&self) -> Option<Seq> {
         self.source_journal_seq
+    }
+
+    pub(crate) const fn retention(&self) -> ToolResultRetention {
+        self.retention
     }
 
     pub(crate) fn tool_call_id(&self) -> &str {

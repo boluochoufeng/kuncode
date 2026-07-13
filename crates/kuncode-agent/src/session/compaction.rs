@@ -7,9 +7,10 @@ use super::AgentSession;
 use crate::{
     compaction::{
         artifact::{ArtifactSpillOutcome, ArtifactSpillResult},
-        protocol::ProtocolGroup,
+        protocol::{ProtocolGroup, flatten_groups},
         selection::CompactionSelection,
-        summary::{ContinuitySummary, SummaryError, SummaryRequest},
+        slimming::ToolResultSlimmingResult,
+        summary::{ContinuitySummary, SummaryError, SummaryRequest, project_summary_message},
     },
     session_store::Seq,
 };
@@ -73,13 +74,23 @@ impl AgentSession {
         artifacts: &ArtifactSpillResult,
         selection: &CompactionSelection,
     ) -> Result<SummaryRequest, SummarySourceError> {
-        let binding = self.bind_summary_source(artifacts, selection)?;
+        let binding = self.bind_summary_source(artifacts, artifacts.groups(), selection)?;
+        Ok(SummaryRequest::from_bound_source(&binding)?)
+    }
+
+    pub(crate) fn issue_slimmed_summary_request(
+        &self,
+        slimmed: &ToolResultSlimmingResult<'_>,
+        selection: &CompactionSelection,
+    ) -> Result<SummaryRequest, SummarySourceError> {
+        let binding = self.bind_summary_source(slimmed.source(), slimmed.groups(), selection)?;
         Ok(SummaryRequest::from_bound_source(&binding)?)
     }
 
     fn bind_summary_source(
         &self,
         artifacts: &ArtifactSpillResult,
+        candidate_groups: &[ProtocolGroup],
         selection: &CompactionSelection,
     ) -> Result<SummarySourceBinding, SummarySourceError> {
         let session_id = self
@@ -92,45 +103,48 @@ impl AgentSession {
         if !self.is_durable()
             || artifacts.session_id() != session_id
             || artifacts.source_frontier() > artifacts.frontier()
-            || source_frontier != artifacts.source_frontier()
+            || (source_frontier != artifacts.source_frontier()
+                && source_frontier != artifacts.frontier())
         {
             return Err(SummarySourceError::SnapshotMismatch);
         }
         let prefix_groups = selection.summarize().len();
         let retained_groups = selection.retain_verbatim().len();
         if prefix_groups == 0
-            || prefix_groups + retained_groups != artifacts.groups().len()
-            || selection.summarize() != &artifacts.groups()[..prefix_groups]
-            || selection.retain_verbatim() != &artifacts.groups()[prefix_groups..]
+            || prefix_groups + retained_groups != candidate_groups.len()
+            || selection.summarize() != &candidate_groups[..prefix_groups]
+            || selection.retain_verbatim() != &candidate_groups[prefix_groups..]
         {
             return Err(SummarySourceError::SnapshotMismatch);
         }
-        let source_messages = flatten(selection.summarize());
+        let mut source_messages = flatten_groups(selection.summarize());
         let source_message_count = source_messages.len();
-        if flatten(artifacts.groups()).len() != self.messages.len()
-            || source_message_count > self.message_journal_seqs.len()
+        if flatten_groups(artifacts.groups()).len() != self.messages.len()
+            || self.messages.len() != self.message_lineage.len()
+            || source_message_count > self.message_lineage.len()
         {
             return Err(SummarySourceError::SnapshotMismatch);
         }
-        let mut source_seqs = Vec::with_capacity(source_message_count);
-        for (message_index, source) in self.message_journal_seqs[..source_message_count]
+        let mut source_seq_start = None;
+        let mut source_seq_end = None;
+        let mut allowed_artifact_refs = BTreeSet::new();
+        for (message_index, lineage) in self.message_lineage[..source_message_count]
             .iter()
             .enumerate()
         {
-            source_seqs.push(
-                source.ok_or(SummarySourceError::MissingMessageProvenance { message_index })?,
+            let coverage = lineage
+                .coverage()
+                .ok_or(SummarySourceError::MissingMessageProvenance { message_index })?;
+            source_seq_start = Some(source_seq_start.map_or(coverage.start(), |current: Seq| {
+                current.min(coverage.start())
+            }));
+            source_seq_end = Some(
+                source_seq_end.map_or(coverage.end(), |current: Seq| current.max(coverage.end())),
             );
+            allowed_artifact_refs.extend(lineage.artifact_refs().iter().cloned());
         }
-        let source_seq_start = *source_seqs
-            .first()
-            .ok_or(SummarySourceError::SnapshotMismatch)?;
-        let source_seq_end = *source_seqs
-            .last()
-            .ok_or(SummarySourceError::SnapshotMismatch)?;
-        let allowed_artifact_refs = artifacts
-            .outcomes()
-            .iter()
-            .filter_map(|outcome| match outcome {
+        allowed_artifact_refs.extend(artifacts.outcomes().iter().filter_map(
+            |outcome| match outcome {
                 ArtifactSpillOutcome::Spilled {
                     location,
                     artifact_id,
@@ -139,30 +153,26 @@ impl AgentSession {
                 ArtifactSpillOutcome::BelowThreshold(_)
                 | ArtifactSpillOutcome::Failed { .. }
                 | ArtifactSpillOutcome::Spilled { .. } => None,
-            })
-            .collect();
+            },
+        ));
+        let existing_summary = self
+            .active_summary
+            .as_ref()
+            .map(|active| active.summary().clone());
+        if let Some(previous) = existing_summary.as_ref() {
+            let projected = project_summary_message(previous)
+                .map_err(|error| SummaryError::PromptEncoding(error.to_string()))?;
+            if source_messages.first() == Some(&projected) {
+                source_messages.remove(0);
+            }
+        }
         Ok(SummarySourceBinding {
-            existing_summary: None,
+            existing_summary,
             source_messages,
-            source_seq_start,
-            source_seq_end,
+            source_seq_start: source_seq_start.ok_or(SummarySourceError::SnapshotMismatch)?,
+            source_seq_end: source_seq_end.ok_or(SummarySourceError::SnapshotMismatch)?,
             durable_head: artifacts.frontier(),
             allowed_artifact_refs,
         })
     }
-}
-
-fn flatten(groups: &[ProtocolGroup]) -> Vec<Message> {
-    groups
-        .iter()
-        .flat_map(|group| match group {
-            ProtocolGroup::Message(message) => vec![message.clone()],
-            ProtocolGroup::ToolExchange { assistant, results } => {
-                let mut messages = Vec::with_capacity(results.len() + 1);
-                messages.push(assistant.clone());
-                messages.extend(results.iter().cloned());
-                messages
-            }
-        })
-        .collect()
 }

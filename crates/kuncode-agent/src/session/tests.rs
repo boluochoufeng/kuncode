@@ -1,4 +1,7 @@
 use super::*;
+use crate::session_store::CommittedCompaction;
+
+mod lineage;
 
 #[test]
 fn push_user_routes_through_push() {
@@ -45,8 +48,9 @@ fn compacted_context_requires_a_current_commit_receipt() {
     session.advance_durable_seq(Seq::new(3));
     session.push_user("original");
 
-    let receipt = CommittedCompaction::new(SessionId::new("session-a"), Seq::new(1), Seq::new(2));
-    let result = session.install_compacted_context(vec![Message::user("summary")], receipt);
+    let messages = vec![Message::user("summary")];
+    let receipt = committed_compaction("session-a", 1, 2, &messages);
+    let result = session.install_compacted_context(prepared(messages), receipt);
 
     assert!(matches!(
         result,
@@ -62,9 +66,10 @@ fn persistence_failure_prevents_compacted_context_installation() {
     session.advance_durable_seq(Seq::new(1));
     session.push_user("original");
     session.mark_persistence_failed("write failed");
-    let receipt = CommittedCompaction::new(SessionId::new("session-a"), Seq::new(2), Seq::new(3));
+    let messages = vec![Message::user("summary")];
+    let receipt = committed_compaction("session-a", 2, 3, &messages);
 
-    let result = session.install_compacted_context(vec![Message::user("summary")], receipt);
+    let result = session.install_compacted_context(prepared(messages), receipt);
 
     assert_eq!(result, Err(SessionMutationError::NonDurable));
     assert_eq!(session.messages(), &[Message::user("original")]);
@@ -77,9 +82,10 @@ fn committed_compaction_installs_context_and_advances_frontier() {
     session.attach_session_id(SessionId::new("session-a"));
     session.advance_durable_seq(Seq::new(1));
     session.push_user("original");
-    let receipt = CommittedCompaction::new(SessionId::new("session-a"), Seq::new(2), Seq::new(3));
+    let messages = vec![Message::user("summary")];
+    let receipt = committed_compaction("session-a", 2, 3, &messages);
 
-    let result = session.install_compacted_context(vec![Message::user("summary")], receipt);
+    let result = session.install_compacted_context(prepared(messages), receipt);
 
     assert_eq!(result, Ok(()));
     assert_eq!(session.messages(), &[Message::user("summary")]);
@@ -91,9 +97,10 @@ fn compaction_receipt_cannot_cross_session_boundaries() {
     let mut session = AgentSession::new();
     session.attach_session_id(SessionId::new("session-a"));
     session.push_user("original");
-    let receipt = CommittedCompaction::new(SessionId::new("session-b"), Seq::new(1), Seq::new(2));
+    let messages = vec![Message::user("summary")];
+    let receipt = committed_compaction("session-b", 1, 2, &messages);
 
-    let result = session.install_compacted_context(vec![Message::user("summary")], receipt);
+    let result = session.install_compacted_context(prepared(messages), receipt);
 
     assert_eq!(result, Err(SessionMutationError::SessionMismatch));
     assert_eq!(session.messages(), &[Message::user("original")]);
@@ -119,4 +126,25 @@ fn persistence_failure_is_reported_once() {
     );
     assert!(session.take_persistence_error().is_none());
     assert!(!session.is_durable());
+}
+
+fn committed_compaction(
+    session_id: &str,
+    compaction_seq: i64,
+    journal_head: i64,
+    messages: &[Message],
+) -> CommittedCompaction {
+    let output_hash = crate::session_store::active_messages_sha256(messages)
+        .expect("test messages should encode");
+    CommittedCompaction::new(
+        SessionId::new(session_id),
+        Seq::new(compaction_seq),
+        Seq::new(journal_head),
+        output_hash,
+    )
+}
+
+fn prepared(messages: Vec<Message>) -> PreparedActiveContext {
+    let lineage = vec![MessageLineage::appended(None, false); messages.len()];
+    PreparedActiveContext::new(messages, lineage, None).expect("fixture should be aligned")
 }

@@ -92,7 +92,12 @@ pub fn view(kind: EventKind) -> Option<ViewEffect> {
         | EventKind::TextDelta { .. }
         | EventKind::ReasoningDelta { .. }
         | EventKind::Assistant { .. }
-        | EventKind::Error { .. } => None,
+        | EventKind::Error { .. }
+        | EventKind::CompactionStarted { .. }
+        | EventKind::CompactionCompleted { .. }
+        | EventKind::CompactionSkipped { .. }
+        | EventKind::CompactionObserved { .. }
+        | EventKind::CompactionFailed { .. } => None,
     }
 }
 

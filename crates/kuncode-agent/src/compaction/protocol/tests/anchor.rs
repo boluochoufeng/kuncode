@@ -30,8 +30,7 @@ fn anchor_rejects_index_that_is_not_human_text() {
     let messages = vec![result_message(&[("one", None)], None)];
 
     let error = current_human_request_anchor(&messages, &[HumanMessageIndex(0)], 1)
-        .err()
-        .expect("tool result is not human text");
+        .expect_err("tool result is not human text");
 
     assert_eq!(
         error,

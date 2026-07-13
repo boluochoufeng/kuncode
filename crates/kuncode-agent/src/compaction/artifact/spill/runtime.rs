@@ -17,6 +17,7 @@ use super::super::{
 use crate::{
     compaction::protocol::ProtocolGroup,
     session_store::{Seq, SessionId},
+    tool::ToolResultRetention,
 };
 
 mod persist;
@@ -98,7 +99,10 @@ impl<'a> SpillRuntime<'a> {
                 result_message_index,
                 content_index,
             };
-            let source_journal_seq = self.result_message_seq(location);
+            let Some(source_journal_seq) = self.result_message_seq(location)? else {
+                continue;
+            };
+            let retention = self.result_message_retention(location)?;
             let Some(tool_name) = call_names.get(result.id.as_str()).map(String::as_str) else {
                 failed(
                     pass,
@@ -111,7 +115,14 @@ impl<'a> SpillRuntime<'a> {
                 continue;
             };
             if let Some(marker) = self
-                .spill_one(result, tool_name, location, source_journal_seq, pass)
+                .spill_one(
+                    result,
+                    tool_name,
+                    location,
+                    source_journal_seq,
+                    retention,
+                    pass,
+                )
                 .await?
             {
                 *result = marker;
@@ -128,7 +139,8 @@ impl<'a> SpillRuntime<'a> {
         result: &ToolResult,
         tool_name: &str,
         location: ArtifactResultLocation,
-        source_journal_seq: Option<Seq>,
+        source_journal_seq: Seq,
+        retention: ToolResultRetention,
         pass: &mut ArtifactSpillResult,
     ) -> Result<Option<ToolResult>, ArtifactSpillError> {
         let tokens = match self.counter.count(result).await {
@@ -160,7 +172,8 @@ impl<'a> SpillRuntime<'a> {
                     result.id.clone(),
                     tokens,
                     source_hash,
-                    source_journal_seq,
+                    Some(source_journal_seq),
+                    retention,
                 ),
             ));
             return Ok(None);
@@ -168,11 +181,32 @@ impl<'a> SpillRuntime<'a> {
         spill_large_result(self, result, tool_name, location, tokens, pass).await
     }
 
-    fn result_message_seq(&self, location: ArtifactResultLocation) -> Option<Seq> {
-        self.group_message_starts
+    fn result_message_seq(
+        &self,
+        location: ArtifactResultLocation,
+    ) -> Result<Option<Seq>, ArtifactSpillError> {
+        let Some(message_index) = self
+            .group_message_starts
             .get(location.group_index)
             .and_then(|start| start.checked_add(1 + location.result_message_index))
-            .and_then(|index| self.audit.message_seq(index))
+        else {
+            return Err(ArtifactSpillError::InvalidLineage);
+        };
+        Ok(self.audit.message_seq(message_index))
+    }
+
+    fn result_message_retention(
+        &self,
+        location: ArtifactResultLocation,
+    ) -> Result<ToolResultRetention, ArtifactSpillError> {
+        let Some(message_index) = self
+            .group_message_starts
+            .get(location.group_index)
+            .and_then(|start| start.checked_add(1 + location.result_message_index))
+        else {
+            return Err(ArtifactSpillError::InvalidLineage);
+        };
+        Ok(self.audit.message_retention(message_index))
     }
 }
 

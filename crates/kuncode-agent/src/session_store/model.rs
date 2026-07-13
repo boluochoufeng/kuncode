@@ -7,6 +7,13 @@ use serde_json::Value;
 
 use super::{SessionStoreError, dto, project_slug};
 
+mod compaction;
+
+pub use compaction::{
+    CommittedCompaction, CompactionEvent, CompactionMetadata, CompactionPassKind, CompactionReason,
+    NewCompactionCommit,
+};
+
 /// Stable durable-session identifier that isolates every journal and checkpoint.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionId(String);
@@ -155,9 +162,9 @@ pub struct NewCheckpoint {
     pub active_messages: Vec<Message>,
     /// Structured summary and schema version, absent without semantic summarization.
     pub summary_json: Option<Value>,
-    /// Model that generated the semantic summary, absent for deterministic checkpoints.
+    /// Model that generated the active summary, absent without summary provenance.
     pub model: Option<String>,
-    /// Provider token usage for summarization, absent when unavailable.
+    /// Provider usage for the active summary, absent without summary provenance.
     pub token_usage_json: Option<Value>,
 }
 
@@ -180,93 +187,4 @@ pub struct Checkpoint {
     pub model: Option<String>,
     /// Provider token usage for summarization.
     pub token_usage_json: Option<Value>,
-}
-
-/// Versioned compaction audit fact written to the journal.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CompactionEvent {
-    input_hash: String,
-    source_seq_start: Seq,
-    source_seq_end: Seq,
-}
-
-impl CompactionEvent {
-    /// Binds candidate input to its contiguous durable source range.
-    pub fn new(input_hash: impl Into<String>, source_seq_start: Seq, source_seq_end: Seq) -> Self {
-        Self {
-            input_hash: input_hash.into(),
-            source_seq_start,
-            source_seq_end,
-        }
-    }
-
-    /// Returns the stable input digest used to reject stale candidates.
-    pub fn input_hash(&self) -> &str {
-        &self.input_hash
-    }
-
-    /// Returns the first journal sequence covered by the candidate.
-    pub const fn source_seq_start(&self) -> Seq {
-        self.source_seq_start
-    }
-
-    /// Returns the last journal sequence covered by the candidate.
-    pub const fn source_seq_end(&self) -> Seq {
-        self.source_seq_end
-    }
-}
-
-/// Complete input for an atomic compaction commit.
-#[derive(Clone, Debug)]
-pub struct NewCompactionCommit {
-    /// Candidate's session, which must match the checkpoint.
-    pub session_id: SessionId,
-    /// Journal head observed during candidate generation and used as transaction CAS.
-    pub expected_journal_head: Seq,
-    /// Compaction audit fact appended to the journal.
-    pub event: CompactionEvent,
-    /// Active-context checkpoint installed in the compaction event's transaction.
-    pub checkpoint: NewCheckpoint,
-}
-
-/// Receipt proving the compaction event and checkpoint committed atomically.
-#[derive(Debug, PartialEq, Eq)]
-pub struct CommittedCompaction {
-    session_id: SessionId,
-    compaction_seq: Seq,
-    checkpoint_seq: Seq,
-}
-
-impl CommittedCompaction {
-    pub(crate) const fn new(
-        session_id: SessionId,
-        compaction_seq: Seq,
-        checkpoint_seq: Seq,
-    ) -> Self {
-        Self {
-            session_id,
-            compaction_seq,
-            checkpoint_seq,
-        }
-    }
-
-    /// Returns the receipt-bound session to prevent cross-session candidate installation.
-    pub fn session_id(&self) -> &SessionId {
-        &self.session_id
-    }
-
-    /// Returns the compaction audit event's journal sequence.
-    pub const fn compaction_seq(&self) -> Seq {
-        self.compaction_seq
-    }
-
-    /// Returns the `checkpoint_ref` journal sequence.
-    pub const fn checkpoint_seq(&self) -> Seq {
-        self.checkpoint_seq
-    }
-
-    /// Returns the journal head after the atomic transaction completes.
-    pub const fn journal_head(&self) -> Seq {
-        self.checkpoint_seq
-    }
 }

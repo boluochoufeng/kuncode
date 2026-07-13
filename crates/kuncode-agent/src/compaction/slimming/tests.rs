@@ -19,6 +19,8 @@ use crate::{
     tool::ToolOutput,
 };
 
+#[path = "tests/binding.rs"]
+mod binding;
 #[path = "tests/boundaries.rs"]
 mod boundaries;
 #[path = "tests/identity.rs"]

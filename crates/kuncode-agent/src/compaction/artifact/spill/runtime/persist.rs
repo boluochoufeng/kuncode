@@ -69,6 +69,7 @@ pub(super) async fn spill_large_result(
             ));
         }
     };
+    let expected_artifact = artifact.clone();
     let receipt = match runtime
         .store
         .put(runtime.session, pass.frontier, artifact)
@@ -77,6 +78,12 @@ pub(super) async fn spill_large_result(
         Ok(receipt) => receipt,
         Err(crate::session_store::SessionStoreError::JournalHeadConflict { expected, actual }) => {
             return Err(ArtifactSpillError::JournalHeadConflict { expected, actual });
+        }
+        Err(crate::session_store::SessionStoreError::CommitOutcomeUnknown {
+            operation,
+            message,
+        }) => {
+            return Err(ArtifactSpillError::PersistenceOutcomeUnknown { operation, message });
         }
         Err(error) => {
             return Ok(failed(
@@ -87,6 +94,9 @@ pub(super) async fn spill_large_result(
             ));
         }
     };
+    if !receipt.proves(runtime.session, &expected_artifact) {
+        return Err(ArtifactSpillError::ReceiptMismatch);
+    }
     pass.frontier = pass.frontier.max(receipt.journal_seq());
     pass.outcomes.push(ArtifactSpillOutcome::Spilled {
         location,

@@ -43,7 +43,9 @@ pub(super) async fn write(
     let now = timestamp();
     insert(&mut tx, &checkpoint, seq, &now).await?;
     touch_session(&mut tx, &checkpoint.session_id, &now).await?;
-    tx.commit().await?;
+    tx.commit()
+        .await
+        .map_err(|error| SessionStoreError::commit_outcome_unknown("write checkpoint", error))?;
     Ok(seq)
 }
 
@@ -134,13 +136,22 @@ fn validate_checkpoint(
         )));
     }
 
-    match (checkpoint.source_seq_start, checkpoint.source_seq_end) {
-        (None, None) => Ok(()),
-        (Some(start), Some(end)) => {
+    match (
+        checkpoint.summary_json.as_ref(),
+        checkpoint.source_seq_start,
+        checkpoint.source_seq_end,
+        checkpoint.model.as_deref(),
+        checkpoint.token_usage_json.as_ref(),
+    ) {
+        (None, None, None, None, None) => Ok(()),
+        (Some(_), Some(start), Some(end), Some(model), Some(_)) if !model.is_empty() => {
             validate_source_range(start, end, checkpoint.covers_through_seq)
         }
-        _ => Err(invalid_checkpoint(
-            "source_seq_start and source_seq_end must be provided together",
+        (None, _, _, _, _) => Err(invalid_checkpoint(
+            "deterministic checkpoint cannot carry summary provenance",
+        )),
+        (Some(_), _, _, _, _) => Err(invalid_checkpoint(
+            "summary checkpoint requires source range, model, and token usage",
         )),
     }
 }

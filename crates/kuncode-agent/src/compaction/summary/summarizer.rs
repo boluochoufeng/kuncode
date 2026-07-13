@@ -24,6 +24,9 @@ pub struct GeneratedSummary {
 /// Failures produced by the isolated semantic-summary call.
 #[derive(Debug, Error)]
 pub enum SummarizerError {
+    /// The caller cancelled before the isolated model call completed.
+    #[error("summary completion was cancelled")]
+    Cancelled,
     /// The configured generation budget cannot be represented by providers.
     #[error("summary output token budget {actual} must be within 1..={max}")]
     InvalidOutputBudget {
@@ -61,9 +64,10 @@ impl SummarizerError {
             Self::InvalidResponseShape { usage } | Self::InvalidSummary { usage, .. } => {
                 Some(*usage)
             }
-            Self::InvalidOutputBudget { .. } | Self::InvalidRequest(_) | Self::Completion(_) => {
-                None
-            }
+            Self::Cancelled
+            | Self::InvalidOutputBudget { .. }
+            | Self::InvalidRequest(_)
+            | Self::Completion(_) => None,
         }
     }
 }

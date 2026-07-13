@@ -13,7 +13,7 @@ use crate::{
     hook::{PostToolCx, PostToolOutcome},
     observer::{EventKind, ToolFailure},
     session::AgentSession,
-    tool::{ToolContext, ToolErrorKind, ToolOutput},
+    tool::{ToolContext, ToolErrorKind, ToolOutput, ToolResultRetention},
 };
 
 use super::{AgentRunner, CallOutcome, PendingToolCall, cancellation::cancellable};
@@ -49,11 +49,12 @@ where
                 .gated_call(session, iteration, &id, &name, arguments, &ctx)
                 .await
             {
-                Ok(CallOutcome { output, executed }) => {
+                Ok(outcome) => {
                     // Snapshot the output for PostToolUse before record_result
                     // consumes it — only when a hook could actually use it.
-                    let post_output = (executed && !self.hooks.is_empty()).then(|| output.clone());
-                    self.record_result(session, iteration, id, call_id, &name, output)
+                    let post_output = (outcome.executed && !self.hooks.is_empty())
+                        .then(|| outcome.output.clone());
+                    self.record_result(session, iteration, id, call_id, &name, outcome)
                         .await;
 
                     // The plan changed iff the generation advanced (a validation
@@ -101,8 +102,19 @@ where
                         }
                         _ => interrupted_tool_output(),
                     };
-                    self.record_result(session, iteration, id, call_id, &name, failed)
-                        .await;
+                    self.record_result(
+                        session,
+                        iteration,
+                        id,
+                        call_id,
+                        &name,
+                        CallOutcome {
+                            output: failed,
+                            executed: false,
+                            retention: ToolResultRetention::Verbatim,
+                        },
+                    )
+                    .await;
                     self.pair_unpaired(session, iteration, &tool_calls[index + 1..])
                         .await;
                     // Buffered PostToolUse feedback is dropped here, same as the
@@ -141,7 +153,11 @@ where
                 call.id.clone(),
                 call.call_id.clone(),
                 &call.name,
-                interrupted_tool_output(),
+                CallOutcome {
+                    output: interrupted_tool_output(),
+                    executed: false,
+                    retention: ToolResultRetention::Verbatim,
+                },
             )
             .await;
         }
@@ -163,8 +179,11 @@ where
         id: String,
         call_id: Option<String>,
         tool: &str,
-        output: ToolOutput,
+        outcome: CallOutcome,
     ) {
+        let CallOutcome {
+            output, retention, ..
+        } = outcome;
         self.emit(
             session,
             Some(iteration),
@@ -176,9 +195,10 @@ where
                 error: output.error.as_ref().map(ToolFailure::from),
             },
         );
-        self.push_message(
+        self.push_tool_result_message(
             session,
             tool_result_message(id, call_id, output.to_model_content()),
+            retention,
         )
         .await;
     }

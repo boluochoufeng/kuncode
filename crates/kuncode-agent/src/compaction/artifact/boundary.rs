@@ -4,12 +4,14 @@ use thiserror::Error;
 use crate::{
     compaction::protocol::{ProtectedRecentTail, ProtocolGroup, group_messages},
     session::{AgentSession, DurableSessionContext},
+    tool::ToolResultRetention,
 };
 
 /// Validated immutable inputs for one spill pass.
 pub struct ArtifactSpillInput<'a> {
     pub(super) groups: &'a [ProtocolGroup],
-    pub(super) messages: Vec<Message>,
+    pub(super) source_message_seqs: Vec<Option<crate::session_store::Seq>>,
+    pub(super) source_message_retentions: Vec<ToolResultRetention>,
     pub(super) protected_start: usize,
     pub(super) durable: DurableSessionContext<'a>,
 }
@@ -37,6 +39,9 @@ impl<'a> ArtifactSpillInput<'a> {
         if flattened != session.messages() {
             return Err(ArtifactSpillError::ActiveSessionMismatch);
         }
+        if session.message_lineage().len() != flattened.len() {
+            return Err(ArtifactSpillError::InvalidLineage);
+        }
         match group_messages(&flattened) {
             Ok(regrouped) if regrouped == groups => {}
             Ok(_) => return Err(ArtifactSpillError::InvalidProtocolGroups),
@@ -51,7 +56,16 @@ impl<'a> ArtifactSpillInput<'a> {
         }
         Ok(Self {
             groups,
-            messages: flattened,
+            source_message_seqs: session
+                .message_lineage()
+                .iter()
+                .map(crate::session::MessageLineage::verbatim_journal_seq)
+                .collect(),
+            source_message_retentions: session
+                .message_lineage()
+                .iter()
+                .map(crate::session::MessageLineage::tool_result_retention)
+                .collect(),
             protected_start: protected.group_range.start,
             durable,
         })
@@ -76,6 +90,9 @@ pub enum ArtifactSpillError {
     /// The supplied history contains an open or malformed exchange.
     #[error("artifact spill protocol is invalid: {0}")]
     InvalidProtocol(String),
+    /// Active messages and trusted provenance no longer align one-for-one.
+    #[error("artifact spill requires aligned active-message lineage")]
+    InvalidLineage,
     /// Journal replay failed before artifact writes were allowed.
     #[error("artifact spill journal audit failed: {0}")]
     JournalAudit(String),
@@ -86,14 +103,6 @@ pub enum ArtifactSpillError {
         frontier: i64,
         /// Journal head or newer fact observed during replay.
         actual: i64,
-    },
-    /// Active and durable journal message counts differ at the claimed frontier.
-    #[error("active context has {active} messages but durable journal has {durable}")]
-    JournalMessageCountMismatch {
-        /// Messages reconstructed from current protocol groups.
-        active: usize,
-        /// Messages rebuilt from checkpoint and journal facts.
-        durable: usize,
     },
     /// A journal message differs from active context at the same position.
     #[error("active context differs from durable journal at message {index}")]
@@ -109,6 +118,17 @@ pub enum ArtifactSpillError {
         /// Journal head observed by the artifact transaction.
         actual: i64,
     },
+    /// A durable artifact write may have committed without returning a receipt.
+    #[error("artifact persistence outcome is unknown after {operation}: {message}")]
+    PersistenceOutcomeUnknown {
+        /// Store operation that attempted the uncertain commit.
+        operation: &'static str,
+        /// Provider-safe storage failure context.
+        message: String,
+    },
+    /// A store returned a receipt that does not prove the requested artifact write.
+    #[error("artifact persistence returned a receipt for a different session or payload")]
+    ReceiptMismatch,
 }
 
 fn flatten(groups: &[ProtocolGroup]) -> Vec<Message> {

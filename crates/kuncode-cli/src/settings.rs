@@ -1,19 +1,26 @@
-//! Loads `.kuncode/settings.json` into a permission policy and initial mode.
+//! Loads `.kuncode/settings.json` into permission and automatic-compaction policy.
 //!
 //! The file shape mirrors Claude Code's `permissions` block. Rules are parsed
 //! with [`RuleOrigin::ProjectSettings`] so denials remain explainable.
 
-use std::path::Path;
+use std::{num::NonZeroU32, path::Path};
 
-use kuncode_agent::permission::{PermissionMode, PermissionPolicy, Rule, RuleOrigin, parse_rule};
+use kuncode_agent::{
+    compaction::budget::{CompactionConfig, CompactionMode},
+    permission::{PermissionMode, PermissionPolicy, Rule, RuleOrigin, parse_rule},
+    runner::{AgentCompactionConfig, AgentCompactionConfigError, AgentConfig},
+};
 use serde::Deserialize;
 
 const SETTINGS_PATH: &str = ".kuncode/settings.json";
+const DEFAULT_SAFETY_MARGIN: u64 = 4_096;
+const DEFAULT_SUMMARY_MAX_TOKENS: u64 = 4_096;
 
 #[derive(Debug, Default, Deserialize)]
 struct SettingsFile {
     #[serde(default)]
     permissions: PermissionsSection,
+    compaction: Option<CompactionSection>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -28,13 +35,47 @@ struct PermissionsSection {
     default_mode: Option<String>,
 }
 
-/// Permission settings read from the project file.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CompactionSection {
+    mode: Option<String>,
+    context_limit: Option<u64>,
+    reserved_output: Option<u64>,
+    safety_margin: Option<u64>,
+    summary_max_tokens: Option<u64>,
+    target_ratio: Option<f64>,
+    soft_threshold: Option<f64>,
+    hard_threshold: Option<f64>,
+    recent_ratio: Option<f64>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ProjectCompaction {
+    policy: CompactionConfig,
+    summary_max_tokens: NonZeroU32,
+}
+
+impl ProjectCompaction {
+    pub(crate) fn into_runtime(
+        self,
+        model_id: &str,
+    ) -> Result<AgentCompactionConfig, AgentCompactionConfigError> {
+        AgentCompactionConfig::new(
+            self.policy,
+            model_id,
+            u64::from(self.summary_max_tokens.get()),
+        )
+    }
+}
+
+/// Runtime settings read from the project file.
 #[derive(Debug, Default)]
 pub struct ProjectSettings {
     /// Rules contributed by the file (origin = `ProjectSettings`).
     pub policy: PermissionPolicy,
     /// Default mode requested by the file, if any.
     pub default_mode: Option<PermissionMode>,
+    pub(crate) compaction: Option<ProjectCompaction>,
 }
 
 /// Loads `.kuncode/settings.json` under `root`.
@@ -63,11 +104,68 @@ pub fn load_project_settings(root: &Path) -> Result<ProjectSettings, SettingsErr
         Some(name) => Some(PermissionMode::parse(&name).ok_or(SettingsError::Mode(name))?),
         None => None,
     };
+    let compaction = parse_compaction(file.compaction)?;
 
     Ok(ProjectSettings {
         policy,
         default_mode,
+        compaction,
     })
+}
+
+fn parse_compaction(
+    section: Option<CompactionSection>,
+) -> Result<Option<ProjectCompaction>, SettingsError> {
+    let Some(section) = section else {
+        return Ok(None);
+    };
+    let mode = match section.mode.as_deref().unwrap_or("disabled") {
+        "disabled" => return Ok(None),
+        "shadow" => CompactionMode::Shadow,
+        "enabled" => CompactionMode::Enabled,
+        name => return Err(SettingsError::CompactionMode(name.to_string())),
+    };
+    let context_limit = section
+        .context_limit
+        .ok_or(SettingsError::CompactionContextLimit)?;
+    let reserved_output = match section.reserved_output {
+        Some(value) => value,
+        None => AgentConfig::default().max_tokens.ok_or_else(|| {
+            SettingsError::Compaction("agent default max_tokens is unavailable".to_string())
+        })?,
+    };
+    let policy = CompactionConfig::new(
+        mode,
+        context_limit,
+        reserved_output,
+        section.safety_margin.unwrap_or(DEFAULT_SAFETY_MARGIN),
+    )
+    .map_err(|error| SettingsError::Compaction(error.to_string()))?;
+    let policy = policy
+        .with_ratios(
+            section.target_ratio.unwrap_or(policy.target_ratio()),
+            section.soft_threshold.unwrap_or(policy.soft_threshold()),
+            section.hard_threshold.unwrap_or(policy.hard_threshold()),
+            section.recent_ratio.unwrap_or(policy.recent_ratio()),
+        )
+        .map_err(|error| SettingsError::Compaction(error.to_string()))?;
+    let summary_max_tokens = section
+        .summary_max_tokens
+        .unwrap_or(DEFAULT_SUMMARY_MAX_TOKENS);
+    let summary_max_tokens = u32::try_from(summary_max_tokens)
+        .ok()
+        .and_then(NonZeroU32::new)
+        .ok_or_else(|| {
+            SettingsError::Compaction(format!(
+                "summaryMaxTokens must be within 1..={}, got {summary_max_tokens}",
+                u32::MAX
+            ))
+        })?;
+
+    Ok(Some(ProjectCompaction {
+        policy,
+        summary_max_tokens,
+    }))
 }
 
 fn push_rules(target: &mut Vec<Rule>, rules: &[String]) -> Result<(), SettingsError> {
@@ -86,6 +184,9 @@ pub enum SettingsError {
     Parse(serde_json::Error),
     Rule(String, String),
     Mode(String),
+    CompactionMode(String),
+    CompactionContextLimit,
+    Compaction(String),
 }
 
 impl std::fmt::Display for SettingsError {
@@ -95,6 +196,19 @@ impl std::fmt::Display for SettingsError {
             Self::Parse(err) => write!(f, "failed to parse {SETTINGS_PATH}: {err}"),
             Self::Rule(rule, err) => write!(f, "invalid rule `{rule}` in {SETTINGS_PATH}: {err}"),
             Self::Mode(mode) => write!(f, "invalid defaultMode `{mode}` in {SETTINGS_PATH}"),
+            Self::CompactionMode(mode) => {
+                write!(f, "invalid compaction mode `{mode}` in {SETTINGS_PATH}")
+            }
+            Self::CompactionContextLimit => write!(
+                f,
+                "compaction contextLimit is required for shadow or enabled mode in {SETTINGS_PATH}"
+            ),
+            Self::Compaction(message) => {
+                write!(
+                    f,
+                    "invalid compaction settings in {SETTINGS_PATH}: {message}"
+                )
+            }
         }
     }
 }
@@ -102,66 +216,5 @@ impl std::fmt::Display for SettingsError {
 impl std::error::Error for SettingsError {}
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::{fs, path::PathBuf};
-
-    fn unique_dir(tag: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("kuncode-settings-{}-{tag}", std::process::id()));
-        fs::create_dir_all(dir.join(".kuncode")).expect("temp dir");
-        dir
-    }
-
-    #[test]
-    fn missing_file_is_default_not_error() {
-        let dir = std::env::temp_dir().join(format!("kuncode-absent-{}", std::process::id()));
-        let loaded = load_project_settings(&dir).expect("a missing file is fine");
-        assert!(loaded.policy.deny.is_empty());
-        assert!(loaded.default_mode.is_none());
-    }
-
-    #[test]
-    fn loads_rules_and_mode() {
-        let dir = unique_dir("ok");
-        fs::write(
-            dir.join(".kuncode/settings.json"),
-            r#"{ "permissions": {
-                "allow": ["Read", "Bash(cargo *)"],
-                "deny": ["Bash(curl *)"],
-                "defaultMode": "acceptEdits"
-            } }"#,
-        )
-        .unwrap();
-
-        let loaded = load_project_settings(&dir).expect("loads");
-        // `Read` expands to read_file + glob (2) plus `Bash(cargo *)` (1) = 3.
-        assert_eq!(loaded.policy.allow.len(), 3);
-        assert_eq!(loaded.policy.deny.len(), 1);
-        assert_eq!(loaded.default_mode, Some(PermissionMode::AcceptEdits));
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn malformed_json_is_an_error() {
-        let dir = unique_dir("bad");
-        fs::write(dir.join(".kuncode/settings.json"), "{ not json").unwrap();
-        assert!(load_project_settings(&dir).is_err());
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn bad_rule_is_an_error() {
-        let dir = unique_dir("badrule");
-        fs::write(
-            dir.join(".kuncode/settings.json"),
-            r#"{ "permissions": { "deny": ["Bash("] } }"#,
-        )
-        .unwrap();
-        assert!(matches!(
-            load_project_settings(&dir),
-            Err(SettingsError::Rule(_, _))
-        ));
-        let _ = fs::remove_dir_all(&dir);
-    }
-}
+#[path = "settings/tests.rs"]
+mod tests;

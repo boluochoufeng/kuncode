@@ -5,6 +5,7 @@ use std::{panic::AssertUnwindSafe, sync::Arc};
 use kuncode_core::completion::{CompletionModel, Message};
 
 use crate::{
+    compaction::budget::{ConservativeTokenEstimator, TokenEstimator},
     error::AgentError,
     hook::{Hook, Hooks},
     observer::{AgentEvent, AgentObserver, EventKind},
@@ -13,9 +14,10 @@ use crate::{
     session::AgentSession,
     session_store::{NewJournalEntry, SessionStore},
     system_prompt::SystemPrompt,
+    tool::ToolResultRetention,
 };
 
-use super::{AgentConfig, AgentRunner, events::error_kind};
+use super::{AgentConfig, AgentRunner, compaction::RequestGroupEstimator, events::error_kind};
 
 impl<M> AgentRunner<M>
 where
@@ -32,7 +34,10 @@ where
 
     /// Creates a runner with explicit loop configuration.
     pub fn with_config(model: M, registry: ToolRegistry, config: AgentConfig) -> Self {
+        let token_estimator: Arc<dyn TokenEstimator> =
+            Arc::new(ConservativeTokenEstimator::default());
         Self {
+            summary_model: model.clone(),
             model,
             registry,
             config,
@@ -42,6 +47,8 @@ where
             observer: None,
             hooks: Arc::new(Hooks::new()),
             session_store: None,
+            group_estimator: Arc::new(RequestGroupEstimator::new(token_estimator.clone())),
+            token_estimator,
         }
     }
 
@@ -89,6 +96,19 @@ where
         self
     }
 
+    /// Replaces the model used only for semantic context summaries.
+    pub fn with_summary_model(mut self, model: M) -> Self {
+        self.summary_model = model;
+        self
+    }
+
+    /// Replaces request token accounting for compaction decisions.
+    pub fn with_token_estimator(mut self, estimator: Arc<dyn TokenEstimator>) -> Self {
+        self.group_estimator = Arc::new(RequestGroupEstimator::new(estimator.clone()));
+        self.token_estimator = estimator;
+        self
+    }
+
     /// Emits one event, but only when an observer is attached — with none the
     /// `seq` is left untouched and nothing is dispatched. The `seq` is drawn at
     /// emit time, the single source of total ordering.
@@ -122,13 +142,42 @@ where
         self.push_message(session, Message::user(prompt)).await;
     }
 
+    pub(super) async fn push_human_message(
+        &self,
+        session: &mut AgentSession,
+        prompt: impl Into<String>,
+    ) {
+        let message = Message::user(prompt);
+        let journal_seq = self.persist_message(session, &message).await;
+        session.push_human_with_journal_seq(message, journal_seq);
+    }
+
     pub(super) async fn push_message(&self, session: &mut AgentSession, message: Message) {
+        let journal_seq = self.persist_message(session, &message).await;
+        session.push_with_journal_seq(message, journal_seq);
+    }
+
+    pub(super) async fn push_tool_result_message(
+        &self,
+        session: &mut AgentSession,
+        message: Message,
+        retention: ToolResultRetention,
+    ) {
+        let journal_seq = self.persist_message(session, &message).await;
+        session.push_tool_result_with_journal_seq(message, journal_seq, retention);
+    }
+
+    async fn persist_message(
+        &self,
+        session: &mut AgentSession,
+        message: &Message,
+    ) -> Option<crate::session_store::Seq> {
         let session_id = session.session_id().cloned();
         let mut journal_seq = None;
         if let (Some(store), Some(session_id)) = (&self.session_store, session_id)
             && session.is_durable()
         {
-            match NewJournalEntry::message(&message) {
+            match NewJournalEntry::message(message) {
                 Ok(entry) => match store.append(&session_id, entry).await {
                     Ok(seq) => journal_seq = Some(seq),
                     Err(error) => session.mark_persistence_failed(error.to_string()),
@@ -136,7 +185,7 @@ where
                 Err(error) => session.mark_persistence_failed(error.to_string()),
             }
         }
-        session.push_with_journal_seq(message, journal_seq);
+        journal_seq
     }
 
     /// Emits the single turn-terminal [`Error`](EventKind::Error) for a failing

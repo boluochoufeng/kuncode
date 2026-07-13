@@ -1,3 +1,5 @@
+use sha2::{Digest, Sha256};
+
 use crate::{
     session_store::{
         JournalKind, NewSession, NewToolArtifact, Seq, SessionStore, SessionStoreError,
@@ -5,6 +7,11 @@ use crate::{
     },
     test_support::TestDir,
 };
+
+fn inline_artifact(preview: &str, payload: &str) -> NewToolArtifact {
+    let content_hash = format!("sha256-{:x}", Sha256::digest(payload.as_bytes()));
+    NewToolArtifact::inline(content_hash, preview, payload).expect("artifact should be valid")
+}
 
 #[tokio::test]
 async fn concurrent_artifact_writers_return_one_typed_head_conflict() {
@@ -27,8 +34,7 @@ async fn concurrent_artifact_writers_return_one_typed_head_conflict() {
             .put_tool_artifact(
                 &session,
                 Seq::ZERO,
-                NewToolArtifact::inline("sha256-race-first", "first", "first payload")
-                    .expect("first artifact should be valid"),
+                inline_artifact("first", "first payload"),
             )
             .await
     };
@@ -38,8 +44,7 @@ async fn concurrent_artifact_writers_return_one_typed_head_conflict() {
             .put_tool_artifact(
                 &session,
                 Seq::ZERO,
-                NewToolArtifact::inline("sha256-race-second", "second", "second payload")
-                    .expect("second artifact should be valid"),
+                inline_artifact("second", "second payload"),
             )
             .await
     };

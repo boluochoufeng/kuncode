@@ -31,6 +31,7 @@ pub(crate) fn fixture_below_threshold(
         tokens,
         source_hash,
         source_journal_seq,
+        crate::tool::ToolResultRetention::Slimmable,
     ))
 }
 

@@ -10,6 +10,14 @@ pub enum SessionStoreError {
     /// A SQLite query or transaction failed.
     #[error("session store database failed: {0}")]
     Sqlx(#[from] sqlx::Error),
+    /// SQLite may have committed even though the client did not receive a receipt.
+    #[error("{operation} commit outcome is unknown: {message}")]
+    CommitOutcomeUnknown {
+        /// Durable operation whose receipt could not be established.
+        operation: &'static str,
+        /// Storage error returned after commit was attempted.
+        message: String,
+    },
     /// A versioned payload could not be encoded or decoded as JSON.
     #[error("session store JSON failed: {0}")]
     Json(#[from] serde_json::Error),
@@ -30,6 +38,20 @@ pub enum SessionStoreError {
     /// An artifact lacks an identifier, content digest, or valid payload source.
     #[error("invalid tool artifact: {0}")]
     InvalidToolArtifact(String),
+    /// An artifact digest is not the canonical `sha256-<lowercase hex>` form.
+    #[error("invalid tool artifact content hash format: `{content_hash}`")]
+    InvalidToolArtifactHashFormat {
+        /// Rejected digest supplied at the persistence boundary.
+        content_hash: String,
+    },
+    /// An inline payload does not match its claimed content digest.
+    #[error("tool artifact digest mismatch: claimed `{claimed}`, computed `{computed}`")]
+    ToolArtifactDigestMismatch {
+        /// Digest supplied by the artifact producer.
+        claimed: String,
+        /// Digest computed from the complete inline payload.
+        computed: String,
+    },
     /// The artifact length cannot be represented by SQLite's signed integer type.
     #[error("tool artifact is too large to store: {bytes} bytes")]
     ToolArtifactTooLarge {
@@ -55,6 +77,16 @@ pub enum SessionStoreError {
         /// Existing artifact for which no receipt can be issued.
         artifact_id: String,
     },
+    /// An artifact row and its durable journal identity disagree.
+    #[error(
+        "tool artifact `{artifact_id}` has a mismatched journal fact in session `{session_id}`"
+    )]
+    ToolArtifactJournalMismatch {
+        /// Session containing the inconsistent audit fact.
+        session_id: String,
+        /// Artifact whose journal identity failed validation.
+        artifact_id: String,
+    },
     /// A compaction commit violates session, source-range, or checkpoint invariants.
     #[error("invalid compaction commit: {0}")]
     InvalidCompaction(String),
@@ -67,4 +99,13 @@ pub enum SessionStoreError {
         /// Journal head read by the write transaction.
         actual: i64,
     },
+}
+
+impl SessionStoreError {
+    pub(crate) fn commit_outcome_unknown(operation: &'static str, error: sqlx::Error) -> Self {
+        Self::CommitOutcomeUnknown {
+            operation,
+            message: error.to_string(),
+        }
+    }
 }

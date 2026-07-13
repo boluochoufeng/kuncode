@@ -9,9 +9,8 @@ use crate::{
         protocol::{group_messages, select_protected_recent_tail},
     },
     session_store::{
-        Checkpoint, CommittedArtifact, JournalEntry, JournalKind, NewJournalEntry, NewSession,
-        NewToolArtifact, Seq, SessionId, SessionStore, SessionStoreError,
-        sqlite::SqliteSessionStore,
+        CommittedArtifact, JournalEntry, JournalKind, NewJournalEntry, NewSession, NewToolArtifact,
+        Seq, SessionId, SessionStore, SessionStoreError, sqlite::SqliteSessionStore,
     },
     test_support::TestDir,
 };
@@ -23,13 +22,6 @@ struct InterleavingStore<'a> {
 
 #[async_trait]
 impl ArtifactStore for InterleavingStore<'_> {
-    async fn latest_checkpoint(
-        &self,
-        session: &SessionId,
-    ) -> Result<Option<Checkpoint>, SessionStoreError> {
-        SessionStore::latest_checkpoint(self.inner, session).await
-    }
-
     async fn replay(
         &self,
         session: &SessionId,

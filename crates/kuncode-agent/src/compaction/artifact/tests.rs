@@ -19,6 +19,7 @@ mod durability;
 mod failures;
 mod metadata;
 mod multi;
+mod receipt;
 mod summary_binding;
 mod support;
 

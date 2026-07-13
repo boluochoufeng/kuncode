@@ -39,7 +39,7 @@ async fn latest_checkpoint_then_replay_after_rebuilds_active_context() {
             source_seq_start: Some(first),
             source_seq_end: Some(second),
             active_messages: vec![Message::user("summary-through-two")],
-            summary_json: None,
+            summary_json: Some(serde_json::json!({"schema_version": 1})),
             model: Some("deepseek-v4-flash".to_string()),
             token_usage_json: Some(serde_json::json!({ "input_tokens": 10 })),
         })

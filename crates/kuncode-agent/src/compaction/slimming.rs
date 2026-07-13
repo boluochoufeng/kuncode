@@ -15,9 +15,11 @@ use kuncode_core::{
 };
 
 mod marker;
+mod policy;
 mod types;
 
 use marker::{PreparedSlimming, prepare_slimmed_result};
+pub(crate) use policy::production_slimming_candidates;
 pub use types::{
     SlimmingOutcome, SlimmingRetention, ToolResultSlimmingError, ToolResultSlimmingResult,
 };
@@ -27,12 +29,12 @@ pub use types::{
 /// # Errors
 /// Returns [`ToolResultSlimmingError`] when protocol groups, protection, or an
 /// explicit candidate location is invalid.
-pub async fn slim_tool_results(
-    source: &ArtifactSpillResult,
+pub async fn slim_tool_results<'source>(
+    source: &'source ArtifactSpillResult,
     protected: &ProtectedRecentTail,
     authorized: &[ArtifactResultLocation],
     counter: &dyn ArtifactTokenCounter,
-) -> Result<ToolResultSlimmingResult, ToolResultSlimmingError> {
+) -> Result<ToolResultSlimmingResult<'source>, ToolResultSlimmingError> {
     let groups = source.groups();
     if groups.is_empty()
         || protected.group_range.end != groups.len()
@@ -89,6 +91,7 @@ pub async fn slim_tool_results(
         }
     }
     Ok(ToolResultSlimmingResult {
+        source,
         groups: projected,
         outcomes,
     })

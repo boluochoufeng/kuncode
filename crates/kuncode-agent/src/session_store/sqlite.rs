@@ -172,7 +172,9 @@ impl SessionStore for SqliteSessionStore {
         .execute(&mut *tx)
         .await?;
         touch_session(&mut tx, session, &now).await?;
-        tx.commit().await?;
+        tx.commit().await.map_err(|error| {
+            SessionStoreError::commit_outcome_unknown("append journal entry", error)
+        })?;
         Ok(seq)
     }
 

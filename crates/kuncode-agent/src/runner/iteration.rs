@@ -27,7 +27,7 @@ where
         iteration: usize,
         cancel: &CancellationToken,
     ) -> Result<IterationResult, AgentError> {
-        let request = self.build_request(session)?;
+        let request = self.prepare_request(session, iteration, cancel).await?;
         // Open the "thinking" state only after a successful build (a build
         // failure never started a model call). On completion error/cancel the
         // turn-terminal `Error` closes it; on success the `Assistant` below does.

@@ -4,8 +4,8 @@ use kuncode_core::completion::Message;
 use thiserror::Error;
 
 use crate::compaction::protocol::{
-    HumanMessageIndex, ProtectedRecentTail, ProtocolError, ProtocolGroup,
-    current_human_request_anchor, group_messages,
+    HumanMessageIndex, HumanRequestAnchor, ProtectedRecentTail, ProtocolError, ProtocolGroup,
+    current_human_request_anchor, flatten_groups, group_messages,
 };
 
 /// Exact token limits derived from one validated runtime window.
@@ -60,7 +60,7 @@ impl CandidateLoad {
 pub struct CompactionSelection {
     summarize: Vec<ProtocolGroup>,
     retain_verbatim: Vec<ProtocolGroup>,
-    current_request_anchor: Option<Message>,
+    current_request_anchor: Option<HumanRequestAnchor>,
 }
 
 impl CompactionSelection {
@@ -76,7 +76,15 @@ impl CompactionSelection {
 
     /// Returns the exact current human request when it lies in the prefix.
     pub fn current_request_anchor(&self) -> Option<&Message> {
-        self.current_request_anchor.as_ref()
+        self.current_request_anchor
+            .as_ref()
+            .map(|anchor| &anchor.message)
+    }
+
+    pub(crate) fn current_request_anchor_index(&self) -> Option<usize> {
+        self.current_request_anchor
+            .as_ref()
+            .map(|anchor| anchor.source_message_index)
     }
 }
 
@@ -166,8 +174,7 @@ pub fn select_prefix_tail(
         });
     }
     let anchor =
-        current_human_request_anchor(authoritative_messages, human_messages, prefix_message_end)?
-            .map(|anchor| anchor.message);
+        current_human_request_anchor(authoritative_messages, human_messages, prefix_message_end)?;
     Ok(SelectionOutcome::Summarize(CompactionSelection {
         summarize: groups[..protected.group_range.start].to_vec(),
         retain_verbatim: groups[protected.group_range.clone()].to_vec(),
@@ -176,18 +183,7 @@ pub fn select_prefix_tail(
 }
 
 fn flatten(groups: &[ProtocolGroup]) -> Vec<Message> {
-    groups
-        .iter()
-        .flat_map(|group| match group {
-            ProtocolGroup::Message(message) => vec![message.clone()],
-            ProtocolGroup::ToolExchange { assistant, results } => {
-                let mut messages = Vec::with_capacity(results.len() + 1);
-                messages.push(assistant.clone());
-                messages.extend(results.iter().cloned());
-                messages
-            }
-        })
-        .collect()
+    flatten_groups(groups)
 }
 
 #[cfg(test)]

@@ -10,8 +10,8 @@ use crate::{
     compaction::artifact::{ArtifactStore, ArtifactTokenCounter, ArtifactTokenCounterError},
     session::AgentSession,
     session_store::{
-        Checkpoint, CommittedArtifact, JournalEntry, NewJournalEntry, NewToolArtifact, Seq,
-        SessionId, SessionStore, SessionStoreError, sqlite::SqliteSessionStore,
+        CommittedArtifact, JournalEntry, NewJournalEntry, NewToolArtifact, Seq, SessionId,
+        SessionStore, SessionStoreError, sqlite::SqliteSessionStore,
     },
     tool::ToolOutput,
 };
@@ -25,6 +25,13 @@ pub(super) struct SerializedByteCounter;
 
 pub(super) struct AdaptiveMarkerCounter {
     divisor: u64,
+}
+
+#[derive(Default)]
+enum PutFailure {
+    #[default]
+    Rejected,
+    OutcomeUnknown,
 }
 
 impl AdaptiveMarkerCounter {
@@ -63,6 +70,7 @@ pub(super) struct RejectingStore {
     calls: AtomicUsize,
     replay_calls: AtomicUsize,
     entries: Vec<JournalEntry>,
+    put_failure: PutFailure,
 }
 
 impl RejectingStore {
@@ -75,6 +83,14 @@ impl RejectingStore {
     }
 
     pub(super) fn with_messages(messages: &[Message]) -> (Self, AgentSession) {
+        Self::with_failure(messages, PutFailure::Rejected)
+    }
+
+    pub(super) fn with_unknown_commit(messages: &[Message]) -> (Self, AgentSession) {
+        Self::with_failure(messages, PutFailure::OutcomeUnknown)
+    }
+
+    fn with_failure(messages: &[Message], put_failure: PutFailure) -> (Self, AgentSession) {
         let entries = messages
             .iter()
             .enumerate()
@@ -87,15 +103,17 @@ impl RejectingStore {
                 }
             })
             .collect::<Vec<_>>();
-        let frontier = entries.last().map_or(Seq::ZERO, |entry| entry.seq);
-        let mut session = AgentSession::from_messages(messages.to_vec());
+        let mut session = AgentSession::new();
         session.attach_session_id(SessionId::new("test-session"));
-        session.advance_durable_seq(frontier);
+        for (message, entry) in messages.iter().zip(&entries) {
+            session.push_with_journal_seq(message.clone(), Some(entry.seq));
+        }
         (
             Self {
                 calls: AtomicUsize::new(0),
                 replay_calls: AtomicUsize::new(0),
                 entries,
+                put_failure,
             },
             session,
         )
@@ -104,13 +122,6 @@ impl RejectingStore {
 
 #[async_trait]
 impl ArtifactStore for RejectingStore {
-    async fn latest_checkpoint(
-        &self,
-        _session: &SessionId,
-    ) -> Result<Option<Checkpoint>, SessionStoreError> {
-        Ok(None)
-    }
-
     async fn replay(
         &self,
         _session: &SessionId,
@@ -127,9 +138,15 @@ impl ArtifactStore for RejectingStore {
         _artifact: NewToolArtifact,
     ) -> Result<CommittedArtifact, SessionStoreError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        Err(SessionStoreError::InvalidToolArtifact(
-            "injected store failure".to_string(),
-        ))
+        match self.put_failure {
+            PutFailure::Rejected => Err(SessionStoreError::InvalidToolArtifact(
+                "injected store failure".to_string(),
+            )),
+            PutFailure::OutcomeUnknown => Err(SessionStoreError::CommitOutcomeUnknown {
+                operation: "put test artifact",
+                message: "injected uncertain commit".to_string(),
+            }),
+        }
     }
 }
 

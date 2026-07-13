@@ -51,7 +51,7 @@ where
         // it behind to leak to the provider on a later turn. The cx borrows the
         // transcript, so it is scoped to end before any `push_user`.
         if self.hooks.is_empty() {
-            self.push_user_message(session, prompt).await;
+            self.push_human_message(session, prompt).await;
         } else {
             let outcome = {
                 let cx = PromptCx {
@@ -62,9 +62,9 @@ where
             };
             match outcome {
                 None => return Err(self.terminal_error(session, None, AgentError::Cancelled)),
-                Some(PromptOutcome::Proceed) => self.push_user_message(session, prompt).await,
+                Some(PromptOutcome::Proceed) => self.push_human_message(session, prompt).await,
                 Some(PromptOutcome::AddContext(context)) => {
-                    self.push_user_message(session, prompt).await;
+                    self.push_human_message(session, prompt).await;
                     self.push_user_message(session, context).await;
                 }
                 Some(PromptOutcome::Block { reason }) => {

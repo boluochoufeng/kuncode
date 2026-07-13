@@ -3,8 +3,7 @@
 use async_trait::async_trait;
 use kuncode_core::completion::ToolDefinition;
 use schemars::JsonSchema;
-use serde::{Deserialize, Deserializer, Serialize, Serializer, de::DeserializeOwned};
-use thiserror::Error;
+use serde::{Serialize, de::DeserializeOwned};
 use tokio_util::sync::CancellationToken;
 
 use crate::permission::PermissionRequest;
@@ -13,6 +12,10 @@ use crate::todo::TodoHandle;
 pub mod bash;
 pub mod filesystem;
 pub mod todo_write;
+
+mod output;
+
+pub use output::{ToolError, ToolErrorKind, ToolErrorPayload, ToolOutput, ToolResultRetention};
 
 /// Per-call execution context threaded into every tool.
 ///
@@ -60,204 +63,6 @@ impl ToolContext {
     }
 }
 
-/// Harness-level failures the agent loop must handle itself — as opposed to
-/// failures the model can react to, which are reported inside [`ToolOutput`].
-///
-/// [`ToolError::Cancelled`] is surfaced by the runner, which races
-/// [`Tool::call`] against the [`ToolContext`] cancellation token (user
-/// interrupt / shutdown) and maps a token win onto
-/// [`AgentError::Cancelled`](crate::error::AgentError::Cancelled).
-/// [`ToolError::Internal`] is produced when a tool's typed output fails to
-/// serialize at the dispatch boundary.
-#[derive(Debug, Error)]
-pub enum ToolError {
-    /// The tool was cancelled before completing (user interrupt or shutdown).
-    #[error("tool execution was cancelled")]
-    Cancelled,
-
-    /// An internal invariant inside the tool runtime broke. This is a bug, not
-    /// something the model can recover from.
-    #[error("internal tool error: {0}")]
-    Internal(String),
-}
-
-/// Uniform envelope returned by every tool.
-///
-/// `D` is the typed `data` payload. Tools work with a concrete `D` (e.g.
-/// `ToolOutput<BashOutput>`); at the [`dyn Tool`](Tool) boundary it is erased
-/// to `ToolOutput<serde_json::Value>` (the default) via [`ToolOutput::erase`].
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
-pub struct ToolOutput<D = serde_json::Value> {
-    pub ok: bool,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub data: Option<D>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<ToolErrorPayload>,
-
-    pub truncated: bool,
-}
-
-/// The `kind` tag on a [`ToolErrorPayload`] (and its event mirror
-/// [`ToolFailure`](crate::observer::ToolFailure)).
-///
-/// The harness produces a fixed protocol vocabulary — the named variants — that
-/// the runner, gate, and frontends recognize. Tools may report their own
-/// open-ended kinds (e.g. bash's `non_zero_exit`), which round-trip through
-/// [`Other`](Self::Other). So the harness vocabulary is type-checked in one
-/// place while the tool taxonomy stays open.
-///
-/// Serializes transparently to the snake_case wire string the model reads in its
-/// `tool_result` and audit records — the variants change nothing on the wire.
-/// [`From<&str>`](Self::from) canonicalizes a known string to its variant, so a
-/// tool that passes `"permission_denied"` and the gate that passes
-/// [`PermissionDenied`](Self::PermissionDenied) are indistinguishable downstream.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ToolErrorKind {
-    /// Arguments failed to parse or validate before the tool ran.
-    InvalidArguments,
-    /// No tool with the requested name is registered.
-    UnknownTool,
-    /// Blocked by a permission rule at the gate.
-    PermissionDenied,
-    /// Vetoed by a `PreToolUse` hook.
-    BlockedByHook,
-    /// The call was interrupted before the tool returned.
-    Cancelled,
-    /// A harness-boundary tool failure (e.g. output failed to serialize).
-    ToolError,
-    /// A tool-defined kind outside the harness vocabulary.
-    Other(String),
-}
-
-impl ToolErrorKind {
-    /// The wire / model-facing string for this kind.
-    pub fn as_str(&self) -> &str {
-        match self {
-            Self::InvalidArguments => "invalid_arguments",
-            Self::UnknownTool => "unknown_tool",
-            Self::PermissionDenied => "permission_denied",
-            Self::BlockedByHook => "blocked_by_hook",
-            Self::Cancelled => "cancelled",
-            Self::ToolError => "tool_error",
-            Self::Other(kind) => kind,
-        }
-    }
-}
-
-impl From<&str> for ToolErrorKind {
-    fn from(kind: &str) -> Self {
-        match kind {
-            "invalid_arguments" => Self::InvalidArguments,
-            "unknown_tool" => Self::UnknownTool,
-            "permission_denied" => Self::PermissionDenied,
-            "blocked_by_hook" => Self::BlockedByHook,
-            "cancelled" => Self::Cancelled,
-            "tool_error" => Self::ToolError,
-            other => Self::Other(other.to_string()),
-        }
-    }
-}
-
-impl From<String> for ToolErrorKind {
-    fn from(kind: String) -> Self {
-        // Reuse the &str table; only an unknown string keeps its allocation.
-        match Self::from(kind.as_str()) {
-            Self::Other(_) => Self::Other(kind),
-            known => known,
-        }
-    }
-}
-
-impl std::fmt::Display for ToolErrorKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-// Transparent (de)serialization: the wire form is just the kind string, so the
-// model-facing `tool_result` and serialized events are unchanged by the typing.
-impl Serialize for ToolErrorKind {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(self.as_str())
-    }
-}
-
-impl<'de> Deserialize<'de> for ToolErrorKind {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        Ok(Self::from(String::deserialize(deserializer)?))
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-pub struct ToolErrorPayload {
-    pub kind: ToolErrorKind,
-    pub message: String,
-}
-
-impl<D> ToolOutput<D> {
-    pub fn success(data: D) -> Self {
-        Self {
-            ok: true,
-            data: Some(data),
-            error: None,
-            truncated: false,
-        }
-    }
-
-    pub fn failure(kind: impl Into<ToolErrorKind>, message: impl Into<String>) -> Self {
-        Self {
-            ok: false,
-            data: None,
-            error: Some(ToolErrorPayload {
-                kind: kind.into(),
-                message: message.into(),
-            }),
-            truncated: false,
-        }
-    }
-
-    pub fn truncated(mut self) -> Self {
-        self.truncated = true;
-        self
-    }
-}
-
-impl<D: Serialize> ToolOutput<D> {
-    /// Erase the typed `data` payload to a [`serde_json::Value`] for the
-    /// dynamic-dispatch boundary. A serialization failure is a tool bug, so it
-    /// surfaces as [`ToolError::Internal`].
-    pub fn erase(self) -> Result<ToolOutput, ToolError> {
-        let data = match self.data {
-            Some(payload) => Some(serde_json::to_value(payload).map_err(|err| {
-                ToolError::Internal(format!("failed to serialize tool output: {err}"))
-            })?),
-            None => None,
-        };
-
-        Ok(ToolOutput {
-            ok: self.ok,
-            data,
-            error: self.error,
-            truncated: self.truncated,
-        })
-    }
-
-    pub fn to_model_content(&self) -> String {
-        serde_json::to_string(self).unwrap_or_else(|err| {
-            serde_json::json!({
-                "ok": false,
-                "error": {
-                    "kind": "serialization",
-                    "message": format!("failed to serialize tool output: {err}")
-                }
-            })
-            .to_string()
-        })
-    }
-}
-
 /// Object-safe tool interface used to register and dispatch tools.
 ///
 /// Most tools should implement [`TypedTool`] instead — it provides this trait
@@ -298,6 +103,18 @@ pub trait Tool: Send + Sync {
         args: serde_json::Value,
         ctx: &ToolContext,
     ) -> Result<ToolOutput, ToolError>;
+
+    /// Authorizes deterministic compaction for a successfully completed call.
+    ///
+    /// The default is fail-safe because tool names and model-supplied arguments
+    /// alone cannot prove that exact output is no longer required.
+    fn result_retention(
+        &self,
+        _args: &serde_json::Value,
+        _output: &ToolOutput,
+    ) -> ToolResultRetention {
+        ToolResultRetention::Verbatim
+    }
 }
 
 /// Ergonomic tool definition with strongly-typed arguments and output.
@@ -336,6 +153,18 @@ pub trait TypedTool: Send + Sync {
 
     /// Run the tool with already-parsed, validated arguments.
     async fn run(&self, args: Self::Args, ctx: &ToolContext) -> ToolOutput<Self::Output>;
+
+    /// Authorizes deterministic compaction after the typed output is erased.
+    ///
+    /// Override only when bounded projection cannot hide evidence needed to
+    /// reason about mutable or external state.
+    fn result_retention(
+        &self,
+        _args: &serde_json::Value,
+        _output: &ToolOutput,
+    ) -> ToolResultRetention {
+        ToolResultRetention::Verbatim
+    }
 }
 
 #[async_trait]
@@ -388,6 +217,14 @@ where
         };
 
         output.erase()
+    }
+
+    fn result_retention(
+        &self,
+        args: &serde_json::Value,
+        output: &ToolOutput,
+    ) -> ToolResultRetention {
+        TypedTool::result_retention(self, args, output)
     }
 }
 

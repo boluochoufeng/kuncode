@@ -1,7 +1,10 @@
 use thiserror::Error;
 
 use crate::{
-    compaction::{artifact::ArtifactResultLocation, protocol::ProtocolGroup},
+    compaction::{
+        artifact::{ArtifactResultLocation, ArtifactSpillResult},
+        protocol::ProtocolGroup,
+    },
     session_store::Seq,
 };
 
@@ -49,12 +52,13 @@ pub enum SlimmingRetention {
 
 /// Candidate-only groups produced by the slimming pass.
 #[derive(Clone, Debug, PartialEq)]
-pub struct ToolResultSlimmingResult {
+pub struct ToolResultSlimmingResult<'source> {
+    pub(super) source: &'source ArtifactSpillResult,
     pub(super) groups: Vec<ProtocolGroup>,
     pub(super) outcomes: Vec<SlimmingOutcome>,
 }
 
-impl ToolResultSlimmingResult {
+impl ToolResultSlimmingResult<'_> {
     /// Returns projected groups without mutating durable history.
     pub fn groups(&self) -> &[ProtocolGroup] {
         &self.groups
@@ -63,6 +67,10 @@ impl ToolResultSlimmingResult {
     /// Returns one decision for every authorized candidate.
     pub fn outcomes(&self) -> &[SlimmingOutcome] {
         &self.outcomes
+    }
+
+    pub(crate) const fn source(&self) -> &ArtifactSpillResult {
+        self.source
     }
 }
 

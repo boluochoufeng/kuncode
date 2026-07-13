@@ -9,10 +9,14 @@
 
 use std::{panic::AssertUnwindSafe, sync::Arc};
 
+use kuncode_core::completion::Usage;
 use serde::{Deserialize, Serialize};
 
-use crate::todo::TodoItem;
-use crate::tool::{ToolErrorKind, ToolErrorPayload};
+use crate::{
+    compaction::budget::TokenCountPrecision,
+    todo::TodoItem,
+    tool::{ToolErrorKind, ToolErrorPayload},
+};
 
 /// One event produced in order by the agent loop.
 ///
@@ -125,6 +129,79 @@ pub enum EventKind {
     /// given failure only once (see the session persistence take-and-clear
     /// contract).
     Warning { message: String },
+    /// An enabled attempt crossed a configured pressure boundary.
+    CompactionStarted {
+        /// Stable trigger category such as `soft_threshold` or `hard_threshold`.
+        reason: String,
+        /// Full provider-request input estimate before any pass.
+        before_tokens: u64,
+        /// Accuracy class of the estimate.
+        precision: TokenCountPrecision,
+    },
+    /// A candidate was durably committed and installed.
+    CompactionCompleted {
+        /// Full request estimate before compaction.
+        before_tokens: u64,
+        /// Full request estimate after compaction.
+        after_tokens: u64,
+        /// Whether the optimization target was reached.
+        target_reached: bool,
+        /// Stable names of passes that changed or committed the candidate.
+        passes: Vec<String>,
+        /// First durable journal fact covered by the compacted prefix.
+        source_seq_start: i64,
+        /// Last durable journal fact covered by the compacted prefix.
+        source_seq_end: i64,
+        /// Receipt-bound `checkpoint_ref` journal sequence installed in memory.
+        checkpoint_seq: i64,
+        /// Number of tool payloads spilled during this attempt.
+        artifact_count: usize,
+        /// Provider usage consumed only by semantic summarization.
+        summary_usage: Option<Usage>,
+        /// Summarizer latency, absent when no semantic pass ran.
+        summary_latency_ms: Option<u64>,
+        /// Wall-clock latency of the complete compaction attempt.
+        latency_ms: u64,
+    },
+    /// Rollout policy observed a request without changing context or storage.
+    CompactionSkipped {
+        /// Stable category such as `shadow_observation` or `below_soft_threshold`.
+        reason: String,
+        /// Measured provider-request input.
+        before_tokens: u64,
+        /// Accuracy class of the observation.
+        precision: TokenCountPrecision,
+    },
+    /// Shadow rollout planned deterministic work without mutating session state.
+    CompactionObserved {
+        /// Full request estimate before any planned pass.
+        before_tokens: u64,
+        /// Conservative upper bound after shape-eligible artifact spills.
+        projected_after_tokens: u64,
+        /// Number of protocol groups outside the protected suffix.
+        safe_prefix_groups: usize,
+        /// Large tool results whose shape permits a spill attempt.
+        artifact_shape_candidates: usize,
+        /// Whether deterministic savings still leave the request above target.
+        requires_summary: bool,
+        /// Accuracy class of the full-request estimate.
+        precision: TokenCountPrecision,
+    },
+    /// An attempt failed before candidate installation.
+    CompactionFailed {
+        /// Stable pipeline category containing the failure.
+        stage: String,
+        /// Stable safe classification that excludes provider and storage payloads.
+        error: String,
+        /// Whether the original request remains safe to send.
+        recoverable: bool,
+        /// Full request estimate that triggered the attempt.
+        before_tokens: u64,
+        /// Provider usage already incurred by a rejected semantic summary.
+        summary_usage: Option<Usage>,
+        /// Wall-clock latency spent before failure.
+        latency_ms: u64,
+    },
 }
 
 /// Failure summary for [`EventKind::ToolEnd`], shaped like `ToolOutput.error`

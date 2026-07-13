@@ -15,7 +15,7 @@ use std::sync::Arc;
 use kuncode_agent::observer::AgentObserver;
 use kuncode_agent::permission::{Approver, PermissionMode, PermissionPolicy};
 use kuncode_agent::registry::ToolRegistry;
-use kuncode_agent::runner::{AgentConfig, AgentRunner};
+use kuncode_agent::runner::{AgentCompactionConfigError, AgentConfig, AgentRunner};
 use kuncode_agent::session::AgentSession;
 use kuncode_agent::session_store::{
     NewSession, SessionStore, session_store_path, sqlite::SqliteSessionStore,
@@ -29,7 +29,7 @@ use kuncode_core::providers::deepseek::{DeepSeekClient, DeepSeekCompletionModel}
 
 use crate::Cli;
 use crate::config::{PermissionFlags, resolve_permissions};
-use crate::settings::load_project_settings;
+use crate::settings::{ProjectCompaction, load_project_settings};
 
 /// Identity and behavioral instructions rendered as the first system-prompt
 /// block. Folds in guidance to maintain a plan via `todo_write`.
@@ -50,6 +50,7 @@ Keep working until the task is done, then give a short, direct final answer.";
 /// [`assemble`]: Self::assemble
 pub struct CliRuntime<M> {
     model: M,
+    summary_model: M,
     registry: ToolRegistry,
     config: AgentConfig,
     system_prompt: SystemPrompt,
@@ -80,6 +81,7 @@ impl CliRuntime<RetryModel<DeepSeekCompletionModel>> {
         // The merge is pure and tested in `config`; loading the project file
         // (I/O) stays in `settings`.
         let project = load_project_settings(workspace.root())?;
+        let project_compaction = project.compaction;
         let flags = PermissionFlags {
             allow: &cli.allow,
             ask: &cli.ask,
@@ -108,20 +110,15 @@ impl CliRuntime<RetryModel<DeepSeekCompletionModel>> {
             std::env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| "deepseek-v4-flash".to_string());
         // Wrap the provider so transient failures (timeouts, 429/5xx) are
         // retried with backoff; every model call the runner makes inherits it.
-        let model = RetryModel::with_policy(
-            DeepSeekCompletionModel::make(&client, model_name.clone()),
-            RetryPolicy::default(),
-        );
+        let provider = DeepSeekCompletionModel::make(&client, model_name.clone());
+        let model = RetryModel::with_policy(provider.clone(), RetryPolicy::default());
+        let summary_model = RetryModel::with_policy(provider, summary_retry_policy());
         let registry = ToolRegistry::with_default_workspace_tools(workspace);
-        let config = AgentConfig {
-            // Nudge the model to keep its plan current after a few quiet calls;
-            // the library leaves this off, the CLI opts in.
-            todo_reminder_interval: Some(3),
-            ..AgentConfig::default()
-        };
+        let config = agent_config(project_compaction, &model_name)?;
 
         Ok(Self {
             model,
+            summary_model,
             registry,
             config,
             system_prompt,
@@ -132,6 +129,27 @@ impl CliRuntime<RetryModel<DeepSeekCompletionModel>> {
             session_store,
             persistence_error,
         })
+    }
+}
+
+fn agent_config(
+    project_compaction: Option<ProjectCompaction>,
+    model_name: &str,
+) -> Result<AgentConfig, AgentCompactionConfigError> {
+    let compaction = project_compaction
+        .map(|settings| settings.into_runtime(model_name))
+        .transpose()?;
+    Ok(AgentConfig {
+        todo_reminder_interval: Some(3),
+        compaction,
+        ..AgentConfig::default()
+    })
+}
+
+fn summary_retry_policy() -> RetryPolicy {
+    RetryPolicy {
+        max_retries: 1,
+        ..RetryPolicy::default()
     }
 }
 
@@ -171,6 +189,7 @@ impl<M: CompletionModel> CliRuntime<M> {
         observer: Arc<dyn AgentObserver>,
     ) -> AgentRunner<M> {
         let runner = AgentRunner::with_config(self.model, self.registry, self.config)
+            .with_summary_model(self.summary_model)
             .with_system_prompt(self.system_prompt)
             .with_policy(self.policy)
             .with_approver(approver)
@@ -183,3 +202,7 @@ impl<M: CompletionModel> CliRuntime<M> {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "runtime/tests.rs"]
+mod tests;

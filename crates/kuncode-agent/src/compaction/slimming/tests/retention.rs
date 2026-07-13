@@ -72,10 +72,7 @@ async fn marker_metadata_over_provider_limit_remains_verbatim() {
     assert_retained(&result, SlimmingRetention::MarkerTooLarge);
 }
 
-async fn slim_payload(
-    payload: &str,
-    counter: &dyn ArtifactTokenCounter,
-) -> crate::compaction::slimming::ToolResultSlimmingResult {
+async fn slim_payload(payload: &str, counter: &dyn ArtifactTokenCounter) -> Vec<SlimmingOutcome> {
     let messages = [
         exchange(
             "old",
@@ -95,17 +92,15 @@ async fn slim_payload(
     let protected = select_protected_recent_tail(&groups, 0, |_| 1)
         .expect("fixture should have a protected tail");
     let source = artifact_source(&groups, &[(location(0), "old", 1_000, Some(Seq::new(2)))]);
-    slim_tool_results(&source, &protected, &[location(0)], counter)
+    let result = slim_tool_results(&source, &protected, &[location(0)], counter)
         .await
-        .expect("isolated retention should not fail the pass")
+        .expect("isolated retention should not fail the pass");
+    result.outcomes().to_vec()
 }
 
-fn assert_retained(
-    result: &crate::compaction::slimming::ToolResultSlimmingResult,
-    reason: SlimmingRetention,
-) {
+fn assert_retained(outcomes: &[SlimmingOutcome], reason: SlimmingRetention) {
     assert_eq!(
-        result.outcomes(),
+        outcomes,
         &[SlimmingOutcome::Retained {
             location: location(0),
             reason,

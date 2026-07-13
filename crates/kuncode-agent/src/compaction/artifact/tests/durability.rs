@@ -12,7 +12,7 @@ use crate::{
 };
 
 #[tokio::test]
-async fn rejects_frontier_when_only_assistant_is_durable() {
+async fn skips_result_without_exact_durable_lineage() {
     // Given: active context has a closed exchange but SQLite only has its assistant fact.
     let root = TestDir::new();
     let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
@@ -43,11 +43,10 @@ async fn rejects_frontier_when_only_assistant_is_durable() {
         .expect("session supplies a durable context");
     let result = spill_artifacts(input, &store, &FixedCounter::new(9_000, 100)).await;
 
-    // Then: missing journal messages are fatal and no artifact receipt is produced.
-    assert!(matches!(
-        result,
-        Err(ArtifactSpillError::JournalMessageCountMismatch { .. })
-    ));
+    // Then: the unproven result remains inline and no artifact receipt is produced.
+    let result = result.expect("unproven derived content should be skipped safely");
+    assert_eq!(result.groups(), groups);
+    assert!(result.outcomes().is_empty());
 }
 
 #[tokio::test]
@@ -106,8 +105,8 @@ async fn rejects_any_journal_fact_beyond_session_frontier() {
 }
 
 #[tokio::test]
-async fn rejects_active_message_that_differs_from_durable_journal() {
-    // Given: SQLite has a complete but different exchange at the claimed frontier.
+async fn rejects_verbatim_assistant_that_differs_from_durable_journal() {
+    // Given: live lineage claims a tool-call assistant message that SQLite contradicts.
     let root = TestDir::new();
     let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
         .await
@@ -122,7 +121,7 @@ async fn rejects_active_message_that_differs_from_durable_journal() {
     ]
     .concat();
     let active = [
-        tool_exchange("old", "bash", "changed payload"),
+        tool_exchange("old", "write_file", "durable payload"),
         tool_exchange("recent", "read_file", "recent"),
     ]
     .concat();
@@ -131,12 +130,12 @@ async fn rejects_active_message_that_differs_from_durable_journal() {
     let groups = group_messages(session.messages()).expect("active context should be closed");
     let protected = select_protected_recent_tail(&groups, 0, |_| 1).expect("tail should exist");
 
-    // When: spill compares active messages with authoritative journal facts.
+    // When: spill validates the assistant fact before deriving marker metadata.
     let input = ArtifactSpillInput::new(&groups, &protected, &session)
         .expect("session supplies a durable context");
     let result = spill_artifacts(input, &store, &FixedCounter::new(9_000, 100)).await;
 
-    // Then: the first mismatched fact rejects the entire pass.
+    // Then: the mismatched tool name rejects the entire pass.
     assert!(matches!(
         result,
         Err(ArtifactSpillError::JournalMessageMismatch { .. })
@@ -186,9 +185,15 @@ fn attached_session(
     session_id: crate::session_store::SessionId,
     frontier: crate::session_store::Seq,
 ) -> AgentSession {
-    let mut session = AgentSession::from_messages(messages.to_vec());
+    let mut session = AgentSession::new();
     session.attach_session_id(session_id);
-    session.advance_durable_seq(frontier);
+    for (index, message) in messages.iter().enumerate() {
+        let seq = i64::try_from(index + 1)
+            .ok()
+            .map(Seq::new)
+            .filter(|seq| *seq <= frontier);
+        session.push_with_journal_seq(message.clone(), seq);
+    }
     session
 }
 

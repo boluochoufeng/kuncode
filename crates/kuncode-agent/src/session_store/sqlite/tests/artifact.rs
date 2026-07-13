@@ -1,3 +1,4 @@
+use sha2::{Digest, Sha256};
 use sqlx::Row;
 
 use crate::{
@@ -7,6 +8,11 @@ use crate::{
     },
     test_support::TestDir,
 };
+
+fn inline_artifact(preview: &str, payload: &str) -> NewToolArtifact {
+    let content_hash = format!("sha256-{:x}", Sha256::digest(payload.as_bytes()));
+    NewToolArtifact::inline(content_hash, preview, payload).expect("artifact should be valid")
+}
 
 #[tokio::test]
 async fn put_tool_artifact_is_idempotent_and_journaled_once() {
@@ -18,8 +24,7 @@ async fn put_tool_artifact_is_idempotent_and_journaled_once() {
         .create_session(NewSession::new(root.path().to_path_buf()))
         .await
         .expect("session should be created");
-    let artifact = NewToolArtifact::inline("sha256-deadbeef", "preview text", "large payload text")
-        .expect("artifact should be valid");
+    let artifact = inline_artifact("preview text", "large payload text");
 
     let first = store
         .put_tool_artifact(&session, Seq::ZERO, artifact.clone())
@@ -42,9 +47,12 @@ async fn put_tool_artifact_is_idempotent_and_journaled_once() {
     assert_eq!(first.journal_seq(), artifact_entries[0].seq);
     assert_eq!(
         first.reference().artifact_id(),
-        "tool-result-sha256-deadbeef"
+        "tool-result-sha256-8618bd8ede71feee43bbd41673f754d1fbb4572c399b0dc3dde18b7efe14fad5"
     );
-    assert_eq!(first.reference().content_hash(), "sha256-deadbeef");
+    assert_eq!(
+        first.reference().content_hash(),
+        "sha256-8618bd8ede71feee43bbd41673f754d1fbb4572c399b0dc3dde18b7efe14fad5"
+    );
     assert_eq!(first.reference().bytes(), 18);
     assert_eq!(artifact_entries.len(), 1);
     assert_eq!(
@@ -54,7 +62,7 @@ async fn put_tool_artifact_is_idempotent_and_journaled_once() {
 }
 
 #[tokio::test]
-async fn put_tool_artifact_rejects_existing_id_with_different_content() {
+async fn put_tool_artifact_rejects_existing_id_with_different_metadata() {
     // Given: a durable artifact and its original receipt.
     let root = TestDir::new();
     let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
@@ -64,20 +72,18 @@ async fn put_tool_artifact_rejects_existing_id_with_different_content() {
         .create_session(NewSession::new(root.path().to_path_buf()))
         .await
         .expect("session should be created");
-    let original = NewToolArtifact::inline("caller-hash", "original preview", "original payload")
-        .expect("artifact should be valid");
+    let original = inline_artifact("original preview", "original payload");
     let first = store
         .put_tool_artifact(&session, Seq::ZERO, original.clone())
         .await
         .expect("first artifact write should commit");
 
-    // When: the caller reuses that identifier for different durable content.
+    // When: the caller reuses that identifier with different durable metadata.
     let conflict = store
         .put_tool_artifact(
             &session,
             first.journal_seq(),
-            NewToolArtifact::inline("caller-hash", "changed preview", "changed payload")
-                .expect("conflicting artifact should be structurally valid"),
+            inline_artifact("changed preview", "original payload"),
         )
         .await;
 
@@ -118,7 +124,10 @@ async fn put_tool_artifact_rejects_existing_id_with_different_content() {
     .expect("journal count should be queryable");
 
     assert_eq!(repeated, first);
-    assert_eq!(row.get::<String, _>("content_hash"), "caller-hash");
+    assert_eq!(
+        row.get::<String, _>("content_hash"),
+        "sha256-95bc7d277692d7369b761d95a567c2433ae022737112bb6d85e028b2480dfa8e"
+    );
     assert_eq!(row.get::<i64, _>("bytes"), 16);
     assert_eq!(row.get::<String, _>("preview"), "original preview");
     assert_eq!(row.get::<String, _>("payload_text"), "original payload");
@@ -143,8 +152,7 @@ async fn distinct_artifacts_receive_monotonic_journal_receipts() {
         .put_tool_artifact(
             &session,
             Seq::ZERO,
-            NewToolArtifact::inline("sha256-first", "first", "first payload")
-                .expect("first artifact should be valid"),
+            inline_artifact("first", "first payload"),
         )
         .await
         .expect("first artifact should commit");
@@ -152,8 +160,7 @@ async fn distinct_artifacts_receive_monotonic_journal_receipts() {
         .put_tool_artifact(
             &session,
             first.journal_seq(),
-            NewToolArtifact::inline("sha256-second", "second", "second payload")
-                .expect("second artifact should be valid"),
+            inline_artifact("second", "second payload"),
         )
         .await
         .expect("second artifact should commit");
@@ -171,8 +178,7 @@ async fn existing_artifact_without_journal_entry_is_rejected() {
         .create_session(NewSession::new(root.path().to_path_buf()))
         .await
         .expect("session should be created");
-    let artifact = NewToolArtifact::inline("sha256-orphan", "preview", "payload")
-        .expect("artifact should be valid");
+    let artifact = inline_artifact("preview", "payload");
     store
         .put_tool_artifact(&session, Seq::ZERO, artifact.clone())
         .await
@@ -201,8 +207,7 @@ async fn artifact_put_rejects_stale_head_before_new_or_idempotent_writes() {
         .create_session(NewSession::new(root.path().to_path_buf()))
         .await
         .expect("session should be created");
-    let existing = NewToolArtifact::inline("sha256-existing", "preview", "payload")
-        .expect("artifact should be valid");
+    let existing = inline_artifact("preview", "payload");
     let first = store
         .put_tool_artifact(&session, Seq::ZERO, existing.clone())
         .await
@@ -225,8 +230,7 @@ async fn artifact_put_rejects_stale_head_before_new_or_idempotent_writes() {
         .put_tool_artifact(
             &session,
             first.journal_seq(),
-            NewToolArtifact::inline("sha256-new", "new", "new payload")
-                .expect("new artifact should be valid"),
+            inline_artifact("new", "new payload"),
         )
         .await;
     let entries = store

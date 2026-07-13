@@ -4,6 +4,7 @@ use std::io::{self, Write};
 
 use async_trait::async_trait;
 use kuncode_core::completion::CompletionRequest;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 mod config;
@@ -14,7 +15,8 @@ pub use config::{CompactionConfig, CompactionConfigError, CompactionMode};
 const DEFAULT_PROVIDER_FRAMING_TOKENS: u64 = 16;
 
 /// Identifies how closely an input count matches provider tokenization.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TokenCountPrecision {
     /// Count returned by the provider's tokenizer or count endpoint.
     Exact,

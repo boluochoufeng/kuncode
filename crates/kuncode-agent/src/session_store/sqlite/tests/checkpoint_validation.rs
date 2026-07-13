@@ -19,7 +19,7 @@ async fn write_checkpoint_rejects_future_covers_through_seq() {
             source_seq_start: Some(first),
             source_seq_end: Some(second),
             active_messages: vec![Message::user("summary")],
-            summary_json: None,
+            summary_json: Some(serde_json::json!({"schema_version": 1})),
             model: None,
             token_usage_json: None,
         })
@@ -50,7 +50,7 @@ async fn write_checkpoint_rejects_invalid_source_ranges() {
                 source_seq_start: start,
                 source_seq_end: end,
                 active_messages: vec![Message::user(format!("summary-{case}"))],
-                summary_json: None,
+                summary_json: Some(serde_json::json!({"schema_version": 1})),
                 model: None,
                 token_usage_json: None,
             })
@@ -60,6 +60,42 @@ async fn write_checkpoint_rejects_invalid_source_ranges() {
             matches!(result, Err(SessionStoreError::InvalidCheckpoint(_))),
             "{case} should be rejected as an invalid checkpoint, got {result:?}"
         );
+    }
+    assert_no_checkpoint(&store, &session).await;
+}
+
+#[tokio::test]
+async fn write_checkpoint_rejects_summary_provenance_without_summary() {
+    // Given
+    let root = TestDir::new();
+    let (store, session, first, second) = session_with_two_messages(&root).await;
+
+    for (start, end, model, usage) in [
+        (Some(first), Some(second), None, None),
+        (None, None, Some("test-model".to_string()), None),
+        (
+            None,
+            None,
+            None,
+            Some(serde_json::json!({"input_tokens": 1})),
+        ),
+    ] {
+        // When
+        let result = store
+            .write_checkpoint(NewCheckpoint {
+                session_id: session.clone(),
+                covers_through_seq: second,
+                source_seq_start: start,
+                source_seq_end: end,
+                active_messages: vec![Message::user("deterministic")],
+                summary_json: None,
+                model,
+                token_usage_json: usage,
+            })
+            .await;
+
+        // Then
+        assert_invalid_checkpoint(result);
     }
     assert_no_checkpoint(&store, &session).await;
 }

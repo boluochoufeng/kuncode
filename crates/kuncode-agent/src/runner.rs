@@ -1,6 +1,7 @@
 //! Agent loop entry point.
 
 mod cancellation;
+mod compaction;
 mod events;
 mod iteration;
 mod loop_control;
@@ -15,6 +16,10 @@ use std::sync::Arc;
 use kuncode_core::completion::{ReasoningEffort, ToolChoice, Usage};
 
 use crate::{
+    compaction::{
+        GroupTokenEstimator,
+        budget::{CompactionConfig, TokenEstimator},
+    },
     hook::Hooks,
     observer::AgentObserver,
     permission::{Approver, PermissionPolicy},
@@ -22,7 +27,7 @@ use crate::{
     session::AgentSession,
     session_store::SessionStore,
     system_prompt::SystemPrompt,
-    tool::ToolOutput,
+    tool::{ToolOutput, ToolResultRetention},
 };
 
 use self::request::final_text_at;
@@ -48,6 +53,8 @@ pub struct AgentConfig {
     pub tool_choice: Option<ToolChoice>,
     /// Consecutive model calls allowed before reminding the model about the plan.
     pub todo_reminder_interval: Option<usize>,
+    /// Harness-owned automatic compaction settings, absent to disable all work.
+    pub compaction: Option<AgentCompactionConfig>,
 }
 
 impl Default for AgentConfig {
@@ -59,8 +66,61 @@ impl Default for AgentConfig {
             tool_choice: None,
             // Injecting messages by default would surprise library embedders.
             todo_reminder_interval: None,
+            compaction: None,
         }
     }
+}
+
+/// Runtime metadata required to commit semantic compaction checkpoints.
+#[derive(Clone, Debug)]
+pub struct AgentCompactionConfig {
+    policy: CompactionConfig,
+    model_id: String,
+    summary_max_tokens: u64,
+}
+
+impl AgentCompactionConfig {
+    /// Binds rollout policy to an explicit provider model and output budget.
+    ///
+    /// # Errors
+    /// Returns an error for a blank model id or a budget outside `1..=u32::MAX`.
+    pub fn new(
+        policy: CompactionConfig,
+        model_id: impl Into<String>,
+        summary_max_tokens: u64,
+    ) -> Result<Self, AgentCompactionConfigError> {
+        let model_id = model_id.into();
+        if model_id.trim().is_empty() {
+            return Err(AgentCompactionConfigError::BlankModelId);
+        }
+        if summary_max_tokens == 0 || summary_max_tokens > u64::from(u32::MAX) {
+            return Err(AgentCompactionConfigError::InvalidSummaryBudget {
+                actual: summary_max_tokens,
+            });
+        }
+        Ok(Self {
+            policy,
+            model_id,
+            summary_max_tokens,
+        })
+    }
+}
+
+/// Invalid automatic-compaction runtime metadata.
+#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
+pub enum AgentCompactionConfigError {
+    /// Checkpoint audit records require a concrete model identifier.
+    #[error("compaction model id must not be blank")]
+    BlankModelId,
+    /// Summary requests use a portable non-zero unsigned 32-bit output limit.
+    #[error(
+        "compaction summary output budget {actual} must be within 1..={}",
+        u32::MAX
+    )]
+    InvalidSummaryBudget {
+        /// Rejected caller-supplied budget.
+        actual: u64,
+    },
 }
 
 /// Summary for one completed user turn appended to an existing transcript.
@@ -85,6 +145,7 @@ impl AgentTurn {
 #[derive(Clone)]
 pub struct AgentRunner<M> {
     model: M,
+    summary_model: M,
     registry: ToolRegistry,
     config: AgentConfig,
     system_prompt: Arc<SystemPrompt>,
@@ -93,6 +154,8 @@ pub struct AgentRunner<M> {
     observer: Option<Arc<dyn AgentObserver>>,
     hooks: Arc<Hooks>,
     session_store: Option<Arc<dyn SessionStore>>,
+    token_estimator: Arc<dyn TokenEstimator>,
+    group_estimator: Arc<dyn GroupTokenEstimator>,
 }
 
 #[derive(Debug)]
@@ -113,6 +176,7 @@ struct PendingToolCall {
 struct CallOutcome {
     output: ToolOutput,
     executed: bool,
+    retention: ToolResultRetention,
 }
 
 #[cfg(test)]

@@ -11,14 +11,18 @@ use async_trait::async_trait;
 mod artifact;
 mod dto;
 mod error;
+mod hash;
 mod model;
 pub mod sqlite;
+
+pub(crate) use hash::active_messages_sha256;
 
 pub use artifact::{CommittedArtifact, NewToolArtifact, ToolArtifactRef};
 pub use error::SessionStoreError;
 pub use model::{
-    Checkpoint, CommittedCompaction, CompactionEvent, JournalEntry, JournalKind, NewCheckpoint,
-    NewCompactionCommit, NewJournalEntry, NewSession, Seq, SessionId,
+    Checkpoint, CommittedCompaction, CompactionEvent, CompactionMetadata, CompactionPassKind,
+    CompactionReason, JournalEntry, JournalKind, NewCheckpoint, NewCompactionCommit,
+    NewJournalEntry, NewSession, Seq, SessionId,
 };
 
 /// Persists the complete session journal and manages active-context checkpoints.

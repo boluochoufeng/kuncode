@@ -169,6 +169,35 @@ async fn preserves_inline_payload_when_parsing_or_storage_fails() {
 }
 
 #[tokio::test]
+async fn aborts_spill_when_artifact_commit_outcome_is_unknown() {
+    // Given: two spillable results before the protected exchange and an uncertain store commit.
+    let messages = [
+        tool_exchange("old-a", "bash", "first payload"),
+        tool_exchange("old-b", "bash", "second payload"),
+        tool_exchange("recent", "read_file", "recent"),
+    ]
+    .concat();
+    let (store, session) = RejectingStore::with_unknown_commit(&messages);
+    let groups = group_messages(session.messages()).expect("history should be valid");
+    let protected = select_protected_recent_tail(&groups, 0, |_| 1).expect("tail should exist");
+    let input =
+        ArtifactSpillInput::new(&groups, &protected, &session).expect("input should be valid");
+
+    // When: the first artifact write may have committed without returning its receipt.
+    let result = spill_artifacts(input, &store, &FixedCounter::new(9_000, 100)).await;
+
+    // Then: the whole pass stops immediately instead of recording an isolated item failure.
+    assert!(matches!(
+        result,
+        Err(ArtifactSpillError::PersistenceOutcomeUnknown {
+            operation: "put test artifact",
+            message,
+        }) if message == "injected uncertain commit"
+    ));
+    assert_eq!(store.calls(), 1);
+}
+
+#[tokio::test]
 async fn keeps_inline_when_marker_metadata_cannot_fit() {
     // Given: an exact call id that alone exceeds the marker budget.
     let long_id = "x".repeat(10_000);

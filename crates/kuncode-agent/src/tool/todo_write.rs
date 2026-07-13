@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     permission::{PermissionAction, PermissionRequest},
     todo::TodoItem,
-    tool::{ToolContext, ToolOutput, TypedTool, definition_for},
+    tool::{ToolContext, ToolOutput, ToolResultRetention, TypedTool, definition_for},
 };
 
 const DESCRIPTION: &str = "\
@@ -93,6 +93,18 @@ impl TypedTool for TodoWrite {
             // Validation failures are model-recoverable: report them so the model
             // can fix the list and resubmit.
             Err(err) => ToolOutput::failure("invalid_arguments", err.to_string()),
+        }
+    }
+
+    fn result_retention(
+        &self,
+        _args: &serde_json::Value,
+        output: &ToolOutput,
+    ) -> ToolResultRetention {
+        if output.ok && !output.truncated {
+            ToolResultRetention::Slimmable
+        } else {
+            ToolResultRetention::Verbatim
         }
     }
 }
