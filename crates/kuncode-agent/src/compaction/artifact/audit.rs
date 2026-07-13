@@ -4,10 +4,20 @@ use super::{
 };
 use crate::session_store::{JournalKind, Seq};
 
+pub(super) struct JournalAudit {
+    message_seqs: Vec<Option<Seq>>,
+}
+
+impl JournalAudit {
+    pub(super) fn message_seq(&self, index: usize) -> Option<Seq> {
+        self.message_seqs.get(index).copied().flatten()
+    }
+}
+
 pub(super) async fn audit_journal(
     input: &ArtifactSpillInput<'_>,
     store: &dyn ArtifactStore,
-) -> Result<(), ArtifactSpillError> {
+) -> Result<JournalAudit, ArtifactSpillError> {
     let checkpoint = store
         .latest_checkpoint(input.durable.session_id())
         .await
@@ -19,6 +29,7 @@ pub(super) async fn audit_journal(
         return Err(stale(input, replay_after));
     }
     let mut durable_messages = checkpoint.map_or_else(Vec::new, |value| value.active_messages);
+    let mut message_seqs = vec![None; durable_messages.len()];
     let entries = store
         .replay(input.durable.session_id(), replay_after)
         .await
@@ -30,11 +41,13 @@ pub(super) async fn audit_journal(
         }
         observed_head = entry.seq;
         if entry.kind == JournalKind::Message.as_str() {
+            let seq = entry.seq;
             durable_messages.push(
                 entry
                     .into_message()
                     .map_err(|error| ArtifactSpillError::JournalAudit(error.to_string()))?,
             );
+            message_seqs.push(Some(seq));
         }
     }
     if observed_head != input.durable.frontier() {
@@ -54,7 +67,7 @@ pub(super) async fn audit_journal(
     {
         return Err(ArtifactSpillError::JournalMessageMismatch { index });
     }
-    Ok(())
+    Ok(JournalAudit { message_seqs })
 }
 
 fn stale(input: &ArtifactSpillInput<'_>, actual: Seq) -> ArtifactSpillError {

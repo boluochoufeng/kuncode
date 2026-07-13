@@ -10,6 +10,17 @@ use crate::{
     },
 };
 
+/// Exact source position for one artifact-pass decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ArtifactResultLocation {
+    /// Group containing the closed tool exchange.
+    pub group_index: usize,
+    /// Result-message position within the exchange.
+    pub result_message_index: usize,
+    /// Tool-result block position within the user message.
+    pub content_index: usize,
+}
+
 /// Counts the final provider-visible representation of one tool result.
 #[async_trait]
 pub trait ArtifactTokenCounter: Send + Sync {
@@ -123,14 +134,11 @@ pub enum ArtifactSpillFailure {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ArtifactSpillOutcome {
     /// The result did not cross the strict spill threshold.
-    BelowThreshold {
-        /// Primary tool call identifier.
-        tool_call_id: String,
-        /// Final provider-visible result cost.
-        tokens: u64,
-    },
+    BelowThreshold(BelowThresholdArtifact),
     /// The item stayed inline because one isolated operation failed.
     Failed {
+        /// Exact result retained inline after the failure.
+        location: ArtifactResultLocation,
         /// Primary tool call identifier.
         tool_call_id: String,
         /// Typed failure category without the complete payload.
@@ -138,6 +146,8 @@ pub enum ArtifactSpillOutcome {
     },
     /// A committed receipt authorized replacement in the candidate view.
     Spilled {
+        /// Exact result replaced after its durable receipt.
+        location: ArtifactResultLocation,
         /// Primary tool call identifier.
         tool_call_id: String,
         /// Stable content-addressed artifact identifier.
@@ -149,6 +159,71 @@ pub enum ArtifactSpillOutcome {
     },
 }
 
+impl ArtifactSpillOutcome {
+    /// Returns the exact result inspected by the artifact pass.
+    pub const fn location(&self) -> ArtifactResultLocation {
+        match self {
+            Self::BelowThreshold(artifact) => artifact.location,
+            Self::Failed { location, .. } | Self::Spilled { location, .. } => *location,
+        }
+    }
+}
+
+/// Opaque authorization for slimming one exact artifact-pass input.
+///
+/// Construction remains inside the artifact pass so callers cannot attach a
+/// token count or journal sequence to a different payload.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BelowThresholdArtifact {
+    location: ArtifactResultLocation,
+    tool_call_id: String,
+    tokens: u64,
+    source_hash: String,
+    source_journal_seq: Option<Seq>,
+}
+
+impl BelowThresholdArtifact {
+    pub(super) fn new(
+        location: ArtifactResultLocation,
+        tool_call_id: String,
+        tokens: u64,
+        source_hash: String,
+        source_journal_seq: Option<Seq>,
+    ) -> Self {
+        Self {
+            location,
+            tool_call_id,
+            tokens,
+            source_hash,
+            source_journal_seq,
+        }
+    }
+
+    /// Returns the exact result inspected by the artifact pass.
+    pub const fn location(&self) -> ArtifactResultLocation {
+        self.location
+    }
+
+    /// Returns the provider-visible cost measured by the artifact pass.
+    pub const fn tokens(&self) -> u64 {
+        self.tokens
+    }
+
+    /// Returns the stable hash of the complete source [`ToolResult`].
+    pub fn source_hash(&self) -> &str {
+        &self.source_hash
+    }
+
+    /// Returns durable per-message lineage when the journal exposes it.
+    pub const fn source_journal_seq(&self) -> Option<Seq> {
+        self.source_journal_seq
+    }
+
+    pub(crate) fn tool_call_id(&self) -> &str {
+        &self.tool_call_id
+    }
+}
+
 /// Candidate groups and durable frontier produced by one spill pass.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ArtifactSpillResult {
@@ -158,6 +233,18 @@ pub struct ArtifactSpillResult {
 }
 
 impl ArtifactSpillResult {
+    pub(super) fn new(
+        groups: Vec<ProtocolGroup>,
+        frontier: Seq,
+        outcomes: Vec<ArtifactSpillOutcome>,
+    ) -> Self {
+        Self {
+            groups,
+            frontier,
+            outcomes,
+        }
+    }
+
     /// Returns the candidate-only protocol groups.
     pub fn groups(&self) -> &[ProtocolGroup] {
         &self.groups

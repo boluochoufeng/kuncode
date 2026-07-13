@@ -7,7 +7,8 @@ use super::support::{FixedCounter, persisted_session, tool_exchange};
 use crate::{
     compaction::{
         artifact::{
-            ArtifactSpillFailure, ArtifactSpillInput, ArtifactSpillOutcome, spill_artifacts,
+            ArtifactResultLocation, ArtifactSpillFailure, ArtifactSpillInput, ArtifactSpillOutcome,
+            spill_artifacts,
         },
         protocol::{group_messages, select_protected_recent_tail},
     },
@@ -46,9 +47,23 @@ async fn spills_valid_tool_while_preserving_failed_sibling() {
     assert!(matches!(
         result.outcomes(),
         [
-            ArtifactSpillOutcome::Spilled { tool_call_id, .. },
-            ArtifactSpillOutcome::Failed { failure: ArtifactSpillFailure::Parse(_), .. }
+            ArtifactSpillOutcome::Spilled { location: spilled, tool_call_id, .. },
+            ArtifactSpillOutcome::Failed {
+                location: failed,
+                failure: ArtifactSpillFailure::Parse(_),
+                ..
+            }
         ] if tool_call_id == "valid"
+            && *spilled == ArtifactResultLocation {
+                group_index: 0,
+                result_message_index: 0,
+                content_index: 0,
+            }
+            && *failed == ArtifactResultLocation {
+                group_index: 0,
+                result_message_index: 0,
+                content_index: 1,
+            }
     ));
     let crate::compaction::protocol::ProtocolGroup::ToolExchange { results, .. } =
         &result.groups()[0]

@@ -5,7 +5,7 @@ pub(super) fn canonical_artifact_preview(payload: &str) -> String {
     adaptive_preview(payload, CANONICAL_ARTIFACT_PREVIEW_BYTES)
 }
 
-pub(super) fn adaptive_preview(value: &str, max_bytes: usize) -> String {
+pub(crate) fn adaptive_preview(value: &str, max_bytes: usize) -> String {
     if max_bytes < MIN_OMISSION_PREVIEW_BYTES {
         return String::new();
     }

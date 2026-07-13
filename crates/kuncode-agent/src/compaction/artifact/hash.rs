@@ -1,7 +1,13 @@
 use sha2::{Digest, Sha256};
 
+use kuncode_core::completion::ToolResult;
+
 pub(super) fn sha256_hex(input: &[u8]) -> String {
     format!("{:x}", Sha256::digest(input))
+}
+
+pub(crate) fn tool_result_hash(result: &ToolResult) -> Result<String, serde_json::Error> {
+    serde_json::to_vec(result).map(|encoded| format!("sha256-{}", sha256_hex(&encoded)))
 }
 
 #[cfg(test)]

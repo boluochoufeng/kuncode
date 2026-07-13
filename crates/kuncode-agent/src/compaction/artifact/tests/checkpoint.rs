@@ -1,3 +1,4 @@
+use super::super::audit::audit_journal;
 use super::support::{FixedCounter, tool_exchange};
 use crate::{
     compaction::{
@@ -48,6 +49,7 @@ async fn rebuilds_active_context_from_checkpoint_and_message_tail() {
             .await
             .expect("gap message should commit");
     }
+    let gap_result_seq = head;
     let checkpoint_seq = store
         .write_checkpoint(NewCheckpoint {
             session_id: session_id.clone(),
@@ -82,6 +84,11 @@ async fn rebuilds_active_context_from_checkpoint_and_message_tail() {
     // When: artifact audit rebuilds from the checkpoint plus its journal tail.
     let input = ArtifactSpillInput::new(&groups, &protected, &session)
         .expect("active context should bind to the session");
+    let audit = audit_journal(&input, &store)
+        .await
+        .expect("checkpoint-aware audit should pass");
+    assert_eq!(audit.message_seq(1), None);
+    assert_eq!(audit.message_seq(3), Some(gap_result_seq));
     let result = spill_artifacts(input, &store, &FixedCounter::new(9_000, 100))
         .await
         .expect("checkpoint-aware audit should pass");

@@ -2,11 +2,15 @@ use std::sync::Arc;
 
 use crate::{
     compaction::{
-        artifact::{ArtifactSpillFailure, ArtifactSpillInput, ArtifactSpillOutcome},
+        artifact::{
+            ArtifactResultLocation, ArtifactSpillFailure, ArtifactSpillInput, ArtifactSpillOutcome,
+        },
         protocol::{group_messages, select_protected_recent_tail},
+        slimming::slim_tool_results,
     },
-    session_store::{NewSession, SessionStore, sqlite::SqliteSessionStore},
+    session_store::{NewSession, Seq, SessionStore, sqlite::SqliteSessionStore},
     test_support::TestDir,
+    tool::ToolOutput,
 };
 
 mod checkpoint;
@@ -58,7 +62,7 @@ async fn spills_only_when_result_exceeds_threshold() {
 }
 
 #[tokio::test]
-async fn keeps_result_at_exact_threshold_inline() {
+async fn keeps_result_at_exact_threshold_inline_and_authorizes_slimming() {
     // Given: one durable old exchange before a protected tool exchange.
     let root = TestDir::new();
     let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
@@ -68,8 +72,10 @@ async fn keeps_result_at_exact_threshold_inline() {
         .create_session(NewSession::new(root.path().to_path_buf()))
         .await
         .expect("session should be created");
+    let old_payload =
+        ToolOutput::success(serde_json::json!({"stdout": "payload"})).to_model_content();
     let messages = [
-        tool_exchange("old", "bash", "payload"),
+        tool_exchange("old", "bash", &old_payload),
         tool_exchange("recent", "read_file", "recent payload"),
     ]
     .concat();
@@ -90,8 +96,25 @@ async fn keeps_result_at_exact_threshold_inline() {
     assert_eq!(result.frontier(), frontier);
     assert!(matches!(
         result.outcomes(),
-        [ArtifactSpillOutcome::BelowThreshold { tokens: 8_192, .. }]
+        [ArtifactSpillOutcome::BelowThreshold(authorization)]
+            if authorization.tokens() == 8_192
+                && authorization.source_journal_seq() == Some(Seq::new(2))
     ));
+    let location = ArtifactResultLocation {
+        group_index: 0,
+        result_message_index: 0,
+        content_index: 0,
+    };
+    let slimmed = slim_tool_results(
+        &result,
+        &protected,
+        &[location],
+        &FixedCounter::new(100, 100),
+    )
+    .await
+    .expect("same-pass authorization should slim the journal-backed result");
+    assert_ne!(slimmed.groups()[0], groups[0]);
+    assert_eq!(slimmed.groups()[1], groups[1]);
 }
 
 #[tokio::test]
