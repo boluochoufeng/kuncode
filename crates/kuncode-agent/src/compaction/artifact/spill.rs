@@ -27,8 +27,12 @@ pub async fn spill_artifacts(
         &audit,
         &group_message_starts,
     );
-    let mut pass =
-        ArtifactSpillResult::new(input.groups.to_vec(), input.durable.frontier(), Vec::new());
+    let mut pass = ArtifactSpillResult::new(
+        input.durable.session_id().clone(),
+        input.groups.to_vec(),
+        input.durable.frontier(),
+        Vec::new(),
+    );
     for group_index in 0..input.protected_start {
         runtime.spill_group(group_index, &mut pass).await?;
     }

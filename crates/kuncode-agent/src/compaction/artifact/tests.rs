@@ -19,6 +19,7 @@ mod durability;
 mod failures;
 mod metadata;
 mod multi;
+mod summary_binding;
 mod support;
 
 use support::{AdaptiveMarkerCounter, FixedCounter, persisted_session, tool_exchange};

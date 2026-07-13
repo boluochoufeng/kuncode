@@ -138,19 +138,18 @@ pub(super) async fn persisted_session(
     session_id: SessionId,
     messages: &[Message],
 ) -> AgentSession {
-    let mut frontier = Seq::ZERO;
+    let mut session = AgentSession::new();
+    session.attach_session_id(session_id.clone());
     for message in messages {
-        frontier = store
+        let seq = store
             .append(
                 &session_id,
                 NewJournalEntry::message(message).expect("message should encode"),
             )
             .await
             .expect("message should commit");
+        session.push_with_journal_seq(message.clone(), Some(seq));
     }
-    let mut session = AgentSession::from_messages(messages.to_vec());
-    session.attach_session_id(session_id);
-    session.advance_durable_seq(frontier);
     session
 }
 

@@ -6,6 +6,11 @@ use crate::permission::{PermissionMode, PermissionSessionState};
 use crate::session_store::{CommittedCompaction, Seq, SessionId};
 use crate::todo::{TodoHandle, TodoItem};
 
+mod compaction;
+
+pub(crate) use compaction::SummarySourceBinding;
+pub use compaction::SummarySourceError;
+
 /// Active conversation context owned by the caller between agent turns.
 ///
 /// Besides the message history it carries the mutable
@@ -14,6 +19,7 @@ use crate::todo::{TodoHandle, TodoItem};
 #[derive(Debug, Default)]
 pub struct AgentSession {
     messages: Vec<Message>,
+    message_journal_seqs: Vec<Option<Seq>>,
     permissions: PermissionSessionState,
     /// Monotonic counter handing out [`AgentEvent`](crate::observer::AgentEvent)
     /// sequence numbers. Lives on the session, not the `&self`/`Clone` runner,
@@ -57,8 +63,10 @@ impl Clone for AgentSession {
     /// The persisted session id is dropped, not shared: a clone represents a
     /// separate timeline unless a caller explicitly attaches a new id.
     fn clone(&self) -> Self {
+        let messages = self.messages.clone();
         Self {
-            messages: self.messages.clone(),
+            message_journal_seqs: vec![None; messages.len()],
+            messages,
             permissions: self.permissions.clone(),
             seq: self.seq,
             todos: self.todos.deep_clone(),
@@ -91,6 +99,7 @@ impl AgentSession {
     /// returned session id separately.
     pub fn from_messages(messages: Vec<Message>) -> Self {
         Self {
+            message_journal_seqs: vec![None; messages.len()],
             messages,
             ..Self::default()
         }
@@ -173,6 +182,7 @@ impl AgentSession {
             });
         }
         self.messages = messages;
+        self.message_journal_seqs = vec![None; self.messages.len()];
         self.last_durable_seq = Some(committed_head);
         Ok(())
     }
@@ -237,7 +247,15 @@ impl AgentSession {
 
     /// The single in-memory append chokepoint.
     pub(crate) fn push(&mut self, message: Message) {
+        self.push_with_journal_seq(message, None);
+    }
+
+    pub(crate) fn push_with_journal_seq(&mut self, message: Message, journal_seq: Option<Seq>) {
+        if let Some(seq) = journal_seq {
+            self.advance_durable_seq(seq);
+        }
         self.messages.push(message);
+        self.message_journal_seqs.push(journal_seq);
     }
 
     /// Hands out the next event sequence number, then advances. Starts at `0`.

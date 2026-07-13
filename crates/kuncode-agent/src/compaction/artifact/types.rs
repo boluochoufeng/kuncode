@@ -227,22 +227,37 @@ impl BelowThresholdArtifact {
 /// Candidate groups and durable frontier produced by one spill pass.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ArtifactSpillResult {
+    pub(super) session_id: SessionId,
     pub(super) groups: Vec<ProtocolGroup>,
+    pub(super) source_frontier: Seq,
     pub(super) frontier: Seq,
     pub(super) outcomes: Vec<ArtifactSpillOutcome>,
 }
 
 impl ArtifactSpillResult {
     pub(super) fn new(
+        session_id: SessionId,
         groups: Vec<ProtocolGroup>,
-        frontier: Seq,
+        source_frontier: Seq,
         outcomes: Vec<ArtifactSpillOutcome>,
     ) -> Self {
         Self {
+            session_id,
             groups,
-            frontier,
+            source_frontier,
+            frontier: source_frontier,
             outcomes,
         }
+    }
+
+    /// Returns the durable session audited before this pass began.
+    pub fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
+    /// Returns the journal frontier that authorized the source messages.
+    pub const fn source_frontier(&self) -> Seq {
+        self.source_frontier
     }
 
     /// Returns the candidate-only protocol groups.

@@ -40,7 +40,22 @@ pub(crate) fn fixture_spill_result(
     frontier: crate::session_store::Seq,
     outcomes: Vec<ArtifactSpillOutcome>,
 ) -> ArtifactSpillResult {
-    ArtifactSpillResult::new(groups, frontier, outcomes)
+    ArtifactSpillResult::new(
+        crate::session_store::SessionId::new("artifact-fixture"),
+        groups,
+        frontier,
+        outcomes,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn fixture_spill_result_for_session(
+    session_id: crate::session_store::SessionId,
+    groups: Vec<crate::compaction::protocol::ProtocolGroup>,
+    frontier: crate::session_store::Seq,
+    outcomes: Vec<ArtifactSpillOutcome>,
+) -> ArtifactSpillResult {
+    ArtifactSpillResult::new(session_id, groups, frontier, outcomes)
 }
 
 #[cfg(test)]

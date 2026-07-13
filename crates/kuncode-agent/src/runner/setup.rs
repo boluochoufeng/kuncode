@@ -124,18 +124,19 @@ where
 
     pub(super) async fn push_message(&self, session: &mut AgentSession, message: Message) {
         let session_id = session.session_id().cloned();
+        let mut journal_seq = None;
         if let (Some(store), Some(session_id)) = (&self.session_store, session_id)
             && session.is_durable()
         {
             match NewJournalEntry::message(&message) {
                 Ok(entry) => match store.append(&session_id, entry).await {
-                    Ok(seq) => session.advance_durable_seq(seq),
+                    Ok(seq) => journal_seq = Some(seq),
                     Err(error) => session.mark_persistence_failed(error.to_string()),
                 },
                 Err(error) => session.mark_persistence_failed(error.to_string()),
             }
         }
-        session.push(message);
+        session.push_with_journal_seq(message, journal_seq);
     }
 
     /// Emits the single turn-terminal [`Error`](EventKind::Error) for a failing

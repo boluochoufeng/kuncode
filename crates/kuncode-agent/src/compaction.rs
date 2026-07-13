@@ -5,3 +5,4 @@ pub mod budget;
 pub mod protocol;
 pub mod selection;
 pub mod slimming;
+pub mod summary;
