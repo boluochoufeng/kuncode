@@ -1,3 +1,5 @@
+//! SQLite-backed durable session storage.
+
 use std::{
     path::Path,
     sync::atomic::{AtomicU64, Ordering},
@@ -10,22 +12,31 @@ use sqlx::{
 };
 
 use super::{
-    Checkpoint, JournalEntry, NewCheckpoint, NewJournalEntry, NewSession, NewToolArtifact, Seq,
-    SessionId, SessionStore, SessionStoreError, ToolArtifactRef,
+    Checkpoint, CommittedArtifact, CommittedCompaction, JournalEntry, NewCheckpoint,
+    NewCompactionCommit, NewJournalEntry, NewSession, NewToolArtifact, Seq, SessionId,
+    SessionStore, SessionStoreError,
 };
 
 mod artifact;
 mod checkpoint;
+mod compaction;
 mod schema;
 #[cfg(test)]
 mod tests;
 
+/// Uses a single-connection pool to order journal sequences and commits deterministically
+/// within one process.
 #[derive(Debug)]
 pub struct SqliteSessionStore {
     pool: SqlitePool,
 }
 
 impl SqliteSessionStore {
+    /// Opens or initializes the SQLite store and restricts database and sidecar permissions.
+    ///
+    /// # Errors
+    /// Returns an error when directory or permission operations fail, the database
+    /// cannot open, or schema migration fails.
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, SessionStoreError> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
@@ -168,7 +179,7 @@ impl SessionStore for SqliteSessionStore {
         &self,
         session: &SessionId,
         artifact: NewToolArtifact,
-    ) -> Result<ToolArtifactRef, SessionStoreError> {
+    ) -> Result<CommittedArtifact, SessionStoreError> {
         artifact::put(&self.pool, session, artifact).await
     }
 
@@ -181,6 +192,13 @@ impl SessionStore for SqliteSessionStore {
 
     async fn write_checkpoint(&self, checkpoint: NewCheckpoint) -> Result<Seq, SessionStoreError> {
         checkpoint::write(&self.pool, checkpoint).await
+    }
+
+    async fn commit_compaction(
+        &self,
+        commit: NewCompactionCommit,
+    ) -> Result<CommittedCompaction, SessionStoreError> {
+        compaction::commit(&self.pool, commit).await
     }
 
     async fn replay_after(

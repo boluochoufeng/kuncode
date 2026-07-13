@@ -40,8 +40,20 @@ pub(super) async fn write(
 ) -> Result<Seq, SessionStoreError> {
     let mut tx = pool.begin().await?;
     let seq = next_seq(&mut tx, &checkpoint.session_id).await?;
-    validate_checkpoint(&checkpoint, seq)?;
     let now = timestamp();
+    insert(&mut tx, &checkpoint, seq, &now).await?;
+    touch_session(&mut tx, &checkpoint.session_id, &now).await?;
+    tx.commit().await?;
+    Ok(seq)
+}
+
+pub(super) async fn insert(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    checkpoint: &NewCheckpoint,
+    seq: Seq,
+    now: &str,
+) -> Result<(), SessionStoreError> {
+    validate_checkpoint(checkpoint, seq)?;
     let active_messages = dto::messages_to_string(&checkpoint.active_messages)?;
     let summary = checkpoint
         .summary_json
@@ -78,10 +90,10 @@ pub(super) async fn write(
     .bind(checkpoint.source_seq_end.map(Seq::get))
     .bind(active_messages)
     .bind(summary)
-    .bind(checkpoint.model)
+    .bind(&checkpoint.model)
     .bind(token_usage)
-    .bind(&now)
-    .execute(&mut *tx)
+    .bind(now)
+    .execute(&mut **tx)
     .await?;
 
     let payload = serde_json::json!({
@@ -99,12 +111,10 @@ pub(super) async fn write(
     .bind(seq.get())
     .bind(JournalKind::CheckpointRef.as_str())
     .bind(serde_json::to_string(&payload)?)
-    .bind(&now)
-    .execute(&mut *tx)
+    .bind(now)
+    .execute(&mut **tx)
     .await?;
-    touch_session(&mut tx, &checkpoint.session_id, &now).await?;
-    tx.commit().await?;
-    Ok(seq)
+    Ok(())
 }
 
 fn validate_checkpoint(

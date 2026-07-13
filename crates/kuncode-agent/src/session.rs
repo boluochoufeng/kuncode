@@ -3,7 +3,7 @@
 use kuncode_core::completion::Message;
 
 use crate::permission::{PermissionMode, PermissionSessionState};
-use crate::session_store::SessionId;
+use crate::session_store::{CommittedCompaction, Seq, SessionId};
 use crate::todo::{TodoHandle, TodoItem};
 
 /// Active conversation context owned by the caller between agent turns.
@@ -25,6 +25,7 @@ pub struct AgentSession {
     /// [`ToolContext`](crate::tool::ToolContext) so `todo_write` writes here.
     todos: TodoHandle,
     session_id: Option<SessionId>,
+    last_durable_seq: Option<Seq>,
     persistence_error: Option<String>,
     non_durable: bool,
 }
@@ -44,6 +45,7 @@ impl Clone for AgentSession {
             seq: self.seq,
             todos: self.todos.deep_clone(),
             session_id: None,
+            last_durable_seq: None,
             persistence_error: None,
             non_durable: false,
         }
@@ -78,6 +80,7 @@ impl AgentSession {
 
     pub fn attach_session_id(&mut self, id: SessionId) {
         self.session_id = Some(id);
+        self.last_durable_seq = Some(Seq::ZERO);
         self.non_durable = false;
     }
 
@@ -86,7 +89,63 @@ impl AgentSession {
     }
 
     pub(crate) fn is_durable(&self) -> bool {
-        self.session_id.is_some() && !self.non_durable
+        self.session_id.is_some() && self.last_durable_seq.is_some() && !self.non_durable
+    }
+
+    /// Returns the latest journal sequence acknowledged by the store.
+    pub fn durable_seq(&self) -> Option<Seq> {
+        self.last_durable_seq
+    }
+
+    pub(crate) fn advance_durable_seq(&mut self, seq: Seq) {
+        if let Some(current) = &mut self.last_durable_seq
+            && seq > *current
+        {
+            *current = seq;
+        }
+    }
+
+    /// Installs a lossy candidate using a commit receipt bound to this session.
+    ///
+    /// # Errors
+    /// Rejects the candidate without changing the active context when the
+    /// session is non-durable, the receipt belongs to another session, or the
+    /// receipt predates the current durable frontier.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Stage 1 establishes the commit boundary before the compaction orchestrator consumes it"
+        )
+    )]
+    pub(crate) fn install_compacted_context(
+        &mut self,
+        messages: Vec<Message>,
+        committed: CommittedCompaction,
+    ) -> Result<(), SessionMutationError> {
+        if !self.is_durable() {
+            return Err(SessionMutationError::NonDurable);
+        }
+        let current = self
+            .last_durable_seq
+            .ok_or(SessionMutationError::NonDurable)?;
+        let session_id = self
+            .session_id
+            .as_ref()
+            .ok_or(SessionMutationError::NonDurable)?;
+        if committed.session_id() != session_id {
+            return Err(SessionMutationError::SessionMismatch);
+        }
+        let committed_head = committed.journal_head();
+        if committed_head < current {
+            return Err(SessionMutationError::StaleCommit {
+                committed: committed_head.get(),
+                current: current.get(),
+            });
+        }
+        self.messages = messages;
+        self.last_durable_seq = Some(committed_head);
+        Ok(())
     }
 
     pub fn mark_persistence_failed(&mut self, reason: impl Into<String>) {
@@ -164,53 +223,19 @@ impl AgentSession {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn push_user_routes_through_push() {
-        let mut session = AgentSession::new();
-
-        session.push_user("hello");
-
-        assert_eq!(session.messages().len(), 1);
-    }
-
-    #[test]
-    fn clone_does_not_carry_session_id() {
-        let mut session = AgentSession::new();
-        session.attach_session_id(SessionId::new("session-a"));
-        session.push_user("one");
-
-        let mut cloned = session.clone();
-        cloned.push_user("two");
-        assert!(cloned.session_id().is_none());
-        assert_eq!(
-            session.session_id().map(SessionId::as_str),
-            Some("session-a")
-        );
-    }
-
-    #[test]
-    fn unattached_session_writes_nothing() {
-        let mut session = AgentSession::new();
-        session.push_user("hello");
-        assert_eq!(session.messages().len(), 1);
-        assert!(session.take_persistence_error().is_none());
-    }
-
-    #[test]
-    fn persistence_failure_is_reported_once() {
-        let mut session = AgentSession::new();
-
-        session.mark_persistence_failed("disk on fire");
-
-        assert_eq!(
-            session.take_persistence_error(),
-            Some("session persistence failed: disk on fire".to_string())
-        );
-        assert!(session.take_persistence_error().is_none());
-        assert!(!session.is_durable());
-    }
+/// Prevents active-context replacement across an unproven durability boundary.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub(crate) enum SessionMutationError {
+    /// The session lacks a provably complete durable journal.
+    #[error("cannot replace active context for a non-durable session")]
+    NonDurable,
+    /// The receipt cannot be reused across sessions.
+    #[error("compaction receipt belongs to a different session")]
+    SessionMismatch,
+    /// The receipt predates the current durable frontier.
+    #[error("compaction commit {committed} is older than durable journal head {current}")]
+    StaleCommit { committed: i64, current: i64 },
 }
+
+#[cfg(test)]
+mod tests;
