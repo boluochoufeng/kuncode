@@ -2,6 +2,7 @@
 //!
 //! This crate owns the harness layer around `kuncode-core`.
 
+pub mod compaction;
 pub mod error;
 pub mod glob;
 pub mod hook;
