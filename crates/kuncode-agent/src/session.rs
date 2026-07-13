@@ -30,6 +30,24 @@ pub struct AgentSession {
     non_durable: bool,
 }
 
+/// Borrowed proof derived only from a persistence-healthy [`AgentSession`].
+pub(crate) struct DurableSessionContext<'a> {
+    session_id: &'a SessionId,
+    frontier: Seq,
+}
+
+impl DurableSessionContext<'_> {
+    /// Returns the durable session whose journal must authorize compaction.
+    pub(crate) const fn session_id(&self) -> &SessionId {
+        self.session_id
+    }
+
+    /// Returns the latest journal sequence acknowledged by the active session.
+    pub(crate) const fn frontier(&self) -> Seq {
+        self.frontier
+    }
+}
+
 impl Clone for AgentSession {
     /// Hand-written rather than derived: a derived clone would share the
     /// [`TodoHandle`]'s `Arc`, so two sessions would write the same plan.
@@ -90,6 +108,17 @@ impl AgentSession {
 
     pub(crate) fn is_durable(&self) -> bool {
         self.session_id.is_some() && self.last_durable_seq.is_some() && !self.non_durable
+    }
+
+    /// Derives compaction authority only while persistence remains healthy.
+    pub(crate) fn durable_context(&self) -> Option<DurableSessionContext<'_>> {
+        if !self.is_durable() {
+            return None;
+        }
+        Some(DurableSessionContext {
+            session_id: self.session_id.as_ref()?,
+            frontier: self.last_durable_seq?,
+        })
     }
 
     /// Returns the latest journal sequence acknowledged by the store.

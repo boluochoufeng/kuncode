@@ -1,6 +1,6 @@
 use sqlx::{Row, SqlitePool};
 
-use super::{next_seq, timestamp, touch_session};
+use super::{head::compare_and_lock, next_seq, timestamp, touch_session};
 use crate::session_store::{
     CommittedArtifact, JournalKind, NewToolArtifact, Seq, SessionId, SessionStoreError,
     ToolArtifactRef,
@@ -9,9 +9,11 @@ use crate::session_store::{
 pub(super) async fn put(
     pool: &SqlitePool,
     session: &SessionId,
+    expected_journal_head: Seq,
     artifact: NewToolArtifact,
 ) -> Result<CommittedArtifact, SessionStoreError> {
     let mut tx = pool.begin().await?;
+    compare_and_lock(&mut tx, session, expected_journal_head).await?;
     let now = timestamp();
     let result = sqlx::query(
         r#"

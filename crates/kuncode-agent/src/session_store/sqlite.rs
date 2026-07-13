@@ -20,6 +20,7 @@ use super::{
 mod artifact;
 mod checkpoint;
 mod compaction;
+mod head;
 mod schema;
 #[cfg(test)]
 mod tests;
@@ -178,9 +179,10 @@ impl SessionStore for SqliteSessionStore {
     async fn put_tool_artifact(
         &self,
         session: &SessionId,
+        expected_journal_head: Seq,
         artifact: NewToolArtifact,
     ) -> Result<CommittedArtifact, SessionStoreError> {
-        artifact::put(&self.pool, session, artifact).await
+        artifact::put(&self.pool, session, expected_journal_head, artifact).await
     }
 
     async fn latest_checkpoint(

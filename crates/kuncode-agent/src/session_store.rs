@@ -43,14 +43,18 @@ pub trait SessionStore: Send + Sync {
         entry: NewJournalEntry,
     ) -> Result<Seq, SessionStoreError>;
 
-    /// Persists a complete tool result and its journal audit record.
+    /// Persists a complete tool result only while the journal remains at the
+    /// caller-audited head.
     ///
     /// # Errors
-    /// Returns an error when the artifact conflicts with durable content, lacks its
-    /// journal fact, or cannot be committed.
+    /// Returns [`SessionStoreError::JournalHeadConflict`] when another fact was
+    /// committed after the caller audited the session. Also returns an error when
+    /// the artifact conflicts with durable content, lacks its journal fact, or
+    /// cannot be committed.
     async fn put_tool_artifact(
         &self,
         session: &SessionId,
+        expected_journal_head: Seq,
         artifact: NewToolArtifact,
     ) -> Result<CommittedArtifact, SessionStoreError>;
 

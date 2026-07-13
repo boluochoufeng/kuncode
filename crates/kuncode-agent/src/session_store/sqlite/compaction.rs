@@ -4,7 +4,7 @@ use crate::session_store::{
     CommittedCompaction, JournalKind, NewCompactionCommit, Seq, SessionStoreError,
 };
 
-use super::{checkpoint, next_seq, timestamp, touch_session};
+use super::{checkpoint, head::compare_and_lock, next_seq, timestamp, touch_session};
 
 pub(super) async fn commit(
     pool: &SqlitePool,
@@ -12,7 +12,7 @@ pub(super) async fn commit(
 ) -> Result<CommittedCompaction, SessionStoreError> {
     validate_commit(&commit)?;
     let mut tx = pool.begin().await?;
-    compare_and_lock_head(&mut tx, &commit.session_id, commit.expected_journal_head).await?;
+    compare_and_lock(&mut tx, &commit.session_id, commit.expected_journal_head).await?;
     let now = timestamp();
     let compaction_seq = next_seq(&mut tx, &commit.session_id).await?;
     let payload = serde_json::json!({
@@ -44,44 +44,6 @@ pub(super) async fn commit(
         compaction_seq,
         checkpoint_seq,
     ))
-}
-
-async fn compare_and_lock_head(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    session: &crate::session_store::SessionId,
-    expected: Seq,
-) -> Result<(), SessionStoreError> {
-    let result = sqlx::query(
-        r#"
-        UPDATE sessions
-        SET updated_at = updated_at
-        WHERE id = ?
-          AND ? = (
-            SELECT COALESCE(MAX(seq), 0)
-            FROM journal_entries
-            WHERE session_id = ?
-          )
-        "#,
-    )
-    .bind(session.as_str())
-    .bind(expected.get())
-    .bind(session.as_str())
-    .execute(&mut **tx)
-    .await?;
-    if result.rows_affected() == 1 {
-        return Ok(());
-    }
-
-    let actual: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(MAX(seq), 0) FROM journal_entries WHERE session_id = ?",
-    )
-    .bind(session.as_str())
-    .fetch_one(&mut **tx)
-    .await?;
-    Err(SessionStoreError::JournalHeadConflict {
-        expected: expected.get(),
-        actual,
-    })
 }
 
 fn validate_commit(commit: &NewCompactionCommit) -> Result<(), SessionStoreError> {

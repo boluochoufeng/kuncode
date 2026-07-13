@@ -58,13 +58,13 @@ pub enum SessionStoreError {
     /// A compaction commit violates session, source-range, or checkpoint invariants.
     #[error("invalid compaction commit: {0}")]
     InvalidCompaction(String),
-    /// The journal advanced after candidate generation, so the caller must discard
-    /// the candidate and measure again.
+    /// The journal advanced after a compaction or artifact candidate was audited,
+    /// so the caller must discard the candidate and measure again.
     #[error("journal head conflict: expected {expected}, found {actual}")]
     JournalHeadConflict {
-        /// Journal head observed when the candidate was generated.
+        /// Journal head observed when the candidate was generated or audited.
         expected: i64,
-        /// Journal head read by the commit transaction.
+        /// Journal head read by the write transaction.
         actual: i64,
     },
 }

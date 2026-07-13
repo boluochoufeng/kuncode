@@ -2,7 +2,8 @@ use sqlx::Row;
 
 use crate::{
     session_store::{
-        JournalKind, NewSession, NewToolArtifact, Seq, SessionStore, sqlite::SqliteSessionStore,
+        JournalKind, NewJournalEntry, NewSession, NewToolArtifact, Seq, SessionStore,
+        SessionStoreError, sqlite::SqliteSessionStore,
     },
     test_support::TestDir,
 };
@@ -21,11 +22,11 @@ async fn put_tool_artifact_is_idempotent_and_journaled_once() {
         .expect("artifact should be valid");
 
     let first = store
-        .put_tool_artifact(&session, artifact.clone())
+        .put_tool_artifact(&session, Seq::ZERO, artifact.clone())
         .await
         .expect("first artifact write should commit");
     let second = store
-        .put_tool_artifact(&session, artifact)
+        .put_tool_artifact(&session, first.journal_seq(), artifact)
         .await
         .expect("duplicate artifact write should reuse the existing record");
     let entries = store
@@ -66,7 +67,7 @@ async fn put_tool_artifact_rejects_existing_id_with_different_content() {
     let original = NewToolArtifact::inline("caller-hash", "original preview", "original payload")
         .expect("artifact should be valid");
     let first = store
-        .put_tool_artifact(&session, original.clone())
+        .put_tool_artifact(&session, Seq::ZERO, original.clone())
         .await
         .expect("first artifact write should commit");
 
@@ -74,6 +75,7 @@ async fn put_tool_artifact_rejects_existing_id_with_different_content() {
     let conflict = store
         .put_tool_artifact(
             &session,
+            first.journal_seq(),
             NewToolArtifact::inline("caller-hash", "changed preview", "changed payload")
                 .expect("conflicting artifact should be structurally valid"),
         )
@@ -91,7 +93,7 @@ async fn put_tool_artifact_rejects_existing_id_with_different_content() {
         .expect_err("different durable content must be rejected")
         .to_string();
     let repeated = store
-        .put_tool_artifact(&session, original)
+        .put_tool_artifact(&session, first.journal_seq(), original)
         .await
         .expect("unchanged duplicate should retain its original receipt");
     let row = sqlx::query(
@@ -140,6 +142,7 @@ async fn distinct_artifacts_receive_monotonic_journal_receipts() {
     let first = store
         .put_tool_artifact(
             &session,
+            Seq::ZERO,
             NewToolArtifact::inline("sha256-first", "first", "first payload")
                 .expect("first artifact should be valid"),
         )
@@ -148,6 +151,7 @@ async fn distinct_artifacts_receive_monotonic_journal_receipts() {
     let second = store
         .put_tool_artifact(
             &session,
+            first.journal_seq(),
             NewToolArtifact::inline("sha256-second", "second", "second payload")
                 .expect("second artifact should be valid"),
         )
@@ -170,7 +174,7 @@ async fn existing_artifact_without_journal_entry_is_rejected() {
     let artifact = NewToolArtifact::inline("sha256-orphan", "preview", "payload")
         .expect("artifact should be valid");
     store
-        .put_tool_artifact(&session, artifact.clone())
+        .put_tool_artifact(&session, Seq::ZERO, artifact.clone())
         .await
         .expect("artifact should commit");
     sqlx::query("DELETE FROM journal_entries WHERE session_id = ?")
@@ -179,10 +183,76 @@ async fn existing_artifact_without_journal_entry_is_rejected() {
         .await
         .expect("test fixture should remove journal entry");
 
-    let result = store.put_tool_artifact(&session, artifact).await;
+    let result = store.put_tool_artifact(&session, Seq::ZERO, artifact).await;
 
     assert!(matches!(
         result,
         Err(crate::session_store::SessionStoreError::ToolArtifactJournalMissing { .. })
     ));
+}
+
+#[tokio::test]
+async fn artifact_put_rejects_stale_head_before_new_or_idempotent_writes() {
+    let root = TestDir::new();
+    let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+        .await
+        .expect("store should open");
+    let session = store
+        .create_session(NewSession::new(root.path().to_path_buf()))
+        .await
+        .expect("session should be created");
+    let existing = NewToolArtifact::inline("sha256-existing", "preview", "payload")
+        .expect("artifact should be valid");
+    let first = store
+        .put_tool_artifact(&session, Seq::ZERO, existing.clone())
+        .await
+        .expect("first artifact should commit");
+    let actual = store
+        .append(
+            &session,
+            NewJournalEntry::raw(
+                JournalKind::SessionNote,
+                serde_json::json!({ "note": "concurrent" }),
+            ),
+        )
+        .await
+        .expect("concurrent fact should commit");
+
+    let repeated = store
+        .put_tool_artifact(&session, first.journal_seq(), existing)
+        .await;
+    let new_artifact = store
+        .put_tool_artifact(
+            &session,
+            first.journal_seq(),
+            NewToolArtifact::inline("sha256-new", "new", "new payload")
+                .expect("new artifact should be valid"),
+        )
+        .await;
+    let entries = store
+        .replay_after(&session, Seq::ZERO)
+        .await
+        .expect("journal should replay");
+    let artifact_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM tool_artifacts WHERE session_id = ?")
+            .bind(session.as_str())
+            .fetch_one(&store.pool)
+            .await
+            .expect("artifact rows should be queryable");
+
+    for result in [repeated, new_artifact] {
+        assert!(matches!(
+            result,
+            Err(SessionStoreError::JournalHeadConflict { expected, actual: found })
+                if expected == first.journal_seq().get() && found == actual.get()
+        ));
+    }
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| entry.kind == JournalKind::ToolArtifact.as_str())
+            .count(),
+        1
+    );
+    assert_eq!(artifact_rows, 1);
 }

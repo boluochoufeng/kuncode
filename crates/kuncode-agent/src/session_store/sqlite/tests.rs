@@ -1,4 +1,5 @@
 mod artifact;
+mod artifact_concurrency;
 mod checkpoint;
 mod checkpoint_validation;
 mod compaction;
