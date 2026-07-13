@@ -1,0 +1,10 @@
+include!("tests/support_tools.rs");
+include!("tests/core_flow.rs");
+include!("tests/turn_and_permissions.rs");
+include!("tests/cancellation.rs");
+include!("tests/observers_persistence.rs");
+include!("tests/persistence_todo.rs");
+include!("tests/todo_errors.rs");
+include!("tests/events.rs");
+include!("tests/hooks_prompt.rs");
+include!("tests/hooks_tool_stop.rs");
