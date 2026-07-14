@@ -20,7 +20,7 @@ use crate::{
     tool::ToolResultRetention,
 };
 
-use super::{AgentConfig, AgentRunner, compaction::RequestGroupEstimator, events::error_kind};
+use super::{AgentConfig, AgentRunner, compaction::RequestGroupEstimator};
 
 impl<M> AgentRunner<M>
 where
@@ -233,5 +233,20 @@ where
             },
         );
         error
+    }
+}
+
+// Keep the stable external code mapping exhaustive so new errors require an
+// explicit observability decision.
+fn error_kind(error: &AgentError) -> &'static str {
+    match error {
+        AgentError::Completion(_) => "completion",
+        AgentError::Tool { .. } => "tool",
+        AgentError::EmptyTranscript => "empty_transcript",
+        AgentError::RequestEncoding(_) => "request_encoding",
+        AgentError::Compaction { .. } => "compaction",
+        AgentError::Cancelled => "cancelled",
+        AgentError::PromptBlocked { .. } => "prompt_blocked",
+        AgentError::MaxIterations { .. } => "max_iterations",
     }
 }

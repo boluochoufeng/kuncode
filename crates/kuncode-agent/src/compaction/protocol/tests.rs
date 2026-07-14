@@ -5,9 +5,8 @@ use kuncode_core::{
 
 use super::ProtocolGroup;
 
-mod anchor;
+mod boundaries;
 mod grouping;
-mod selection;
 
 pub(super) fn assistant_with_calls(calls: &[(&str, Option<&str>)]) -> Message {
     let blocks = calls

@@ -13,5 +13,4 @@ include!("tests/automatic_compaction.rs");
 include!("tests/automatic_compaction_sqlite.rs");
 include!("tests/compaction_fail_closed.rs");
 include!("tests/compaction_redaction.rs");
-include!("tests/compaction_guard.rs");
 include!("tests/large_tool_result_compaction.rs");

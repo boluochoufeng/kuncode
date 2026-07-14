@@ -19,9 +19,7 @@ use crate::{
     tool::ToolOutput,
 };
 
-mod binding;
-mod boundaries;
-mod identity;
+mod invariants;
 mod provenance;
 mod retention;
 

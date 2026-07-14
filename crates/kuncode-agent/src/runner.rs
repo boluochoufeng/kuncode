@@ -2,7 +2,6 @@
 
 mod cancellation;
 mod compaction;
-mod events;
 mod iteration;
 mod loop_control;
 mod request;
