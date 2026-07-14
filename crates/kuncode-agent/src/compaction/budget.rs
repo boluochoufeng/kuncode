@@ -280,5 +280,4 @@ impl ContextBudget {
 }
 
 #[cfg(test)]
-#[path = "budget/tests.rs"]
 mod tests;

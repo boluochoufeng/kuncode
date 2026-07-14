@@ -10,7 +10,6 @@ const CONTEXT_LIMIT: u64 = 1_000;
 const RESERVED_OUTPUT: u64 = 100;
 const SAFETY_MARGIN: u64 = 100;
 
-#[path = "tests/estimator.rs"]
 mod estimator;
 
 fn config() -> CompactionConfig {

@@ -30,11 +30,8 @@ use crate::{
     session::AgentSession,
 };
 
-#[path = "support_fixture.rs"]
 mod fixture;
-#[path = "support_store.rs"]
 mod store;
-#[path = "support_summary.rs"]
 mod summary;
 
 pub(super) use fixture::{DurableFixture, artifact_history, ordinary_history};

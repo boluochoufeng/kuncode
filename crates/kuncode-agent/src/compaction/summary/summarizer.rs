@@ -210,5 +210,4 @@ where
 }
 
 #[cfg(test)]
-#[path = "summarizer/tests.rs"]
 mod tests;

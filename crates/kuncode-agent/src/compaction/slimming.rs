@@ -210,5 +210,4 @@ fn replace_result(
 }
 
 #[cfg(test)]
-#[path = "slimming/tests.rs"]
 mod tests;

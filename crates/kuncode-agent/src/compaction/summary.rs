@@ -28,5 +28,4 @@ pub fn continuity_summary_schema() -> Result<serde_json::Value, SummaryError> {
 }
 
 #[cfg(test)]
-#[path = "summary/tests.rs"]
 mod tests;

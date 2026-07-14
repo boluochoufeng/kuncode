@@ -5,7 +5,6 @@ use crate::compaction::protocol::{
     HumanMessageIndex, group_messages, select_protected_recent_tail,
 };
 
-#[path = "tests/boundaries.rs"]
 mod boundaries;
 
 #[test]

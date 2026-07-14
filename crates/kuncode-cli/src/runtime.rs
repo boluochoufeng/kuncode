@@ -224,5 +224,4 @@ impl<M: CompletionModel> CliRuntime<M> {
 }
 
 #[cfg(test)]
-#[path = "runtime/tests.rs"]
 mod tests;

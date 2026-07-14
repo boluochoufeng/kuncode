@@ -198,5 +198,4 @@ fn flatten(groups: &[ProtocolGroup]) -> Vec<Message> {
 }
 
 #[cfg(test)]
-#[path = "selection/tests.rs"]
 mod tests;

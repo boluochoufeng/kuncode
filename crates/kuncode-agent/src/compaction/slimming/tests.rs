@@ -19,15 +19,10 @@ use crate::{
     tool::ToolOutput,
 };
 
-#[path = "tests/binding.rs"]
 mod binding;
-#[path = "tests/boundaries.rs"]
 mod boundaries;
-#[path = "tests/identity.rs"]
 mod identity;
-#[path = "tests/provenance.rs"]
 mod provenance;
-#[path = "tests/retention.rs"]
 mod retention;
 
 #[tokio::test]

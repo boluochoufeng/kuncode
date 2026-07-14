@@ -256,5 +256,4 @@ impl std::fmt::Display for SettingsError {
 impl std::error::Error for SettingsError {}
 
 #[cfg(test)]
-#[path = "settings/tests.rs"]
 mod tests;
