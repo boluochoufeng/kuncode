@@ -16,11 +16,16 @@ use crate::{
     providers::deepseek::protocol::{DeepSeekCompletionRequest, DeepSeekCompletionResponse},
 };
 
+mod model;
 pub(crate) mod protocol;
+
+pub use model::{
+    DEEPSEEK_V4_FLASH_MODEL_ID, DEEPSEEK_V4_PRO_MODEL_ID, DeepSeekModelProfile, model_profile,
+};
 
 const DEEPSEEK_API_BASE_URL: &str = "https://api.deepseek.com";
 #[cfg(test)]
-const DEEPSEEK_V4_FLASH: &str = "deepseek-v4-flash";
+const DEEPSEEK_V4_FLASH: &str = DEEPSEEK_V4_FLASH_MODEL_ID;
 
 /// Bound on dialing the endpoint.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);

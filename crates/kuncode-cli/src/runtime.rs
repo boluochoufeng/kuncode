@@ -29,7 +29,7 @@ use kuncode_core::providers::deepseek::{DeepSeekClient, DeepSeekCompletionModel}
 
 use crate::Cli;
 use crate::config::{PermissionFlags, resolve_permissions};
-use crate::settings::{ProjectCompaction, load_project_settings};
+use crate::settings::{ProjectSettings, load_project_settings};
 
 /// Identity and behavioral instructions rendered as the first system-prompt
 /// block. Folds in guidance to maintain a plan via `todo_write`.
@@ -83,7 +83,8 @@ impl CliRuntime<RetryModel<DeepSeekCompletionModel>> {
         // The merge is pure and tested in `config`; loading the project file
         // (I/O) stays in `settings`.
         let project = load_project_settings(workspace.root())?;
-        let project_compaction = project.compaction;
+        let model_name = project.model_name.clone();
+        let config = agent_config(&project)?;
         let flags = PermissionFlags {
             allow: &cli.allow,
             ask: &cli.ask,
@@ -111,8 +112,6 @@ impl CliRuntime<RetryModel<DeepSeekCompletionModel>> {
             None => (None, Some("home directory unavailable".to_string())),
         };
         let client = DeepSeekClient::from_env()?;
-        let model_name =
-            std::env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| "deepseek-v4-flash".to_string());
         // Normal turns inherit the default retry budget. Semantic summaries use
         // a separate one-retry wrapper so their fallback latency is bounded
         // independently of ordinary model calls.
@@ -120,7 +119,6 @@ impl CliRuntime<RetryModel<DeepSeekCompletionModel>> {
         let model = RetryModel::with_policy(provider.clone(), RetryPolicy::default());
         let summary_model = RetryModel::with_policy(provider, summary_retry_policy());
         let registry = ToolRegistry::with_default_workspace_tools(workspace);
-        let config = agent_config(project_compaction, &model_name)?;
 
         Ok(Self {
             model,
@@ -138,22 +136,15 @@ impl CliRuntime<RetryModel<DeepSeekCompletionModel>> {
     }
 }
 
-fn agent_config(
-    project_compaction: Option<ProjectCompaction>,
-    model_name: &str,
-) -> Result<AgentConfig, AgentCompactionConfigError> {
-    // The same allowance must cap provider output and remain unavailable to the
-    // input window; otherwise accounting could admit a request with no room for
-    // the response it asks the provider to generate.
-    let max_tokens = project_compaction
-        .map(ProjectCompaction::reserved_output)
-        .or(AgentConfig::default().max_tokens);
-    let compaction = project_compaction
-        .map(|settings| settings.into_runtime(model_name))
+fn agent_config(project: &ProjectSettings) -> Result<AgentConfig, AgentCompactionConfigError> {
+    let compaction = project
+        .compaction
+        .map(|settings| settings.into_runtime(&project.model_name))
         .transpose()?;
     Ok(AgentConfig {
-        max_tokens,
-        todo_reminder_interval: Some(3),
+        max_iterations: project.max_iterations,
+        max_tokens: Some(project.max_tokens),
+        todo_reminder_interval: project.todo_reminder_interval,
         compaction,
         ..AgentConfig::default()
     })
@@ -226,39 +217,46 @@ impl<M: CompletionModel> CliRuntime<M> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::settings::load_project_settings;
+    use crate::settings::{ProjectSettings, load_project_settings_from};
     use std::fs;
 
-    fn compaction_settings(tag: &str) -> crate::settings::ProjectCompaction {
+    fn compaction_settings(tag: &str) -> ProjectSettings {
         let dir =
             std::env::temp_dir().join(format!("kuncode-runtime-{}-{tag}", std::process::id()));
         fs::create_dir_all(dir.join(".kuncode")).expect("temp dir");
         fs::write(
             dir.join(".kuncode/settings.json"),
-            r#"{ "compaction": {
+            r#"{
+            "model": { "maxTokens": 8192 },
+            "compaction": {
                 "mode": "enabled",
                 "contextLimit": 131072,
                 "reservedOutput": 8192
             } }"#,
         )
         .expect("write settings");
-        let settings = load_project_settings(&dir).expect("load settings");
+        let settings = load_project_settings_from(&dir, None).expect("load settings");
         let _ = fs::remove_dir_all(&dir);
-        settings.compaction.expect("active compaction")
+        settings
     }
 
     #[test]
     fn absent_compaction_keeps_agent_default_disabled() {
-        let config = agent_config(None, "deepseek-v4-flash").expect("valid agent config");
+        let project = ProjectSettings::default();
+        let config = agent_config(&project).expect("valid agent config");
 
         assert!(config.compaction.is_none());
+        assert_eq!(config.max_tokens, Some(65_536));
+        assert_eq!(config.max_iterations, 50);
+        assert_eq!(config.todo_reminder_interval, Some(3));
     }
 
     #[test]
     fn active_compaction_is_bound_to_runtime_model_name() {
-        let settings = compaction_settings("model-binding");
+        let mut settings = compaction_settings("model-binding");
+        settings.model_name = " ".to_string();
 
-        let error = agent_config(Some(settings), " ").expect_err("blank runtime model must fail");
+        let error = agent_config(&settings).expect_err("blank runtime model must fail");
 
         assert_eq!(error, AgentCompactionConfigError::BlankModelId);
     }
@@ -267,8 +265,7 @@ mod tests {
     fn active_compaction_is_installed_for_concrete_model() {
         let settings = compaction_settings("model-enabled");
 
-        let config =
-            agent_config(Some(settings), "deepseek-v4-flash").expect("valid runtime model");
+        let config = agent_config(&settings).expect("valid runtime model");
 
         assert!(config.compaction.is_some());
         assert_eq!(config.max_tokens, Some(8_192));

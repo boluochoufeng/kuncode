@@ -116,6 +116,7 @@ mod tests {
             policy,
             default_mode: None,
             compaction: None,
+            ..ProjectSettings::default()
         }
     }
 
@@ -140,6 +141,7 @@ mod tests {
             policy: PermissionPolicy::new(),
             default_mode: Some(mode),
             compaction: None,
+            ..ProjectSettings::default()
         }
     }
 
