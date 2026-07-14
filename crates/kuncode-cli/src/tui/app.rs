@@ -1,10 +1,12 @@
 //! TUI application state and the agent-event reducer.
 
+mod approval;
+mod input;
+
 use std::time::Duration;
 
-use crossterm::event::{KeyCode, KeyEvent};
 use kuncode_agent::observer::EventKind;
-use kuncode_agent::permission::{ApprovalOutcome, PermissionMode};
+use kuncode_agent::permission::PermissionMode;
 use kuncode_agent::todo::TodoItem;
 
 use super::bridge::ApprovalRequest;
@@ -12,10 +14,11 @@ use crate::view::{ToolOutcome, ViewEffect, view};
 
 /// Whether a turn is in flight. Gates input submission (one turn at a time) and
 /// whether the input box / cursor is shown.
-#[derive(PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
     Idle,
     Running,
+    Compacting,
 }
 
 /// Lifecycle of one tool call as the event stream reports it.
@@ -42,6 +45,8 @@ pub enum Item {
         state: ToolState,
     },
     Error(String),
+    /// A presentation-only marker; it never enters the agent transcript.
+    Compaction,
     /// A non-fatal harness notice (e.g. session persistence degraded);
     /// rendered apart from [`Error`](Self::Error) — the turn kept going.
     Warning(String),
@@ -116,128 +121,6 @@ impl App {
         }
     }
 
-    // --- Input editing (idle) -------------------------------------------------
-    //
-    // All edits happen at [`cursor`](Self::cursor); movement keeps it on a char
-    // boundary. Up/Down move by *logical* line (not wrapped row) so this state
-    // needs no knowledge of the render width; a step recomputes the column, so
-    // passing through a short line clamps the column rather than remembering a
-    // goal column.
-
-    pub fn insert_char(&mut self, c: char) {
-        self.input.insert(self.cursor, c);
-        self.cursor += c.len_utf8();
-    }
-
-    pub fn insert_newline(&mut self) {
-        self.insert_char('\n');
-    }
-
-    /// Deletes the char before the cursor (Backspace). No-op at the start.
-    pub fn backspace(&mut self) {
-        if let Some(prev) = self.prev_boundary() {
-            self.input.remove(prev);
-            self.cursor = prev;
-        }
-    }
-
-    /// Deletes the char at the cursor (Delete). No-op at the end.
-    pub fn delete(&mut self) {
-        if self.cursor < self.input.len() {
-            self.input.remove(self.cursor);
-        }
-    }
-
-    pub fn move_left(&mut self) {
-        if let Some(prev) = self.prev_boundary() {
-            self.cursor = prev;
-        }
-    }
-
-    pub fn move_right(&mut self) {
-        if let Some(next) = self.next_boundary() {
-            self.cursor = next;
-        }
-    }
-
-    /// Moves to the start of the current logical line (after the preceding `\n`).
-    pub fn move_home(&mut self) {
-        self.cursor = self.current_line().0;
-    }
-
-    /// Moves to the end of the current logical line (before the next `\n`).
-    pub fn move_end(&mut self) {
-        self.cursor = self.current_line().1;
-    }
-
-    /// Moves to the previous logical line, keeping the column. No-op on the first
-    /// line; a shorter target line clamps the cursor to its end.
-    pub fn move_up(&mut self) {
-        let (start, _) = self.current_line();
-        if start == 0 {
-            return;
-        }
-        let col = self.input[start..self.cursor].chars().count();
-        let prev_end = start - 1; // the '\n' joining the two lines
-        let prev_start = self.input[..prev_end].rfind('\n').map_or(0, |i| i + 1);
-        self.cursor = self.byte_at_column(prev_start, prev_end, col);
-    }
-
-    /// Moves to the next logical line, keeping the column. No-op on the last line.
-    pub fn move_down(&mut self) {
-        let (start, end) = self.current_line();
-        if end == self.input.len() {
-            return;
-        }
-        let col = self.input[start..self.cursor].chars().count();
-        let next_start = end + 1; // skip the '\n'
-        let next_end = self.input[next_start..]
-            .find('\n')
-            .map_or(self.input.len(), |rel| next_start + rel);
-        self.cursor = self.byte_at_column(next_start, next_end, col);
-    }
-
-    /// Takes the current input, leaving the box empty and the cursor at the start.
-    pub fn take_input(&mut self) -> String {
-        self.cursor = 0;
-        std::mem::take(&mut self.input)
-    }
-
-    /// Byte offset of the char boundary before the cursor, or `None` at the start.
-    fn prev_boundary(&self) -> Option<usize> {
-        self.input[..self.cursor]
-            .chars()
-            .next_back()
-            .map(|c| self.cursor - c.len_utf8())
-    }
-
-    /// Byte offset of the char boundary after the cursor, or `None` at the end.
-    fn next_boundary(&self) -> Option<usize> {
-        self.input[self.cursor..]
-            .chars()
-            .next()
-            .map(|c| self.cursor + c.len_utf8())
-    }
-
-    /// Byte range `[start, end)` of the logical line holding the cursor: from
-    /// just after the preceding `\n` to just before the next one (or input end).
-    fn current_line(&self) -> (usize, usize) {
-        let start = self.input[..self.cursor].rfind('\n').map_or(0, |i| i + 1);
-        let end = self.input[self.cursor..]
-            .find('\n')
-            .map_or(self.input.len(), |rel| self.cursor + rel);
-        (start, end)
-    }
-
-    /// Byte offset of the `col`-th char within line `[start, end)`, clamped to
-    /// `end` when the line has fewer than `col` chars.
-    fn byte_at_column(&self, start: usize, end: usize, col: usize) -> usize {
-        self.input[start..end]
-            .char_indices()
-            .nth(col)
-            .map_or(end, |(off, _)| start + off)
-    }
-
     // --- Scrolling ------------------------------------------------------------
 
     /// Scrolls up by `lines`, dropping auto-follow so new output won't yank the
@@ -276,6 +159,9 @@ impl App {
     pub fn push_error(&mut self, text: String) {
         // A turn that errored/cancelled mid-stream drops its live preview.
         self.clear_stream_preview();
+        if self.status == Status::Compacting {
+            self.status = Status::Running;
+        }
         self.conversation.push(Item::Error(text));
     }
 
@@ -336,7 +222,23 @@ impl App {
         match &kind {
             EventKind::ModelStart => {
                 // A new model call: drop any leftover preview from the last one.
+                if self.status == Status::Compacting {
+                    self.status = Status::Running;
+                }
                 self.clear_stream_preview();
+                return;
+            }
+            EventKind::CompactionStarted { .. } => {
+                self.status = Status::Compacting;
+                return;
+            }
+            EventKind::CompactionCompleted { .. } => {
+                self.status = Status::Running;
+                self.conversation.push(Item::Compaction);
+                return;
+            }
+            EventKind::CompactionFailed { .. } => {
+                self.status = Status::Running;
                 return;
             }
             EventKind::TextDelta { text } => {
@@ -412,36 +314,6 @@ impl App {
                 _ => None,
             })
     }
-
-    // --- Approval modal -------------------------------------------------------
-
-    pub fn set_approval(&mut self, req: ApprovalRequest) {
-        self.approval = Some(req);
-    }
-
-    /// Resolves a pending approval from a key press, sending the outcome back to
-    /// the waiting `TuiApprover`. No-op for keys that aren't a choice.
-    pub fn handle_approval_key(&mut self, key: KeyEvent) {
-        let choice = match key.code {
-            KeyCode::Char('y') => Choice::AllowOnce,
-            KeyCode::Char('a') => Choice::AllowAlways,
-            KeyCode::Char('n') => Choice::DenyOnce,
-            KeyCode::Char('d') => Choice::DenyAlways,
-            KeyCode::Char('c') | KeyCode::Esc => Choice::Abort,
-            _ => return,
-        };
-        let Some(req) = self.approval.take() else {
-            return;
-        };
-        let outcome = match choice {
-            Choice::AllowOnce => ApprovalOutcome::AllowOnce,
-            Choice::AllowAlways => ApprovalOutcome::AllowAlways(req.scope),
-            Choice::DenyOnce => ApprovalOutcome::DenyOnce,
-            Choice::DenyAlways => ApprovalOutcome::DenyAlways(req.scope),
-            Choice::Abort => ApprovalOutcome::Abort,
-        };
-        let _ = req.respond.send(outcome);
-    }
 }
 
 /// Byte offset reached by stepping `chars` chars forward from `from` in `text`,
@@ -452,15 +324,6 @@ fn advance_by_chars(text: &str, from: usize, chars: usize) -> usize {
         Some((rel, _)) => from + rel,
         None => text.len(),
     }
-}
-
-/// Approval choice decoded from a key, before the (consuming) outcome is built.
-enum Choice {
-    AllowOnce,
-    AllowAlways,
-    DenyOnce,
-    DenyAlways,
-    Abort,
 }
 
 /// Short label for the status line. Mirrors [`PermissionMode::parse`]'s short
@@ -474,361 +337,4 @@ pub fn mode_label(mode: PermissionMode) -> &'static str {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use kuncode_agent::observer::ToolFailure;
-    use kuncode_agent::tool::ToolErrorKind;
-
-    fn app() -> App {
-        App::new("model", PermissionMode::Default)
-    }
-
-    fn tool_start(id: &str) -> EventKind {
-        EventKind::ToolStart {
-            tool_call_id: id.to_string(),
-            tool: "bash".to_string(),
-            summary: "run ls".to_string(),
-        }
-    }
-
-    #[test]
-    fn tool_start_then_ok_updates_the_same_entry() {
-        let mut app = app();
-        app.apply_event(tool_start("1"));
-        app.apply_event(EventKind::ToolEnd {
-            tool_call_id: "1".to_string(),
-            tool: "bash".to_string(),
-            ok: true,
-            truncated: true,
-            error: None,
-        });
-        // One entry (not two), flipped to Ok with the truncation flag carried.
-        match app.conversation.as_slice() {
-            [
-                Item::Tool {
-                    state: ToolState::Ok { truncated: true },
-                    ..
-                },
-            ] => {}
-            other => panic!("unexpected log: {} items", other.len()),
-        }
-    }
-
-    #[test]
-    fn denial_reads_apart_from_a_failure() {
-        let mut app = app();
-        app.apply_event(tool_start("1"));
-        app.apply_event(EventKind::ToolEnd {
-            tool_call_id: "1".to_string(),
-            tool: "bash".to_string(),
-            ok: false,
-            truncated: false,
-            error: Some(ToolFailure {
-                kind: ToolErrorKind::PermissionDenied,
-                message: "blocked".to_string(),
-            }),
-        });
-        assert!(matches!(
-            app.conversation.as_slice(),
-            [Item::Tool {
-                state: ToolState::Denied(_),
-                ..
-            }]
-        ));
-    }
-
-    #[test]
-    fn tool_end_without_a_start_still_surfaces() {
-        // The runner reports an unknown tool / bad arguments as a `ToolEnd` with no
-        // preceding `ToolStart`; it must still show up, not vanish.
-        let mut app = app();
-        app.apply_event(EventKind::ToolEnd {
-            tool_call_id: "1".to_string(),
-            tool: "mystery".to_string(),
-            ok: false,
-            truncated: false,
-            error: Some(ToolFailure {
-                kind: ToolErrorKind::UnknownTool,
-                message: "no such tool".to_string(),
-            }),
-        });
-        match app.conversation.as_slice() {
-            [
-                Item::Tool {
-                    name,
-                    state: ToolState::Failed(_),
-                    ..
-                },
-            ] => assert_eq!(name, "mystery"),
-            _ => panic!("orphan ToolEnd should surface as a tool entry"),
-        }
-    }
-
-    fn todo(content: &str, status: kuncode_agent::todo::TodoStatus) -> TodoItem {
-        TodoItem {
-            content: content.to_string(),
-            active_form: format!("{content}…"),
-            status,
-        }
-    }
-
-    #[test]
-    fn todo_update_replaces_the_live_plan_without_touching_the_log() {
-        use kuncode_agent::todo::TodoStatus;
-        let mut app = app();
-        app.apply_event(EventKind::TodoUpdate {
-            todos: vec![todo("a", TodoStatus::InProgress)],
-        });
-        // Intervening log activity must not move or duplicate the plan: it is a
-        // sticky panel, not a conversation entry.
-        app.push_user("keep going".to_string());
-        app.apply_event(EventKind::TodoUpdate {
-            todos: vec![
-                todo("a", TodoStatus::Completed),
-                todo("b", TodoStatus::InProgress),
-            ],
-        });
-        // The plan field holds the latest snapshot wholesale.
-        assert_eq!(app.plan.len(), 2);
-        assert_eq!(app.plan[0].status, TodoStatus::Completed);
-        assert_eq!(app.plan[1].content, "b");
-        // The log only has the user message — no plan entry leaked into it.
-        assert!(matches!(app.conversation.as_slice(), [Item::User(_)]));
-    }
-
-    #[test]
-    fn clearing_the_plan_empties_the_panel() {
-        use kuncode_agent::todo::TodoStatus;
-        let mut app = app();
-        app.apply_event(EventKind::TodoUpdate {
-            todos: vec![todo("a", TodoStatus::InProgress)],
-        });
-        // An empty plan clears it: the panel is hidden, not left as a stale list.
-        app.apply_event(EventKind::TodoUpdate { todos: vec![] });
-        assert!(app.plan.is_empty());
-    }
-
-    #[test]
-    fn call_free_assistant_event_is_not_logged() {
-        // The final answer arrives via `push_assistant`; the reducer must ignore
-        // the call-free `Assistant` event so it is not doubled.
-        let mut app = app();
-        app.apply_event(EventKind::Assistant {
-            text: "done".to_string(),
-            tool_calls: vec![],
-        });
-        assert!(app.conversation.is_empty());
-    }
-
-    #[test]
-    fn narration_alongside_calls_is_logged() {
-        let mut app = app();
-        app.apply_event(EventKind::Assistant {
-            text: "let me check".to_string(),
-            tool_calls: vec!["1".to_string()],
-        });
-        match app.conversation.as_slice() {
-            [Item::Assistant(text)] => assert_eq!(text, "let me check"),
-            _ => panic!("narration not logged"),
-        }
-    }
-
-    #[test]
-    fn streamed_deltas_preview_then_finalize_without_duplication() {
-        let mut app = app();
-        app.apply_event(EventKind::ModelStart);
-        app.apply_event(EventKind::TextDelta {
-            text: "Hel".to_string(),
-        });
-        app.apply_event(EventKind::TextDelta {
-            text: "lo".to_string(),
-        });
-        // Live preview accumulates; nothing committed to the log yet.
-        assert_eq!(app.stream_answer, "Hello");
-        assert!(app.conversation.is_empty());
-
-        // The call-free `Assistant` event is ignored (preview kept to avoid a
-        // blank frame); the turn driver commits the final answer.
-        app.apply_event(EventKind::Assistant {
-            text: "Hello".to_string(),
-            tool_calls: vec![],
-        });
-        assert_eq!(app.stream_answer, "Hello", "preview survives until commit");
-
-        app.push_assistant("Hello".to_string());
-        assert!(app.stream_answer.is_empty(), "commit clears the preview");
-        match app.conversation.as_slice() {
-            [Item::Assistant(text)] => assert_eq!(text, "Hello"),
-            _ => panic!("final answer should be the single committed item"),
-        }
-    }
-
-    #[test]
-    fn reasoning_streams_into_its_own_buffer() {
-        let mut app = app();
-        app.apply_event(EventKind::ReasoningDelta {
-            text: "think ".to_string(),
-        });
-        app.apply_event(EventKind::ReasoningDelta {
-            text: "hard".to_string(),
-        });
-        assert_eq!(app.stream_reasoning, "think hard");
-        assert!(
-            app.stream_answer.is_empty(),
-            "reasoning is a separate channel"
-        );
-    }
-
-    #[test]
-    fn narration_event_clears_the_streamed_preview() {
-        let mut app = app();
-        app.apply_event(EventKind::TextDelta {
-            text: "let me check".to_string(),
-        });
-        app.apply_event(EventKind::Assistant {
-            text: "let me check".to_string(),
-            tool_calls: vec!["1".to_string()],
-        });
-        // Narration commits as one item; the preview is gone (not double-shown).
-        assert!(app.stream_answer.is_empty());
-        match app.conversation.as_slice() {
-            [Item::Assistant(text)] => assert_eq!(text, "let me check"),
-            _ => panic!("narration not committed exactly once"),
-        }
-    }
-
-    #[test]
-    fn model_start_clears_a_stale_preview() {
-        let mut app = app();
-        app.stream_answer = "leftover".to_string();
-        app.stream_reasoning = "stale".to_string();
-        app.apply_event(EventKind::ModelStart);
-        assert!(app.stream_answer.is_empty() && app.stream_reasoning.is_empty());
-    }
-
-    #[test]
-    fn reveal_paces_at_the_rate_and_caps_at_received() {
-        let mut app = app();
-        app.apply_event(EventKind::TextDelta {
-            text: "abcdef".to_string(),
-        });
-        // 120 cps over 33ms ≈ 4 chars per tick.
-        assert!(app.advance_reveal(Duration::from_millis(33), 120));
-        assert_eq!(&app.stream_answer[..app.answer_revealed], "abcd");
-        assert!(app.advance_reveal(Duration::from_millis(33), 120));
-        assert_eq!(&app.stream_answer[..app.answer_revealed], "abcdef");
-        // Caught up: nothing left to reveal, so no redraw is requested.
-        assert!(!app.advance_reveal(Duration::from_millis(33), 120));
-        assert!(!app.has_pending_reveal());
-    }
-
-    #[test]
-    fn reveal_spends_budget_on_reasoning_before_the_answer() {
-        let mut app = app();
-        app.apply_event(EventKind::ReasoningDelta {
-            text: "rr".to_string(),
-        });
-        app.apply_event(EventKind::TextDelta {
-            text: "aaaa".to_string(),
-        });
-        // Budget of 3: 2 chars finish reasoning, the remaining 1 starts the answer.
-        app.advance_reveal(Duration::from_secs(1), 3);
-        assert_eq!(&app.stream_reasoning[..app.reasoning_revealed], "rr");
-        assert_eq!(&app.stream_answer[..app.answer_revealed], "a");
-    }
-
-    #[test]
-    fn reveal_never_splits_a_multibyte_char() {
-        let mut app = app();
-        app.apply_event(EventKind::TextDelta {
-            text: "héllo".to_string(), // 'é' is two bytes
-        });
-        // One char per tick, walking across the multi-byte boundary; the slice
-        // must always stay valid UTF-8 (would panic otherwise).
-        for _ in 0..6 {
-            app.advance_reveal(Duration::from_millis(1), 1);
-            let _shown = &app.stream_answer[..app.answer_revealed];
-        }
-        assert_eq!(&app.stream_answer[..app.answer_revealed], "héllo");
-    }
-
-    #[test]
-    fn input_edits_then_take_clears() {
-        let mut app = app();
-        app.insert_char('h');
-        app.insert_char('i');
-        app.insert_newline();
-        app.insert_char('x');
-        app.backspace();
-        assert_eq!(app.input, "hi\n");
-        assert_eq!(app.take_input(), "hi\n");
-        assert!(app.input.is_empty());
-        assert_eq!(app.cursor, 0, "take_input resets the cursor");
-    }
-
-    fn typed(text: &str) -> App {
-        let mut app = app();
-        for c in text.chars() {
-            app.insert_char(c);
-        }
-        app
-    }
-
-    #[test]
-    fn insert_and_delete_happen_at_the_cursor() {
-        let mut app = typed("helo"); // cursor at end
-        app.move_left();
-        app.move_left();
-        app.insert_char('l'); // "hello", between the two spots
-        assert_eq!(app.input, "hello");
-
-        app.move_home();
-        app.delete(); // forward-delete 'h'
-        assert_eq!(app.input, "ello");
-        assert_eq!(app.cursor, 0);
-
-        app.move_end();
-        app.backspace(); // delete-before 'o'
-        assert_eq!(app.input, "ell");
-    }
-
-    #[test]
-    fn movement_stops_at_bounds_and_respects_utf8() {
-        let mut app = app();
-        app.move_left(); // at start: no-op, no panic
-        app.delete(); // at end of empty: no-op
-        let mut app = typed("你好"); // 3 bytes each
-        app.move_left();
-        assert_eq!(app.cursor, 3, "left lands on a char boundary, not mid-byte");
-        app.move_right();
-        app.move_right(); // already at end: no-op
-        assert_eq!(app.cursor, 6);
-        app.backspace();
-        assert_eq!(app.input, "你");
-    }
-
-    #[test]
-    fn home_end_act_on_the_current_logical_line() {
-        let mut app = typed("ab\ncd"); // cursor at end, on line "cd"
-        app.move_home();
-        assert_eq!(app.cursor, 3, "home → start of the current line");
-        app.insert_char('Z');
-        assert_eq!(app.input, "ab\nZcd");
-        app.move_end();
-        assert_eq!(app.cursor, app.input.len(), "end → end of the current line");
-    }
-
-    #[test]
-    fn up_down_move_by_logical_line_clamping_the_column() {
-        let mut app = typed("abcd\nxy\nwxyz"); // cursor at end of "wxyz" (col 4)
-        app.move_up(); // "xy" is shorter → clamp to its end (col 2)
-        assert_eq!(&app.input[..app.cursor], "abcd\nxy");
-        app.move_up(); // column is now 2 → col 2 of "abcd"
-        assert_eq!(&app.input[..app.cursor], "ab");
-        app.move_down(); // back down to "xy", col 2 → its end
-        assert_eq!(&app.input[..app.cursor], "abcd\nxy");
-        app.move_up();
-        app.move_up(); // already on the first line: no-op
-        assert_eq!(&app.input[..app.cursor], "ab");
-    }
-}
+mod tests;
