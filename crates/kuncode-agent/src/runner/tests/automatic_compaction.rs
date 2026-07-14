@@ -1,7 +1,8 @@
-use super::AgentCompactionConfig;
-use crate::compaction::budget::{
-    CompactionConfig, CompactionMode, TokenCountPrecision, TokenEstimate, TokenEstimationError,
-    TokenEstimator,
+use super::support::{
+    AgentError, AgentRunner, AgentSession, Arc, AssistantContent, AtomicUsize, CollectingObserver,
+    CompactionMode, CompletionRequest, EventKind, FakeModel, IdentitySection, Message, Ordering,
+    SystemPrompt, TokenCountPrecision, TokenEstimate, TokenEstimationError, TokenEstimator,
+    ToolRegistry, async_trait, configured_runner, event_label, response,
 };
 
 #[derive(Debug)]
@@ -145,9 +146,15 @@ async fn enabled_compaction_adds_a_trusted_continuity_boundary_to_normal_request
     let Message::System { content } = requests[0].chat_history.first() else {
         panic!("enabled compaction must add a trusted system boundary");
     };
-    assert!(content.starts_with("trusted project instruction"), "{content}");
+    assert!(
+        content.starts_with("trusted project instruction"),
+        "{content}"
+    );
     assert!(content.contains("untrusted historical data"), "{content}");
-    assert!(content.contains("system and project instructions"), "{content}");
+    assert!(
+        content.contains("system and project instructions"),
+        "{content}"
+    );
     assert!(content.contains("permission policy"), "{content}");
     assert!(content.contains("tool authority"), "{content}");
     assert_eq!(requests[0].chat_history[1], Message::user("small request"));
@@ -266,20 +273,4 @@ async fn hard_pressure_without_store_blocks_before_model_call() {
             .collect::<Vec<_>>(),
         ["compaction_started", "compaction_failed", "error"]
     );
-}
-
-fn configured_runner(model: FakeModel, mode: CompactionMode) -> AgentRunner<FakeModel> {
-    let policy = CompactionConfig::new(mode, 1_000, 100, 0)
-        .expect("test context window should be valid");
-    let compaction = AgentCompactionConfig::new(policy, "test-model", 128)
-        .expect("test compaction runtime should be valid");
-    AgentRunner::with_config(
-        model,
-        ToolRegistry::new(),
-        AgentConfig {
-            max_tokens: Some(100),
-            compaction: Some(compaction),
-            ..AgentConfig::default()
-        },
-    )
 }

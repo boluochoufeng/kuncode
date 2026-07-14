@@ -1,3 +1,8 @@
+use super::support::{
+    AgentConfig, AgentRunner, AgentSession, Arc, AssistantContent, FakeModel, NewSession,
+    ScriptedHook, Seq, SessionStore, SqliteSessionStore, TestDir, ToolRegistry, bash, response,
+};
+
 // Verifies that only direct turn input receives human-authored lineage.
 
 #[tokio::test]
@@ -42,9 +47,15 @@ async fn only_real_prompt_is_human_and_durable_appends_get_exact_coverage() {
         .attach_session_id(session_id)
         .expect("fresh session should attach");
 
-    runner.run_turn(&mut session, "REAL_PROMPT").await.expect("runs");
+    runner
+        .run_turn(&mut session, "REAL_PROMPT")
+        .await
+        .expect("runs");
 
-    assert_eq!(session.trusted_human_message_indices().collect::<Vec<_>>(), [0]);
+    assert_eq!(
+        session.trusted_human_message_indices().collect::<Vec<_>>(),
+        [0]
+    );
     assert_eq!(session.message_lineage().len(), session.messages().len());
     for (index, lineage) in session.message_lineage().iter().enumerate() {
         let expected = Seq::new(i64::try_from(index + 1).expect("small test index"));

@@ -1,3 +1,10 @@
+use super::support::{
+    AgentConfig, AgentError, AgentRunner, AgentSession, AlwaysContinueHook, Arc, AssistantContent,
+    AtomicUsize, BrokenTool, CancelInPostHook, CancelInPreHook, CancellationToken,
+    CountingPostHook, FakeModel, Ordering, ScriptedHook, ToolRegistry, bash, is_tool_result,
+    response, response_many, tool_result_id, tool_result_text, user_text,
+};
+
 #[tokio::test]
 async fn post_tool_use_feedback_lands_after_the_batch() {
     let model = FakeModel::new([

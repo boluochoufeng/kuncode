@@ -1,3 +1,10 @@
+use super::support::{
+    AgentError, AgentRunner, AgentSession, Arc, AssistantContent, CollectingObserver,
+    CompletionRequest, EventKind, FakeModel, Message, PermissionPolicy, RuleOrigin,
+    ScriptedApprover, ScriptedHook, ToolRegistry, UserContent, bash, parse_rule, response,
+    tool_result_text, user_text,
+};
+
 #[tokio::test]
 async fn empty_transcript_error_carries_no_iteration() {
     let observer = Arc::new(CollectingObserver::default());
@@ -18,72 +25,6 @@ async fn empty_transcript_error_carries_no_iteration() {
         &events[0].kind,
         EventKind::Error { kind, .. } if kind == "empty_transcript"
     ));
-}
-
-/// Counts `PostToolUse` invocations, to prove it does (not) fire.
-struct CountingPostHook(Arc<AtomicUsize>);
-
-#[async_trait]
-impl Hook for CountingPostHook {
-    async fn post_tool_use(&self, _cx: &PostToolCx<'_>) -> PostToolOutcome {
-        self.0.fetch_add(1, Ordering::SeqCst);
-        PostToolOutcome::Proceed
-    }
-}
-
-/// Cancels the turn from inside `pre_tool_use`, then hangs — the hook analogue
-/// of `HangTool`, driving the trigger's `select!` to its cancel branch.
-struct CancelInPreHook(CancellationToken);
-
-#[async_trait]
-impl Hook for CancelInPreHook {
-    async fn pre_tool_use(&self, _cx: &PreToolCx<'_>) -> PreToolOutcome {
-        self.0.cancel();
-        std::future::pending().await
-    }
-}
-
-/// Same, but on `post_tool_use` — fires after the current tool's result is
-/// recorded, exercising the mid-batch cancellation path.
-struct CancelInPostHook(CancellationToken);
-
-#[async_trait]
-impl Hook for CancelInPostHook {
-    async fn post_tool_use(&self, _cx: &PostToolCx<'_>) -> PostToolOutcome {
-        self.0.cancel();
-        std::future::pending().await
-    }
-}
-
-/// Always forces a continuation — the runner's cap, not the hook, must stop it.
-struct AlwaysContinueHook;
-
-#[async_trait]
-impl Hook for AlwaysContinueHook {
-    async fn stop(&self, _cx: &StopCx<'_>) -> StopOutcome {
-        StopOutcome::Continue {
-            message: "keep going".to_string(),
-        }
-    }
-}
-
-/// Text of the plain user message at `index`, if it is one.
-fn user_text(session: &AgentSession, index: usize) -> Option<String> {
-    match &session.messages()[index] {
-        Message::User { content } => match content.first() {
-            UserContent::Text(text) => Some(text.text_ref().to_string()),
-            UserContent::ToolResult(_) => None,
-        },
-        _ => None,
-    }
-}
-
-/// Whether the message at `index` is a tool-result user message.
-fn is_tool_result(session: &AgentSession, index: usize) -> bool {
-    matches!(
-        &session.messages()[index],
-        Message::User { content } if matches!(content.first(), UserContent::ToolResult(_))
-    )
 }
 
 /// Whether any message in a request's history is a user text equal to `text`.

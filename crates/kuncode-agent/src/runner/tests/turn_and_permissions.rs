@@ -1,3 +1,9 @@
+use super::support::{
+    AgentConfig, AgentError, AgentRunner, AgentSession, ApprovalOutcome, Arc, AssistantContent,
+    FakeModel, IdentitySection, Message, PermissionPolicy, RuleOrigin, ScriptedApprover,
+    SystemPrompt, ToolRegistry, bash, parse_rule, response, tool_result_text,
+};
+
 #[tokio::test]
 async fn run_turn_updates_transcript_in_place() {
     let model = FakeModel::new([response(AssistantContent::text("done"))]);

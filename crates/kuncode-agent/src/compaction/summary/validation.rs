@@ -325,3 +325,156 @@ fn validate_artifact_refs(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::{
+        CONTINUITY_SUMMARY_VERSION,
+        test_support::{ALLOWED_ARTIFACT, fixture_summary},
+    };
+    use super::{SummaryError, SummaryValidationContext};
+    use crate::session_store::Seq;
+
+    #[test]
+    fn validation_rejects_version_range_and_artifact_mismatches() {
+        let context = SummaryValidationContext::new(
+            Seq::new(2),
+            Seq::new(8),
+            Seq::new(8),
+            [ALLOWED_ARTIFACT],
+        )
+        .expect("validation source should be valid");
+
+        let mut wrong_version = fixture_summary();
+        wrong_version.version += 1;
+        assert_eq!(
+            wrong_version.validate(&context),
+            Err(SummaryError::UnsupportedVersion {
+                expected: CONTINUITY_SUMMARY_VERSION,
+                actual: CONTINUITY_SUMMARY_VERSION + 1,
+            })
+        );
+
+        let mut wrong_range = fixture_summary();
+        wrong_range.source_seq_end = Seq::new(7);
+        assert!(matches!(
+            wrong_range.validate(&context),
+            Err(SummaryError::SourceRangeMismatch { .. })
+        ));
+
+        let mut unknown_artifact = fixture_summary();
+        let forged =
+            "tool-result-sha256-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        unknown_artifact.artifact_refs = vec![forged.to_string()];
+        assert_eq!(
+            unknown_artifact.validate(&context),
+            Err(SummaryError::UnknownArtifactRef(forged.to_string()))
+        );
+    }
+
+    #[test]
+    fn validation_rejects_invalid_ranges_blank_fields_and_duplicate_refs() {
+        assert_eq!(
+            SummaryValidationContext::new(
+                Seq::new(8),
+                Seq::new(2),
+                Seq::new(8),
+                std::iter::empty::<&str>(),
+            ),
+            Err(SummaryError::InvalidSourceRange { start: 8, end: 2 })
+        );
+
+        assert_eq!(
+            SummaryValidationContext::new(
+                Seq::new(2),
+                Seq::new(9),
+                Seq::new(8),
+                std::iter::empty::<&str>(),
+            ),
+            Err(SummaryError::SourceBeyondDurableHead {
+                end: 9,
+                durable_head: 8,
+            })
+        );
+
+        let context = SummaryValidationContext::new(
+            Seq::new(2),
+            Seq::new(8),
+            Seq::new(8),
+            [ALLOWED_ARTIFACT],
+        )
+        .expect("validation source should be valid");
+        let mut blank = fixture_summary();
+        blank.current_goal = "  ".to_string();
+        assert_eq!(
+            blank.validate(&context),
+            Err(SummaryError::BlankField("current_goal".to_string()))
+        );
+
+        let mut duplicate = fixture_summary();
+        duplicate
+            .artifact_refs
+            .push(duplicate.artifact_refs[0].clone());
+        assert_eq!(
+            duplicate.validate(&context),
+            Err(SummaryError::DuplicateArtifactRef(
+                ALLOWED_ARTIFACT.to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn strict_parser_applies_wire_and_context_validation() {
+        let context = context();
+        let raw = serde_json::to_string(&fixture_summary()).expect("summary should encode");
+
+        let parsed = context
+            .parse_and_validate(&raw)
+            .expect("summary should validate");
+
+        assert_eq!(parsed, fixture_summary());
+        assert!(matches!(
+            context.parse_and_validate("```json\n{}\n```"),
+            Err(SummaryError::Decode(_))
+        ));
+    }
+
+    #[test]
+    fn source_context_and_output_reject_malformed_artifact_ids() {
+        let invalid = "tool-result-sha256-NOT-A-HASH";
+        assert_eq!(
+            SummaryValidationContext::new(Seq::new(2), Seq::new(8), Seq::new(8), [invalid]),
+            Err(SummaryError::InvalidArtifactRef(invalid.to_string()))
+        );
+
+        let mut summary = fixture_summary();
+        summary.artifact_refs = vec![invalid.to_string()];
+        assert_eq!(
+            summary.validate(&context()),
+            Err(SummaryError::InvalidArtifactRef(invalid.to_string()))
+        );
+    }
+
+    #[test]
+    fn source_context_rejects_zero_and_negative_sequences() {
+        for start in [Seq::ZERO, Seq::new(-1)] {
+            assert_eq!(
+                SummaryValidationContext::new(
+                    start,
+                    Seq::new(8),
+                    Seq::new(8),
+                    std::iter::empty::<&str>(),
+                ),
+                Err(SummaryError::InvalidSourceRange {
+                    start: start.get(),
+                    end: 8,
+                })
+            );
+        }
+    }
+
+    fn context() -> SummaryValidationContext {
+        SummaryValidationContext::new(Seq::new(2), Seq::new(8), Seq::new(8), [ALLOWED_ARTIFACT])
+            .expect("validation source should be valid")
+    }
+}

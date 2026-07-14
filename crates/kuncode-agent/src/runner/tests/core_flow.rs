@@ -1,74 +1,9 @@
-#[derive(Clone, Default)]
-struct FakeModel {
-    responses: Arc<Mutex<VecDeque<CompletionResponse<Value>>>>,
-    requests: Arc<Mutex<Vec<CompletionRequest>>>,
-}
-
-impl FakeModel {
-    fn new(responses: impl IntoIterator<Item = CompletionResponse<Value>>) -> Self {
-        Self {
-            responses: Arc::new(Mutex::new(responses.into_iter().collect())),
-            requests: Arc::default(),
-        }
-    }
-
-    fn requests(&self) -> Vec<CompletionRequest> {
-        self.requests.lock().expect("requests lock").clone()
-    }
-}
-
-impl kuncode_core::completion::CompletionModel for FakeModel {
-    type Response = Value;
-    type Client = ();
-
-    fn make(_client: &Self::Client, _model: impl Into<String>) -> Self {
-        Self::default()
-    }
-
-    async fn completion(
-        &self,
-        request: CompletionRequest,
-    ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
-        self.requests.lock().expect("requests lock").push(request);
-        Ok(self
-            .responses
-            .lock()
-            .expect("responses lock")
-            .pop_front()
-            .expect("fake response queued"))
-    }
-
-    async fn stream(
-        &self,
-        request: CompletionRequest,
-    ) -> Result<CompletionStream, CompletionError> {
-        // Mirror `completion`: record the request, pop the queued response,
-        // and replay it as a single terminal `Completed` event so the runner
-        // exercises its streaming path against the same scripted responses.
-        self.requests.lock().expect("requests lock").push(request);
-        let response = self
-            .responses
-            .lock()
-            .expect("responses lock")
-            .pop_front()
-            .expect("fake response queued");
-        Ok(completed_stream(response))
-    }
-}
-
-/// Replays a [`CompletionResponse`] as a one-event stream ending in
-/// [`StreamEvent::Completed`], for test models that script whole responses.
-/// `finish_reason` is irrelevant — the runner branches on the content.
-fn completed_stream<T>(response: CompletionResponse<T>) -> CompletionStream {
-    let CompletionResponse { choice, usage, .. } = response;
-    Box::pin(futures_util::stream::once(async move {
-        Ok(StreamEvent::Completed {
-            content: choice,
-            usage,
-            finish_reason: FinishReason::Stop,
-        })
-    }))
-}
+use super::support::{
+    AgentRunner, AgentSession, Arc, AssistantContent, CollectingObserver, CompletionError,
+    CompletionRequest, CompletionResponse, CompletionStream, EventKind, FakeModel, FinishReason,
+    Message, NonEmptyVec, StreamEvent, ToolRegistry, ToolResultContent, Usage, UserContent, Value,
+    bash, event_label, response,
+};
 
 /// A model that streams reasoning + text deltas before the final answer, for
 /// asserting the runner forwards render deltas and still finalizes with
@@ -147,28 +82,6 @@ async fn streaming_forwards_deltas_then_finalizes_with_assistant() {
         &events[4].kind,
         EventKind::Assistant { text, tool_calls } if text == "Hello" && tool_calls.is_empty()
     ));
-}
-
-fn response(content: AssistantContent) -> CompletionResponse<Value> {
-    response_many(vec![content])
-}
-
-/// A response whose assistant message carries several content blocks (e.g.
-/// multiple tool calls in one turn).
-fn response_many(contents: Vec<AssistantContent>) -> CompletionResponse<Value> {
-    CompletionResponse {
-        choice: NonEmptyVec::try_from(contents).expect("at least one content block"),
-        usage: Usage {
-            input_tokens: 1,
-            output_tokens: 2,
-            total_tokens: 3,
-            cached_input_tokens: 0,
-            cache_creation_input_tokens: 0,
-            reasoning_tokens: 0,
-        },
-        raw_response: serde_json::json!({}),
-        message_id: None,
-    }
 }
 
 #[tokio::test]

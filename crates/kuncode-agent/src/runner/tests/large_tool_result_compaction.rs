@@ -1,6 +1,13 @@
-use crate::compaction::protocol::group_messages;
+use super::support::{
+    AgentCompactionConfig, AgentConfig, AgentRunner, AgentSession, Arc, AssistantContent,
+    CollectingObserver, CompactionConfig, CompactionMode, Deserialize, EventKind, FakeModel,
+    FixedRunnerGroupEstimator, JsonSchema, LARGE_RESULT_BYTES, Message, NewSession,
+    PermissionAction, PermissionRequest, ScriptedRequestEstimator, Seq, SessionStore,
+    SqliteSessionStore, TestDir, ToolContext, ToolDefinition, ToolOutput, ToolRegistry,
+    ToolResultContent, TypedTool, UserContent, Value, async_trait, definition_for, response,
+};
 
-const LARGE_RESULT_BYTES: usize = 9_500;
+use crate::compaction::protocol::group_messages;
 
 #[derive(Deserialize, JsonSchema)]
 struct ScriptedResultArgs {
@@ -47,48 +54,6 @@ impl TypedTool for ScriptedResultTool {
             "small".to_string()
         };
         ToolOutput::success(payload)
-    }
-}
-
-#[derive(Default)]
-struct ScriptedRequestEstimator;
-
-#[async_trait]
-impl TokenEstimator for ScriptedRequestEstimator {
-    async fn estimate(
-        &self,
-        request: &CompletionRequest,
-    ) -> Result<TokenEstimate, TokenEstimationError> {
-        let mut result_count = 0_u64;
-        let mut marker = false;
-        let mut large_result = false;
-        for message in request.chat_history.iter() {
-            let Message::User { content } = message else {
-                continue;
-            };
-            for result in content.iter().filter_map(|block| match block {
-                UserContent::ToolResult(result) => Some(result),
-                UserContent::Text(_) => None,
-            }) {
-                result_count += 1;
-                let ToolResultContent::Text(text) = result.content.first();
-                large_result |= text.text_ref().len() > 8_192;
-                marker |= serde_json::from_str::<Value>(text.text_ref())
-                    .ok()
-                    .is_some_and(|value| value.get("artifact_id").is_some());
-            }
-        }
-        let tokens = if marker {
-            300
-        } else if request.chat_history.len() == 1 && result_count == 1 && large_result {
-            9_000
-        } else {
-            match result_count {
-                0 | 1 => 300,
-                _ => 700,
-            }
-        };
-        Ok(TokenEstimate::new(tokens, TokenCountPrecision::Exact))
     }
 }
 
@@ -154,7 +119,11 @@ async fn runner_spills_old_large_tool_result_and_commits_sqlite_checkpoint() {
     assert_eq!(turn.iterations, 3);
     let requests = model.requests();
     assert_eq!(requests.len(), 3, "summary must not call the model");
-    assert!(requests.iter().all(|request| request.output_schema.is_none()));
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.output_schema.is_none())
+    );
     let third_messages = requests[2].chat_history.to_vec();
     assert!(group_messages(&third_messages).is_ok());
     let large_marker = tool_result_text_by_id(&third_messages, "call_large")
@@ -185,13 +154,15 @@ async fn runner_spills_old_large_tool_result_and_commits_sqlite_checkpoint() {
         .filter(|entry| entry.kind == "message")
         .filter_map(|entry| entry.clone().into_message().ok())
         .find_map(|message| {
-            tool_result_text_by_id(std::slice::from_ref(&message), "call_large")
-                .map(str::to_string)
+            tool_result_text_by_id(std::slice::from_ref(&message), "call_large").map(str::to_string)
         })
         .expect("journal should retain the original large result");
     let output: ToolOutput =
         serde_json::from_str(&original_large).expect("journaled output should be JSON");
-    assert_eq!(output.data, Some(Value::String("L".repeat(LARGE_RESULT_BYTES))));
+    assert_eq!(
+        output.data,
+        Some(Value::String("L".repeat(LARGE_RESULT_BYTES)))
+    );
     for kind in ["tool_artifact", "compaction", "checkpoint_ref"] {
         assert_eq!(
             journal.iter().filter(|entry| entry.kind == kind).count(),

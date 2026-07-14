@@ -1,6 +1,6 @@
 use kuncode_core::completion::{Message, UserContent};
 
-use super::{ALLOWED_ARTIFACT, fixture_summary};
+use super::super::test_support::{ALLOWED_ARTIFACT, fixture_summary};
 use crate::{
     compaction::summary::{
         SummaryError, SummaryRequest, build_summary_prompt, validation::SummaryValidationContext,

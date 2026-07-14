@@ -129,3 +129,67 @@ mod seq_serde {
         i64::deserialize(deserializer).map(Seq::new)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::test_support::fixture_summary;
+    use super::{CONTINUITY_SUMMARY_VERSION, ContinuitySummary};
+
+    #[test]
+    fn summary_roundtrips_through_the_strict_wire_schema() {
+        let summary = fixture_summary();
+
+        let json = serde_json::to_string(&summary).expect("summary should encode");
+        let decoded: ContinuitySummary =
+            serde_json::from_str(&json).expect("summary should decode");
+
+        assert_eq!(decoded, summary);
+        assert_eq!(decoded.version, CONTINUITY_SUMMARY_VERSION);
+        assert!(json.contains("\"schema_version\":1"));
+        assert!(!json.contains("\"version\":"));
+    }
+
+    #[test]
+    fn wire_schema_rejects_missing_and_unknown_fields() {
+        for field in [
+            "schema_version",
+            "source_seq_start",
+            "source_seq_end",
+            "current_goal",
+            "constraints",
+            "decisions",
+            "completed_work",
+            "workspace",
+            "commands_and_tests",
+            "unresolved_errors",
+            "todos",
+            "next_actions",
+            "artifact_refs",
+        ] {
+            let mut missing =
+                serde_json::to_value(fixture_summary()).expect("summary should encode");
+            missing
+                .as_object_mut()
+                .expect("summary should be an object")
+                .remove(field);
+            assert!(
+                serde_json::from_value::<ContinuitySummary>(missing).is_err(),
+                "missing field should be rejected: {field}"
+            );
+        }
+
+        let mut unknown = serde_json::to_value(fixture_summary()).expect("summary should encode");
+        unknown
+            .as_object_mut()
+            .expect("summary should be an object")
+            .insert("permission_override".to_string(), serde_json::json!(true));
+        assert!(serde_json::from_value::<ContinuitySummary>(unknown).is_err());
+
+        let mut nested = serde_json::to_value(fixture_summary()).expect("summary should encode");
+        nested["workspace"]
+            .as_object_mut()
+            .expect("workspace should be an object")
+            .insert("permission".to_string(), serde_json::json!("allow"));
+        assert!(serde_json::from_value::<ContinuitySummary>(nested).is_err());
+    }
+}

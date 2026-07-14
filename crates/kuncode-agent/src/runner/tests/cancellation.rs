@@ -1,3 +1,24 @@
+use super::support::{
+    AgentError, AgentRunner, AgentSession, ApprovalOutcome, Arc, AssistantContent,
+    CancellationToken, FakeModel, HangModel, HangTool, ScriptedApprover, ToolRegistry, bash,
+    cancellable, response, response_many, tool_result_id, tool_result_text,
+};
+
+#[tokio::test]
+async fn cancellable_yields_none_when_cancelled_while_pending() {
+    let cancel = CancellationToken::new();
+    // Cancel from inside the racing future, then never return: the cancel
+    // branch is the only one that can resolve, so the race ends in `None`.
+    let fut = {
+        let cancel = cancel.clone();
+        async move {
+            cancel.cancel();
+            std::future::pending::<i32>().await
+        }
+    };
+    assert_eq!(cancellable(&cancel, fut).await, None);
+}
+
 #[tokio::test]
 async fn abort_pairs_every_tool_call_with_a_result() {
     // One assistant turn emits TWO tool calls; the user aborts at the first

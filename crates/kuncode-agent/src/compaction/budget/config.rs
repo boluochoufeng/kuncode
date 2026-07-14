@@ -187,3 +187,90 @@ pub(super) fn validate_window(
         }),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{CompactionConfig, CompactionConfigError, CompactionMode};
+
+    const CONTEXT_LIMIT: u64 = 1_000;
+    const RESERVED_OUTPUT: u64 = 100;
+    const SAFETY_MARGIN: u64 = 100;
+
+    fn config() -> CompactionConfig {
+        CompactionConfig::new(
+            CompactionMode::Enabled,
+            CONTEXT_LIMIT,
+            RESERVED_OUTPUT,
+            SAFETY_MARGIN,
+        )
+        .expect("fixture is valid")
+    }
+
+    #[test]
+    fn default_ratios_match_rollout_design() {
+        // Given
+        let config = config();
+
+        // When / Then
+        assert_eq!(config.mode(), CompactionMode::Enabled);
+        assert_eq!(config.target_ratio(), 0.50);
+        assert_eq!(config.soft_threshold(), 0.75);
+        assert_eq!(config.hard_threshold(), 0.90);
+        assert_eq!(config.recent_ratio(), 0.10);
+    }
+
+    #[test]
+    fn invalid_ratio_order_is_rejected_when_config_is_constructed() {
+        // Given / When
+        let result = CompactionConfig::new(
+            CompactionMode::Shadow,
+            CONTEXT_LIMIT,
+            RESERVED_OUTPUT,
+            SAFETY_MARGIN,
+        )
+        .and_then(|config| config.with_ratios(0.75, 0.50, 0.90, 0.10));
+
+        // Then
+        assert!(matches!(
+            result,
+            Err(CompactionConfigError::InvalidRatios { .. })
+        ));
+    }
+
+    #[test]
+    fn non_finite_or_out_of_range_ratios_are_rejected() {
+        for invalid in [f64::NAN, f64::INFINITY, 0.0, 1.0, -0.1] {
+            // Given / When
+            let result = CompactionConfig::new(
+                CompactionMode::Disabled,
+                CONTEXT_LIMIT,
+                RESERVED_OUTPUT,
+                SAFETY_MARGIN,
+            )
+            .and_then(|config| config.with_ratios(0.50, 0.75, 0.90, invalid));
+
+            // Then
+            assert!(matches!(
+                result,
+                Err(CompactionConfigError::InvalidRatios { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn unusable_context_window_is_rejected_without_underflow() {
+        // Given / When
+        let result =
+            CompactionConfig::new(CompactionMode::Enabled, 200, RESERVED_OUTPUT, SAFETY_MARGIN);
+
+        // Then
+        assert!(matches!(
+            result,
+            Err(CompactionConfigError::InvalidWindow {
+                context_limit: 200,
+                reserved_output: RESERVED_OUTPUT,
+                safety_margin: SAFETY_MARGIN,
+            })
+        ));
+    }
+}

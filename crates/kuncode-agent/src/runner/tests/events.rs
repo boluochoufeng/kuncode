@@ -1,3 +1,9 @@
+use super::support::{
+    AgentConfig, AgentError, AgentObserver, AgentRunner, AgentSession, Arc, AssistantContent,
+    CollectingObserver, CompositeObserver, EventKind, FakeModel, PanicObserver, PermissionPolicy,
+    RuleOrigin, ToolRegistry, bash, event_label, parse_rule, response,
+};
+
 #[tokio::test]
 async fn unknown_tool_emits_tool_end_without_tool_start() {
     let model = FakeModel::new([

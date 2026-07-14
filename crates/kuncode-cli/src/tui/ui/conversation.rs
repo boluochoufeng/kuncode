@@ -224,3 +224,80 @@ pub(super) fn display_tool_name(name: &str) -> String {
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::draw;
+    use super::*;
+    use kuncode_agent::observer::EventKind;
+    use kuncode_agent::permission::PermissionMode;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    #[test]
+    fn streamed_preview_renders_answer_and_reasoning_below_the_log() {
+        let mut app = App::new("model-x", PermissionMode::Default);
+        app.apply_event(EventKind::ReasoningDelta {
+            text: "weighing options".to_string(),
+        });
+        app.apply_event(EventKind::TextDelta {
+            text: "partial answer".to_string(),
+        });
+        // Only the revealed prefix draws; a huge budget reveals everything for
+        // this assertion (the typewriter pacing itself is tested in app.rs).
+        app.advance_reveal(std::time::Duration::from_secs(1), 100_000);
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 16)).expect("test terminal");
+        terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
+
+        let rendered = format!("{}", terminal.backend());
+        assert!(
+            rendered.contains("partial answer"),
+            "in-progress answer should render live"
+        );
+        assert!(
+            rendered.contains("weighing options"),
+            "in-progress reasoning should render live"
+        );
+    }
+
+    #[test]
+    fn tool_names_display_as_pascal_case() {
+        assert_eq!(display_tool_name("bash"), "Bash");
+        assert_eq!(display_tool_name("read_file"), "ReadFile");
+        assert_eq!(display_tool_name("glob"), "Glob");
+    }
+
+    #[test]
+    fn wraps_to_exact_lines_and_pads_full_width() {
+        // "abcdef" at width 4 → "abcd" + "ef", each padded back out to width 4 so
+        // a line background would fill the row.
+        let wrapped = wrap_lines(vec![Line::from("abcdef".to_string())], 4);
+        assert_eq!(wrapped.len(), 2);
+        for line in &wrapped {
+            assert_eq!(line.width(), 4, "each physical line filled to full width");
+        }
+    }
+
+    #[test]
+    fn user_rows_get_a_gapless_background() {
+        // A wide (CJK) glyph occupies two cells but a line-level background only
+        // tints the first; `paint_user_bg` must fill the continuation cell too so
+        // the background has no sawtooth gaps.
+        let mut app = App::new("m", PermissionMode::Default);
+        app.push_user("你好世界".to_string());
+        let (w, h) = (20u16, 8u16);
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("terminal");
+        terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
+
+        let buf = terminal.backend().buffer();
+        // Inner content spans columns 1..w-1 (inside the border). Find a row whose
+        // first inner cell is tinted (a user row) and assert the whole inner span
+        // is tinted — no gaps.
+        let tinted = |x: u16, y: u16| buf.cell((x, y)).unwrap().bg == USER_BG;
+        let user_row = (0..h).find(|&y| tinted(1, y)).expect("a tinted user row");
+        for x in 1..w - 1 {
+            assert!(tinted(x, user_row), "gap in user background at column {x}");
+        }
+    }
+}

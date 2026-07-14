@@ -1,3 +1,10 @@
+use super::support::{
+    AgentError, AgentSession, Arc, AssistantContent, CollectingObserver, CompactionMode, EventKind,
+    FakeModel, FixedRunnerGroupEstimator, LARGE_RESULT_BYTES, Message, NewSession, NonEmptyVec,
+    ScriptedRequestEstimator, Seq, SessionId, SessionStore, SqliteSessionStore, TestDir,
+    ToolOutput, async_trait, configured_runner, response,
+};
+
 // Adversarial persistence tests for authority-invalidating compaction failures.
 //
 // Even under soft pressure, ambiguous writes or corrupted durable facts must
@@ -43,12 +50,12 @@ impl SessionStore for AmbiguousStore {
     {
         match self.write {
             AmbiguousWrite::Artifact => ambiguous("tool artifact"),
-            AmbiguousWrite::ArtifactConflict => {
-                Err(crate::session_store::SessionStoreError::JournalHeadConflict {
+            AmbiguousWrite::ArtifactConflict => Err(
+                crate::session_store::SessionStoreError::JournalHeadConflict {
                     expected: expected_journal_head.get(),
                     actual: expected_journal_head.get() + 1,
-                })
-            }
+                },
+            ),
             AmbiguousWrite::ArtifactHeadIntegrity | AmbiguousWrite::Compaction => {
                 self.inner
                     .put_tool_artifact(session, expected_journal_head, artifact)
@@ -80,9 +87,7 @@ impl SessionStore for AmbiguousStore {
         match self.write {
             AmbiguousWrite::Artifact
             | AmbiguousWrite::ArtifactConflict
-            | AmbiguousWrite::ArtifactHeadIntegrity => {
-                self.inner.commit_compaction(commit).await
-            }
+            | AmbiguousWrite::ArtifactHeadIntegrity => self.inner.commit_compaction(commit).await,
             AmbiguousWrite::Compaction => ambiguous("compaction"),
         }
     }
@@ -100,7 +105,8 @@ impl SessionStore for AmbiguousStore {
         &self,
         session: &SessionId,
         seqs: &[Seq],
-    ) -> Result<crate::session_store::JournalSnapshot, crate::session_store::SessionStoreError> {
+    ) -> Result<crate::session_store::JournalSnapshot, crate::session_store::SessionStoreError>
+    {
         let snapshot = self.inner.journal_snapshot(session, seqs).await?;
         if matches!(self.write, AmbiguousWrite::ArtifactHeadIntegrity) {
             let tamper = self
@@ -123,10 +129,12 @@ impl SessionStore for AmbiguousStore {
 }
 
 fn ambiguous<T>(operation: &'static str) -> Result<T, crate::session_store::SessionStoreError> {
-    Err(crate::session_store::SessionStoreError::CommitOutcomeUnknown {
-        operation,
-        message: "provider-secret-ambiguous-receipt".to_string(),
-    })
+    Err(
+        crate::session_store::SessionStoreError::CommitOutcomeUnknown {
+            operation,
+            message: "provider-secret-ambiguous-receipt".to_string(),
+        },
+    )
 }
 
 #[tokio::test]
@@ -159,8 +167,8 @@ async fn soft_artifact_cas_conflict_fails_closed_without_model_request() {
         write: AmbiguousWrite::ArtifactConflict,
         tamper_pool: None,
     });
-    let mut runner = configured_runner(model.clone(), CompactionMode::Enabled)
-        .with_session_store(store);
+    let mut runner =
+        configured_runner(model.clone(), CompactionMode::Enabled).with_session_store(store);
     runner.token_estimator = Arc::new(ScriptedRequestEstimator);
     runner.group_estimator = Arc::new(FixedRunnerGroupEstimator(100));
 
@@ -203,8 +211,8 @@ async fn soft_mistyped_head_after_snapshot_fails_closed_without_model_request() 
         tamper_pool: Some(tamper_pool),
     });
     let model = FakeModel::new([response(AssistantContent::text("must not be requested"))]);
-    let mut runner = configured_runner(model.clone(), CompactionMode::Enabled)
-        .with_session_store(store);
+    let mut runner =
+        configured_runner(model.clone(), CompactionMode::Enabled).with_session_store(store);
     runner.token_estimator = Arc::new(ScriptedRequestEstimator);
     runner.group_estimator = Arc::new(FixedRunnerGroupEstimator(100));
 
@@ -246,8 +254,8 @@ async fn soft_stale_journal_audit_fails_closed_without_model_request() {
         .await
         .expect("concurrent fact should persist");
     let model = FakeModel::new([response(AssistantContent::text("must not be requested"))]);
-    let mut runner = configured_runner(model.clone(), CompactionMode::Enabled)
-        .with_session_store(store);
+    let mut runner =
+        configured_runner(model.clone(), CompactionMode::Enabled).with_session_store(store);
     runner.token_estimator = Arc::new(ScriptedRequestEstimator);
     runner.group_estimator = Arc::new(FixedRunnerGroupEstimator(100));
 
@@ -303,8 +311,8 @@ async fn soft_journal_message_mismatch_fails_closed_without_model_request() {
         session.push_with_journal_seq(active_message, Some(seq));
     }
     let model = FakeModel::new([response(AssistantContent::text("must not be requested"))]);
-    let mut runner = configured_runner(model.clone(), CompactionMode::Enabled)
-        .with_session_store(store);
+    let mut runner =
+        configured_runner(model.clone(), CompactionMode::Enabled).with_session_store(store);
     runner.token_estimator = Arc::new(ScriptedRequestEstimator);
     runner.group_estimator = Arc::new(FixedRunnerGroupEstimator(100));
 
@@ -350,8 +358,7 @@ async fn soft_corrupt_journal_message_fails_closed_without_model_request() {
                 serde_json::json!({"schema_version": 1, "message": "corrupt"}),
             )
         } else {
-            crate::session_store::NewJournalEntry::message(&message)
-                .expect("message should encode")
+            crate::session_store::NewJournalEntry::message(&message).expect("message should encode")
         };
         let seq = store
             .append(&session_id, entry)
@@ -360,8 +367,8 @@ async fn soft_corrupt_journal_message_fails_closed_without_model_request() {
         session.push_with_journal_seq(message, Some(seq));
     }
     let model = FakeModel::new([response(AssistantContent::text("must not be requested"))]);
-    let mut runner = configured_runner(model.clone(), CompactionMode::Enabled)
-        .with_session_store(store);
+    let mut runner =
+        configured_runner(model.clone(), CompactionMode::Enabled).with_session_store(store);
     runner.token_estimator = Arc::new(ScriptedRequestEstimator);
     runner.group_estimator = Arc::new(FixedRunnerGroupEstimator(100));
 
@@ -408,8 +415,8 @@ async fn soft_undecodable_journal_row_fails_closed_without_model_request() {
     .expect("fixture should corrupt the durable journal row");
     tamper.close().await;
     let model = FakeModel::new([response(AssistantContent::text("must not be requested"))]);
-    let mut runner = configured_runner(model.clone(), CompactionMode::Enabled)
-        .with_session_store(store);
+    let mut runner =
+        configured_runner(model.clone(), CompactionMode::Enabled).with_session_store(store);
     runner.token_estimator = Arc::new(ScriptedRequestEstimator);
     runner.group_estimator = Arc::new(FixedRunnerGroupEstimator(100));
 
@@ -584,8 +591,8 @@ async fn assert_tampered_durable_artifact_fails_closed(tampered: TamperedArtifac
     }
     tamper.close().await;
     let model = FakeModel::new([response(AssistantContent::text("must not be requested"))]);
-    let mut runner = configured_runner(model.clone(), CompactionMode::Enabled)
-        .with_session_store(store);
+    let mut runner =
+        configured_runner(model.clone(), CompactionMode::Enabled).with_session_store(store);
     runner.token_estimator = Arc::new(ScriptedRequestEstimator);
     runner.group_estimator = Arc::new(FixedRunnerGroupEstimator(100));
 
@@ -653,19 +660,23 @@ async fn assert_unknown_outcome_blocks(write: AmbiguousWrite) {
             .count(),
         1
     );
-    assert!(!events.iter().any(|event| matches!(event.kind, EventKind::ModelStart)));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event.kind, EventKind::ModelStart))
+    );
     let serialized = serde_json::to_string(&events).expect("events should serialize");
     assert!(!serialized.contains("provider-secret-ambiguous-receipt"));
 }
 
-async fn durable_tool_history(
-    store: &SqliteSessionStore,
-    session_id: &SessionId,
-) -> AgentSession {
+async fn durable_tool_history(store: &SqliteSessionStore, session_id: &SessionId) -> AgentSession {
     let large = ToolOutput::success("L".repeat(LARGE_RESULT_BYTES)).to_model_content();
     let small = ToolOutput::success("small").to_model_content();
-    let messages = [tool_exchange_message("old", &large), tool_exchange_message("recent", &small)]
-        .concat();
+    let messages = [
+        tool_exchange_message("old", &large),
+        tool_exchange_message("recent", &small),
+    ]
+    .concat();
     let mut session = AgentSession::new();
     session
         .attach_session_id(session_id.clone())

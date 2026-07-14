@@ -144,3 +144,54 @@ fn field(field: &str, value: &str, max: usize) -> Result<(), SummaryError> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::super::{
+        SummaryError,
+        test_support::{ALLOWED_ARTIFACT, fixture_summary},
+    };
+    use super::super::SummaryValidationContext;
+    use crate::session_store::Seq;
+
+    #[test]
+    fn strict_parser_rejects_resource_exhaustion_shapes() {
+        // The outer limit rejects the payload before deserialization can allocate
+        // model-selected strings and collections.
+        let oversized = " ".repeat(256 * 1_024 + 1);
+        assert_eq!(
+            context().parse_and_validate(&oversized),
+            Err(SummaryError::SummaryTooLarge {
+                max: 256 * 1_024,
+                actual: 256 * 1_024 + 1,
+            })
+        );
+
+        let mut long_goal = fixture_summary();
+        long_goal.current_goal = "x".repeat(8 * 1_024 + 1);
+        assert_eq!(
+            long_goal.validate(&context()),
+            Err(SummaryError::FieldTooLarge {
+                field: "current_goal".to_string(),
+                max: 8 * 1_024,
+                actual: 8 * 1_024 + 1,
+            })
+        );
+
+        let mut many_constraints = fixture_summary();
+        many_constraints.constraints = (0..65).map(|index| format!("constraint {index}")).collect();
+        assert_eq!(
+            many_constraints.validate(&context()),
+            Err(SummaryError::TooManyItems {
+                field: "constraints".to_string(),
+                max: 64,
+                actual: 65,
+            })
+        );
+    }
+
+    fn context() -> SummaryValidationContext {
+        SummaryValidationContext::new(Seq::new(2), Seq::new(8), Seq::new(8), [ALLOWED_ARTIFACT])
+            .expect("validation source should be valid")
+    }
+}

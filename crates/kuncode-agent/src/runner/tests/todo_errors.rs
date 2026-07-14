@@ -1,3 +1,10 @@
+use super::support::{
+    AgentConfig, AgentError, AgentRunner, AgentSession, ApprovalOutcome, Arc, AssistantContent,
+    BrokenTool, CollectingObserver, ErrModel, EventKind, FakeModel, ScriptedApprover, TodoWrite,
+    ToolRegistry, bash, event_label, reminder_count, response, response_many, tool_result_ids,
+    tool_result_text,
+};
+
 #[tokio::test]
 async fn plan_nag_fires_after_the_idle_interval() {
     // Two tool-only calls leave the plan untouched; on the third iteration

@@ -1,3 +1,9 @@
+use super::support::{
+    AgentRunner, AgentSession, Arc, AssistantContent, CollectingObserver, EventKind, FakeModel,
+    Message, NewSession, Seq, SessionId, SessionStore, SqliteSessionStore, TestDir, TodoWrite,
+    ToolRegistry, bash, event_label, response,
+};
+
 #[tokio::test]
 async fn run_turn_persists_messages_to_session_store() {
     let root = TestDir::new();
@@ -213,19 +219,4 @@ async fn rejected_todo_write_emits_no_todo_update() {
     assert!(!labels.contains(&"todo_update"), "got {labels:?}");
     // The plan was left empty by the rejected write.
     assert!(session.todos_snapshot().is_empty());
-}
-
-/// Counts injected plan-nag reminders in a transcript.
-fn reminder_count(session: &AgentSession) -> usize {
-    session
-        .messages()
-        .iter()
-        .filter(|m| match m {
-            Message::User { content } => matches!(
-                content.first(),
-                UserContent::Text(t) if t.text_ref() == TODO_REMINDER
-            ),
-            _ => false,
-        })
-        .count()
 }

@@ -1,3 +1,11 @@
+use super::support::{
+    AgentCompactionConfig, AgentConfig, AgentRunner, AgentSession, Arc, AssistantContent,
+    CollectingObserver, CompactionConfig, CompactionMode, CompletionError, CompletionRequest,
+    CompletionResponse, CompletionStream, EventKind, FakeModel, FixedRunnerGroupEstimator, Message,
+    Mutex, NewSession, RequestShapeEstimator, SessionStore, SqliteSessionStore, TestDir,
+    ToolRegistry, Value, completed_stream, response,
+};
+
 // Verifies that compaction telemetry exposes stable codes without secret payloads.
 
 #[derive(Clone, Default)]
