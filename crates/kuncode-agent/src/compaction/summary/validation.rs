@@ -1,3 +1,9 @@
+//! Fails closed when decoding and validating model-controlled summary output.
+//!
+//! Validation binds the closed wire schema to one observed durable range and an
+//! explicit artifact allowlist. Raw and per-field bounds cap memory retained from
+//! model output, while recursive requests must continue to cover prior provenance.
+
 use std::collections::BTreeSet;
 
 use thiserror::Error;
@@ -13,6 +19,9 @@ mod bounds;
 use bounds::{MAX_SUMMARY_JSON_BYTES, validate_allowed_artifact_refs, validate_summary_bounds};
 
 /// Durable source facts used to validate untrusted summary output.
+///
+/// The context is minted from one selection boundary; output cannot choose a
+/// different range or introduce artifact references absent from that source.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct SummaryValidationContext {
     source_seq_start: Seq,
@@ -180,6 +189,9 @@ pub enum SummaryError {
 impl ContinuitySummary {
     /// Validates version, exact provenance, required text, and artifact origin.
     ///
+    /// Decoding into the closed schema is necessary but insufficient: these gates
+    /// bind otherwise well-formed model output back to the exact durable source.
+    ///
     /// # Errors
     /// Returns [`SummaryError`] when any deterministic hard gate fails.
     pub(super) fn validate(&self, context: &SummaryValidationContext) -> Result<(), SummaryError> {
@@ -215,6 +227,8 @@ fn parse_and_validate_summary(
     raw: &str,
     context: &SummaryValidationContext,
 ) -> Result<ContinuitySummary, SummaryError> {
+    // Bound the complete input before serde can allocate collections controlled by
+    // the model; field and item limits below further constrain retained structure.
     if raw.len() > MAX_SUMMARY_JSON_BYTES {
         return Err(SummaryError::SummaryTooLarge {
             max: MAX_SUMMARY_JSON_BYTES,

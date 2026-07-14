@@ -1,4 +1,7 @@
 //! In-memory conversation state for agent turns.
+//!
+//! Provider-visible messages are kept aligned one-for-one with harness-owned
+//! lineage. Roles alone never establish human authorship or durable provenance.
 
 use kuncode_core::completion::Message;
 
@@ -19,12 +22,17 @@ pub(crate) use lineage::{ActiveSummary, MessageCoverage, MessageLineage, Prepare
 pub(crate) use persistence::DurableSessionContext;
 #[cfg(test)]
 use persistence::SessionMutationError;
+pub use persistence::{SessionAppendError, SessionAttachError, SessionStartError};
 
 /// Active conversation context owned by the caller between agent turns.
 ///
 /// Besides the message history it carries the mutable
 /// [`PermissionSessionState`]: keeping per-session grants and mode here — rather
 /// than on the shared, `&self` runner — gives per-session isolation with no lock.
+///
+/// `messages` and `message_lineage` always have equal length. A persistence
+/// failure poisons the durable frontier for future lossy mutation, but retains
+/// the last session id and acknowledged sequence as historical diagnostics.
 #[derive(Debug, Default)]
 pub struct AgentSession {
     messages: Vec<Message>,
@@ -53,7 +61,9 @@ impl Clone for AgentSession {
     /// isolation the permission state gets for free.
     ///
     /// The persisted session id is dropped, not shared: a clone represents a
-    /// separate timeline unless a caller explicitly attaches a new id.
+    /// separate timeline. Its copied messages receive untrusted lineage because
+    /// cloning provider-visible content cannot reproduce durable or human-input
+    /// provenance.
     fn clone(&self) -> Self {
         let messages = self.messages.clone();
         Self {
@@ -87,9 +97,10 @@ impl AgentSession {
 
     /// Starts a session from an existing active context in the default mode.
     ///
-    /// The messages become in-memory state only; a caller resuming from
-    /// [`SessionStore`](crate::session_store::SessionStore) attaches the
-    /// returned session id separately.
+    /// The messages remain non-durable in the first release, and every role is
+    /// assigned untrusted lineage. Resume must later reconstruct both messages
+    /// and lineage through a dedicated store path; [`Self::start_durable_session`]
+    /// intentionally rejects this non-empty state.
     pub fn from_messages(messages: Vec<Message>) -> Self {
         Self {
             message_lineage: lineage::untrusted_lineage(messages.len()),
@@ -129,9 +140,20 @@ impl AgentSession {
         self.todos.snapshot()
     }
 
-    /// Appends a user turn to the in-memory active context.
-    pub fn push_user(&mut self, prompt: impl Into<String>) {
+    /// Appends a user turn only when no durable journal is attached.
+    ///
+    /// Attached sessions must use the runner so the journal commit precedes
+    /// the in-memory mutation.
+    ///
+    /// # Errors
+    /// Returns [`SessionAppendError::DurableReceiptRequired`] when this session
+    /// already has a durable identity.
+    pub fn push_user(&mut self, prompt: impl Into<String>) -> Result<(), SessionAppendError> {
+        if self.session_id.is_some() {
+            return Err(SessionAppendError::DurableReceiptRequired);
+        }
         self.push(Message::user(prompt));
+        Ok(())
     }
 
     /// Returns the current active context.
@@ -140,6 +162,9 @@ impl AgentSession {
     }
 
     /// Consumes the session and returns its active context.
+    ///
+    /// This intentionally discards lineage and durable-frontier authority; the
+    /// returned messages cannot later be reattached as a durable session.
     pub fn into_messages(self) -> Vec<Message> {
         self.messages
     }
@@ -171,6 +196,8 @@ impl AgentSession {
             self.advance_durable_seq(seq);
         }
         self.messages.push(message);
+        // Retention is accepted only at the live tool boundary and travels with
+        // lineage so later slimming cannot infer authorization from payload shape.
         self.message_lineage.push(
             MessageLineage::appended(journal_seq, false).with_tool_result_retention(retention),
         );
@@ -185,6 +212,7 @@ impl AgentSession {
         if let Some(seq) = journal_seq {
             self.advance_durable_seq(seq);
         }
+        // Keep both vectors in lockstep at the only ordinary append boundary.
         self.messages.push(message);
         self.message_lineage
             .push(MessageLineage::appended(journal_seq, human_authored));

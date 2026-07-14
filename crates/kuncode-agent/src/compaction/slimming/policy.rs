@@ -8,9 +8,12 @@ use crate::tool::ToolResultRetention;
 
 /// Returns candidates proven safe for lossy projection in production.
 ///
-/// Authorization comes only from harness-owned lineage minted by the concrete
-/// tool implementation. Imported or derived messages default to verbatim, so
-/// tool names and model-supplied arguments never grant this capability.
+/// Authorization requires a below-threshold artifact decision outside the
+/// protected suffix and `Slimmable` retention minted by the concrete tool after
+/// live execution. Imported or derived messages default to verbatim, so tool
+/// names and model-supplied arguments never grant this capability. Marker
+/// preparation separately requires durable lineage, successful non-truncated
+/// output, a fixed size cap, and strict token savings.
 pub(crate) fn production_slimming_candidates(
     source: &ArtifactSpillResult,
     protected: &ProtectedRecentTail,

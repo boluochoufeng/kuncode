@@ -73,8 +73,10 @@ impl CliRuntime<RetryModel<DeepSeekCompletionModel>> {
     /// # Errors
     ///
     /// Fails if the current directory is not a usable workspace, the project
-    /// settings file is malformed, a permission rule is invalid, or the DeepSeek
-    /// client cannot be built from the environment.
+    /// settings or resolved permissions are invalid, active compaction cannot
+    /// be bound to the selected model, or the DeepSeek client cannot be built
+    /// from the environment. Failure to open the optional session store is
+    /// retained as degraded persistence state rather than failing assembly.
     pub async fn assemble(cli: &Cli) -> Result<Self, Box<dyn std::error::Error>> {
         let workspace = Workspace::from_current_dir().await?;
 
@@ -98,6 +100,9 @@ impl CliRuntime<RetryModel<DeepSeekCompletionModel>> {
         ]);
 
         let project_root = workspace.root().to_path_buf();
+        // Persistence discovery is non-fatal for CLI startup. Retaining the
+        // reason lets the session warn once and deny lossy compaction without
+        // preventing ordinary in-memory turns.
         let (session_store, persistence_error) = match std::env::home_dir() {
             Some(home) => match SqliteSessionStore::open(session_store_path(&home)).await {
                 Ok(store) => (Some(Arc::new(store)), None),
@@ -108,8 +113,9 @@ impl CliRuntime<RetryModel<DeepSeekCompletionModel>> {
         let client = DeepSeekClient::from_env()?;
         let model_name =
             std::env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| "deepseek-v4-flash".to_string());
-        // Wrap the provider so transient failures (timeouts, 429/5xx) are
-        // retried with backoff; every model call the runner makes inherits it.
+        // Normal turns inherit the default retry budget. Semantic summaries use
+        // a separate one-retry wrapper so their fallback latency is bounded
+        // independently of ordinary model calls.
         let provider = DeepSeekCompletionModel::make(&client, model_name.clone());
         let model = RetryModel::with_policy(provider.clone(), RetryPolicy::default());
         let summary_model = RetryModel::with_policy(provider, summary_retry_policy());
@@ -136,10 +142,17 @@ fn agent_config(
     project_compaction: Option<ProjectCompaction>,
     model_name: &str,
 ) -> Result<AgentConfig, AgentCompactionConfigError> {
+    // The same allowance must cap provider output and remain unavailable to the
+    // input window; otherwise accounting could admit a request with no room for
+    // the response it asks the provider to generate.
+    let max_tokens = project_compaction
+        .map(ProjectCompaction::reserved_output)
+        .or(AgentConfig::default().max_tokens);
     let compaction = project_compaction
         .map(|settings| settings.into_runtime(model_name))
         .transpose()?;
     Ok(AgentConfig {
+        max_tokens,
         todo_reminder_interval: Some(3),
         compaction,
         ..AgentConfig::default()
@@ -147,6 +160,8 @@ fn agent_config(
 }
 
 fn summary_retry_policy() -> RetryPolicy {
+    // Compaction owns its own fallback behavior, so repeated summary attempts
+    // are capped here instead of inheriting the normal-turn retry count.
     RetryPolicy {
         max_retries: 1,
         ..RetryPolicy::default()
@@ -164,14 +179,19 @@ impl<M: CompletionModel> CliRuntime<M> {
         self.mode
     }
 
+    /// Creates a session and attempts to establish its durable identity.
+    ///
+    /// Store-open and session-creation failures do not prevent session
+    /// construction. They are recorded on the returned session so observers can
+    /// report the degradation and persistence-dependent compaction fails closed.
     pub async fn session(&self) -> AgentSession {
         let mut session = AgentSession::with_mode(self.mode);
         match (&self.session_store, &self.persistence_error) {
-            (Some(store), _) => match store
-                .create_session(NewSession::new(self.project_root.clone()))
+            (Some(store), _) => match session
+                .start_durable_session(store.as_ref(), NewSession::new(self.project_root.clone()))
                 .await
             {
-                Ok(id) => session.attach_session_id(id),
+                Ok(()) => {}
                 Err(error) => session.mark_persistence_failed(error.to_string()),
             },
             (None, Some(error)) => session.mark_persistence_failed(error.clone()),

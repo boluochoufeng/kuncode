@@ -41,7 +41,9 @@ impl DurableFixture {
             .await
             .expect("session should be created");
         let mut session = AgentSession::new();
-        session.attach_session_id(session_id.clone());
+        session
+            .attach_session_id(session_id.clone())
+            .expect("fresh session should attach");
         for (index, (message, human_authored)) in messages.into_iter().enumerate() {
             let seq = store
                 .append(

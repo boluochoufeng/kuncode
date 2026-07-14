@@ -88,7 +88,10 @@ pub trait TokenEstimator: Send + Sync {
     ) -> Result<TokenEstimate, TokenEstimationError>;
 }
 
-/// Provider-neutral fallback that intentionally overcounts serialized characters.
+/// Provider-neutral fallback that counts serialized UTF-8 bytes plus fixed framing.
+///
+/// This heuristic reports [`TokenCountPrecision::LocalEstimate`]: it does not
+/// reproduce any provider tokenizer and must not be treated as an exact count.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConservativeTokenEstimator {
     provider_framing_tokens: u64,
@@ -167,7 +170,8 @@ impl CountingWriter {
 pub enum BudgetLevel {
     /// The request may proceed without compaction.
     Normal,
-    /// Compaction should be attempted but failure remains recoverable.
+    /// Compaction is attempted; fallback is allowed only when the attempt produces
+    /// no authority-invalidating durable outcome.
     Soft,
     /// Compaction must succeed before the request is sent.
     Hard,

@@ -1,4 +1,7 @@
-//! Stable, payload-free compaction telemetry classification.
+//! Stable, payload-free compaction telemetry and failure-policy classification.
+//!
+//! Error codes deliberately exclude provider bodies, message text, artifact
+//! contents, and persistence details that could contain user data.
 
 use std::time::Instant;
 
@@ -56,6 +59,7 @@ pub(super) fn failure_event(
 }
 
 pub(super) fn is_recoverable(error: &CompactionError, level: BudgetLevel) -> bool {
+    // Soft pressure permits fallback only when the durable proof remains valid.
     level == BudgetLevel::Soft && !must_fail_closed(error)
 }
 
@@ -64,21 +68,34 @@ pub(super) fn failure_message(error: &CompactionError) -> String {
 }
 
 fn must_fail_closed(error: &CompactionError) -> bool {
-    matches!(
-        error,
-        CompactionError::Artifact(
-            crate::compaction::artifact::ArtifactSpillError::PersistenceOutcomeUnknown { .. }
-        ) | CompactionError::Store(
-            crate::session_store::SessionStoreError::CommitOutcomeUnknown { .. }
-        ) | CompactionError::Artifact(
-            crate::compaction::artifact::ArtifactSpillError::ReceiptMismatch
-        ) | CompactionError::Artifact(
-            crate::compaction::artifact::ArtifactSpillError::JournalHeadConflict { .. }
-        ) | CompactionError::Store(
-            crate::session_store::SessionStoreError::JournalHeadConflict { .. }
-        ) | CompactionError::Apply(_)
-            | CompactionError::StaleActiveContext
-    )
+    invalidates_persistence_authority(error)
+}
+
+pub(super) fn invalidates_persistence_authority(error: &CompactionError) -> bool {
+    // Keep this exhaustive: a new error variant must explicitly declare whether
+    // the session may continue trusting its journal-to-memory relationship.
+    match error {
+        CompactionError::StaleActiveContext
+        | CompactionError::InvalidLineage
+        | CompactionError::SummarySource(_)
+        | CompactionError::Apply(_) => true,
+        CompactionError::Artifact(error) => error.invalidates_persistence_authority(),
+        CompactionError::Store(error) => error.invalidates_compaction_authority(),
+        CompactionError::NonDurableSession
+        | CompactionError::InvalidThresholds
+        | CompactionError::NoSafeBoundary
+        | CompactionError::InsufficientReduction
+        | CompactionError::AboveSoftThreshold
+        | CompactionError::ProtectedTailChanged
+        | CompactionError::Budget(_)
+        | CompactionError::TokenEstimation(_)
+        | CompactionError::Projection(_)
+        | CompactionError::Protocol(_)
+        | CompactionError::Slimming(_)
+        | CompactionError::Selection(_)
+        | CompactionError::Summary(_)
+        | CompactionError::Encoding(_) => false,
+    }
 }
 
 fn failure_code(error: &CompactionError) -> &'static str {
@@ -98,6 +115,18 @@ fn failure_code(error: &CompactionError) -> &'static str {
         | CompactionError::Store(crate::session_store::SessionStoreError::JournalHeadConflict {
             ..
         }) => "journal_head_conflict",
+        CompactionError::Artifact(
+            crate::compaction::artifact::ArtifactSpillError::JournalFrontierStale { .. },
+        ) => "journal_frontier_stale",
+        CompactionError::Artifact(
+            crate::compaction::artifact::ArtifactSpillError::JournalMessageMismatch { .. },
+        ) => "journal_message_mismatch",
+        CompactionError::Artifact(
+            crate::compaction::artifact::ArtifactSpillError::JournalIntegrity(_),
+        ) => "journal_integrity_failed",
+        CompactionError::Artifact(
+            crate::compaction::artifact::ArtifactSpillError::ArtifactIntegrity(_),
+        ) => "artifact_integrity_failed",
         CompactionError::NonDurableSession | CompactionError::Store(_) => "persistence_failed",
         CompactionError::Budget(_)
         | CompactionError::TokenEstimation(_)
@@ -237,6 +266,40 @@ mod tests {
                 recoverable: false,
                 ..
             } if error == "journal_head_conflict"
+        ));
+    }
+
+    #[test]
+    fn journal_audit_integrity_failures_are_not_recoverable_under_soft_pressure() {
+        let failures = [
+            crate::compaction::artifact::ArtifactSpillError::JournalFrontierStale {
+                frontier: 7,
+                actual: 8,
+            },
+            crate::compaction::artifact::ArtifactSpillError::JournalMessageMismatch { index: 2 },
+            crate::compaction::artifact::ArtifactSpillError::JournalIntegrity(
+                "invalid payload".to_string(),
+            ),
+            crate::compaction::artifact::ArtifactSpillError::ArtifactIntegrity(
+                "invalid binding".to_string(),
+            ),
+        ];
+
+        for failure in failures {
+            assert!(!is_recoverable(
+                &CompactionError::Artifact(failure),
+                BudgetLevel::Soft
+            ));
+        }
+        assert!(!is_recoverable(
+            &CompactionError::InvalidLineage,
+            BudgetLevel::Soft
+        ));
+        assert!(!is_recoverable(
+            &CompactionError::SummarySource(
+                crate::session::SummarySourceError::MissingMessageProvenance { message_index: 0 },
+            ),
+            BudgetLevel::Soft,
         ));
     }
 

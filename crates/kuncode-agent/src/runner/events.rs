@@ -9,6 +9,7 @@ pub(super) fn error_kind(error: &AgentError) -> &'static str {
         AgentError::Completion(_) => "completion",
         AgentError::Tool { .. } => "tool",
         AgentError::EmptyTranscript => "empty_transcript",
+        AgentError::RequestEncoding(_) => "request_encoding",
         AgentError::Compaction { .. } => "compaction",
         AgentError::Cancelled => "cancelled",
         AgentError::PromptBlocked { .. } => "prompt_blocked",

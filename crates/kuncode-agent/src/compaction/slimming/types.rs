@@ -1,3 +1,8 @@
+//! Candidate-only slimming outcomes, retention reasons, and boundary errors.
+//!
+//! These types describe a projection of active context; durable journal entries
+//! remain unchanged and are the authority behind any installed marker.
+
 use thiserror::Error;
 
 use crate::{
@@ -11,7 +16,7 @@ use crate::{
 /// Structured outcome for one caller-authorized candidate.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SlimmingOutcome {
-    /// The result was replaced with a bounded deterministic marker.
+    /// The result was replaced with a bounded, strictly cheaper marker.
     Slimmed {
         /// Exact projected block.
         location: ArtifactResultLocation,

@@ -1,9 +1,13 @@
+//! Lineage regression tests for durable appends, imports, and session clones.
+
 use super::*;
 
 #[test]
 fn durable_append_records_exact_non_human_lineage() {
     let mut session = AgentSession::new();
-    session.attach_session_id(SessionId::new("session-a"));
+    session
+        .attach_session_id(SessionId::new("session-a"))
+        .expect("fresh session should attach");
 
     session.push_with_journal_seq(Message::assistant("done"), Some(Seq::new(7)));
 

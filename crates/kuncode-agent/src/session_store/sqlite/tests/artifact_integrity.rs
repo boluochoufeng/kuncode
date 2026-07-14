@@ -1,7 +1,7 @@
 use crate::{
     session_store::{
-        NewSession, NewToolArtifact, Seq, SessionStore, SessionStoreError,
-        sqlite::SqliteSessionStore,
+        JournalKind, NewJournalEntry, NewSession, NewToolArtifact, Seq, SessionStore,
+        SessionStoreError, sqlite::SqliteSessionStore,
     },
     test_support::TestDir,
 };
@@ -42,7 +42,12 @@ async fn put_tool_artifact_rejects_tampered_durable_payload_identity() {
     // Then: SQLite rejects the forged digest-to-payload binding explicitly.
     assert!(matches!(
         result,
-        Err(SessionStoreError::ToolArtifactDigestMismatch { claimed, .. }) if claimed == hash
+        Err(SessionStoreError::ToolArtifactStoredIntegrity {
+            artifact_id,
+            message,
+            ..
+        }) if artifact_id == format!("tool-result-{hash}")
+            && message.contains("digest mismatch")
     ));
 }
 
@@ -82,7 +87,7 @@ async fn put_tool_artifact_rejects_ambiguous_durable_storage_source() {
     // Then: SQLite refuses a row that is both inline and external.
     assert!(matches!(
         result,
-        Err(SessionStoreError::InvalidToolArtifact(_))
+        Err(SessionStoreError::ToolArtifactStoredIntegrity { .. })
     ));
 }
 
@@ -122,5 +127,49 @@ async fn put_tool_artifact_rejects_tampered_journal_identity() {
     assert!(matches!(
         result,
         Err(SessionStoreError::ToolArtifactJournalMismatch { .. })
+    ));
+}
+
+#[tokio::test]
+async fn put_tool_artifact_rejects_a_non_positive_journal_sequence() {
+    let root = TestDir::new();
+    let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+        .await
+        .expect("store should open");
+    let session = store
+        .create_session(NewSession::new(root.path().to_path_buf()))
+        .await
+        .expect("session should be created");
+    let hash = "sha256-239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5";
+    let artifact =
+        NewToolArtifact::inline(hash, "preview", "payload").expect("artifact should be valid");
+    store
+        .put_tool_artifact(&session, Seq::ZERO, artifact.clone())
+        .await
+        .expect("artifact should commit");
+    let head = store
+        .append(
+            &session,
+            NewJournalEntry::raw(
+                JournalKind::SessionNote,
+                serde_json::json!({"note": "later durable fact"}),
+            ),
+        )
+        .await
+        .expect("later fact should commit");
+    sqlx::query(
+        "UPDATE journal_entries SET seq = -1 \
+         WHERE session_id = ? AND kind = 'tool_artifact'",
+    )
+    .bind(session.as_str())
+    .execute(&store.pool)
+    .await
+    .expect("fixture should corrupt the earlier artifact sequence");
+
+    let result = store.put_tool_artifact(&session, head, artifact).await;
+
+    assert!(matches!(
+        result,
+        Err(SessionStoreError::ToolArtifactJournalIntegrity { .. })
     ));
 }

@@ -1,3 +1,5 @@
+//! Validates the trust boundary between active context and durable artifact storage.
+
 use kuncode_core::completion::Message;
 use thiserror::Error;
 
@@ -8,6 +10,9 @@ use crate::{
 };
 
 /// Validated immutable inputs for one spill pass.
+///
+/// Construction binds canonical protocol groups, their protected suffix, and
+/// one-to-one message lineage to the same durable active session.
 pub struct ArtifactSpillInput<'a> {
     pub(super) groups: &'a [ProtocolGroup],
     pub(super) source_message_seqs: Vec<Option<crate::session_store::Seq>>,
@@ -96,6 +101,12 @@ pub enum ArtifactSpillError {
     /// Journal replay failed before artifact writes were allowed.
     #[error("artifact spill journal audit failed: {0}")]
     JournalAudit(String),
+    /// Durable journal facts could not be decoded according to their schema.
+    #[error("artifact spill found an invalid durable journal fact: {0}")]
+    JournalIntegrity(String),
+    /// Stored artifact identity no longer agrees with its durable journal fact.
+    #[error("artifact spill found an invalid durable artifact binding: {0}")]
+    ArtifactIntegrity(String),
     /// The observed journal head differs from the active session frontier.
     #[error("journal head differs from session frontier {frontier}: found {actual}")]
     JournalFrontierStale {
@@ -129,6 +140,33 @@ pub enum ArtifactSpillError {
     /// A store returned a receipt that does not prove the requested artifact write.
     #[error("artifact persistence returned a receipt for a different session or payload")]
     ReceiptMismatch,
+}
+
+impl ArtifactSpillError {
+    /// Classifies failures that permanently invalidate durable lineage.
+    ///
+    /// A `true` result means the session can no longer prove which durable facts
+    /// authorize its active context, so retrying or reattaching persistence would
+    /// reuse compromised authority. Ordinary input and read failures return
+    /// `false` because they only abort the current pass.
+    pub(crate) const fn invalidates_persistence_authority(&self) -> bool {
+        match self {
+            Self::NonDurableSession
+            | Self::InvalidLineage
+            | Self::JournalIntegrity(_)
+            | Self::ArtifactIntegrity(_)
+            | Self::JournalFrontierStale { .. }
+            | Self::JournalMessageMismatch { .. }
+            | Self::JournalHeadConflict { .. }
+            | Self::PersistenceOutcomeUnknown { .. }
+            | Self::ReceiptMismatch => true,
+            Self::ActiveSessionMismatch
+            | Self::InvalidProtectedTail
+            | Self::InvalidProtocolGroups
+            | Self::InvalidProtocol(_)
+            | Self::JournalAudit(_) => false,
+        }
+    }
 }
 
 fn flatten(groups: &[ProtocolGroup]) -> Vec<Message> {

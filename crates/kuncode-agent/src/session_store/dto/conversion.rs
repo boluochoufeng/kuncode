@@ -1,3 +1,9 @@
+//! Lossless conversion between completion messages and the durable DTO schema.
+//!
+//! Conversion copies provider-owned identifiers and opaque metadata verbatim. Decoding
+//! also reconstructs [`NonEmptyVec`] at the storage boundary so malformed durable arrays
+//! cannot enter the completion domain.
+
 use kuncode_core::{
     completion::{
         AssistantContent, Message, Reasoning, ReasoningContent, Text, ToolCall, ToolFunction,

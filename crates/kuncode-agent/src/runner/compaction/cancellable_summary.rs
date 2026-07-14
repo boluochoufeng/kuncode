@@ -1,4 +1,7 @@
 //! Cancellation boundary for the model-only portion of semantic compaction.
+//!
+//! Durable writes remain governed by their atomic store contracts; cancellation
+//! races only the summary model call, before a candidate can be committed.
 
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;

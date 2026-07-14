@@ -1,3 +1,5 @@
+// Verifies that only direct turn input receives human-authored lineage.
+
 #[tokio::test]
 async fn only_real_prompt_is_human_and_durable_appends_get_exact_coverage() {
     let root = TestDir::new();
@@ -36,7 +38,9 @@ async fn only_real_prompt_is_human_and_durable_appends_get_exact_coverage() {
     .with_hook(Arc::new(hook))
     .with_session_store(store);
     let mut session = AgentSession::new();
-    session.attach_session_id(session_id);
+    session
+        .attach_session_id(session_id)
+        .expect("fresh session should attach");
 
     runner.run_turn(&mut session, "REAL_PROMPT").await.expect("runs");
 

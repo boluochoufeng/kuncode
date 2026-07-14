@@ -106,7 +106,9 @@ async fn runner_spills_old_large_tool_result_and_commits_sqlite_checkpoint() {
         .await
         .expect("session should be created");
     let mut session = AgentSession::new();
-    session.attach_session_id(session_id.clone());
+    session
+        .attach_session_id(session_id.clone())
+        .expect("fresh session should attach");
     let model = FakeModel::new([
         response(AssistantContent::tool_call(
             "call_large",
@@ -169,7 +171,10 @@ async fn runner_spills_old_large_tool_result_and_commits_sqlite_checkpoint() {
         .await
         .expect("checkpoint read should succeed")
         .expect("compaction should persist a checkpoint");
-    assert_eq!(checkpoint.active_messages, third_messages[1..]);
+    assert_eq!(
+        checkpoint.active_messages,
+        third_messages[1..third_messages.len() - 1]
+    );
     assert!(checkpoint.summary_json.is_none());
     let journal = store
         .replay_after(&session_id, Seq::ZERO)

@@ -1,3 +1,10 @@
+//! Runs eligibility-driven compaction passes and commits the first safe result.
+//!
+//! Artifact spilling runs first, followed by tool-result slimming and semantic
+//! summarization only while the remeasured candidate still needs reduction.
+//! Every candidate passes the same protected-tail, token, and lineage gates
+//! before an atomic durable commit can authorize in-memory installation.
+
 use std::time::Instant;
 
 use kuncode_core::completion::Usage;
@@ -27,6 +34,16 @@ use commit::{CommitPlan, commit_and_install};
 use store::SessionArtifactStore;
 use validation::validate_candidate;
 
+/// Compacts one frozen provider-visible request at a durable session boundary.
+///
+/// Passes are conditional: later lossy work is skipped as soon as an earlier
+/// candidate reaches the configured target, and reports include only passes
+/// that materially contributed to the installed candidate.
+///
+/// # Errors
+/// Returns [`CompactionError`] when the session lacks durable authority, a
+/// protocol-safe candidate cannot be built, estimation or summarization fails,
+/// a safety gate rejects the candidate, or persistence cannot prove the commit.
 pub(crate) async fn compact_context(
     input: CompactionDependencies<'_>,
 ) -> Result<CompactionOutcome, CompactionError> {
@@ -48,24 +65,23 @@ pub(crate) async fn compact_context(
         .session_id()
         .cloned()
         .ok_or(CompactionError::NonDurableSession)?;
+    // Bind the final CAS to the original active messages. Artifact writes may
+    // advance the durable head, but they must not silently change this input.
     let input_hash = active_messages_sha256(input.session.messages())?;
     let groups = group_messages(input.session.messages())?;
     let protected = protected_tail(&input, &groups, before).await?;
+    // Capture the safety suffix before any lossy pass so final validation can
+    // require the regrouped candidate to retain it exactly.
     let required_tail = groups[protected.group_range.clone()].to_vec();
     let store = SessionArtifactStore(input.store);
     let spill_input = ArtifactSpillInput::new(&groups, &protected, input.session)?;
     let artifacts = match spill_artifacts(spill_input, &store, input.artifact_counter).await {
         Ok(artifacts) => artifacts,
         Err(error) => {
-            if matches!(
-                error,
-                crate::compaction::artifact::ArtifactSpillError::PersistenceOutcomeUnknown { .. }
-                    | crate::compaction::artifact::ArtifactSpillError::ReceiptMismatch
-                    | crate::compaction::artifact::ArtifactSpillError::JournalHeadConflict { .. }
-            ) {
+            if error.invalidates_persistence_authority() {
                 input
                     .session
-                    .mark_persistence_failed("artifact persistence frontier is no longer trusted");
+                    .mark_persistence_failed("artifact journal authority is no longer trusted");
             }
             return Err(error.into());
         }
@@ -76,6 +92,8 @@ pub(crate) async fn compact_context(
         .iter()
         .filter(|outcome| matches!(outcome, ArtifactSpillOutcome::Spilled { .. }))
         .count();
+    // A pass is reported only when it materially changed the candidate; merely
+    // being evaluated does not imply that it ran successfully or contributed.
     let mut passes = Vec::new();
     if artifact_count > 0 {
         passes.push(CompactionPass::ArtifactSpill);
@@ -168,6 +186,8 @@ async fn compact_after_artifacts(
             ))
         }
         SelectionOutcome::Summarize(selection) => {
+            // Semantic rewriting is the last resort after deterministic passes
+            // cannot produce a candidate below the strict soft boundary.
             let request = input
                 .session
                 .issue_slimmed_summary_request(&slimmed, &selection)?;

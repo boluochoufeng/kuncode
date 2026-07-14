@@ -1,4 +1,7 @@
 //! Automatic compaction at the quiescent boundary before a model request.
+//!
+//! No tool call is running at this boundary, so one frozen provider-visible
+//! envelope can measure the baseline, every candidate, and the final dispatch.
 
 use std::{sync::Arc, time::Instant};
 
@@ -31,19 +34,33 @@ mod shadow;
 
 use artifact_counter::RequestArtifactCounter;
 use cancellable_summary::CancellableSummarizer;
-use events::{elapsed_ms, failure_event, failure_message, is_recoverable, pressure_reason};
+use events::{
+    elapsed_ms, failure_event, failure_message, invalidates_persistence_authority, is_recoverable,
+    pressure_reason,
+};
 
 impl<M> AgentRunner<M>
 where
     M: CompletionModel,
 {
+    /// Builds the next provider request, compacting first when policy requires it.
+    ///
+    /// Soft-pressure failures may reuse the original request when the attempt
+    /// produced no authority-invalidating durable outcome. Hard pressure and
+    /// authority-invalidating failures abort the turn instead.
+    ///
+    /// # Errors
+    /// Returns [`AgentError`] when request projection or initial budget estimation
+    /// fails, cancellation occurs, or a non-recoverable compaction cannot complete.
     pub(super) async fn prepare_request(
         &self,
         session: &mut AgentSession,
         iteration: usize,
         cancel: &CancellationToken,
     ) -> Result<CompletionRequest, AgentError> {
-        let projector = self.freeze_request_projector(session.messages());
+        // Freeze system text, tools, request options, and request-only runtime
+        // state once so token comparisons differ only by active context.
+        let projector = self.freeze_request_projector(session)?;
         let original = projector.project_agent(session.messages())?;
         let Some(runtime) = self.config.compaction.as_ref() else {
             return Ok(original);
@@ -121,6 +138,8 @@ where
                 failure_event(&error, level, before, started),
             );
             if level == BudgetLevel::Soft {
+                // No durable operation started, so the missing store produced no
+                // ambiguous outcome; fallback is still forbidden at hard pressure.
                 self.emit(
                     session,
                     Some(iteration),
@@ -161,6 +180,14 @@ where
             summary_model: &runtime.model_id,
         })
         .await;
+        // Ambiguous durable outcomes and provenance violations poison the
+        // session before recovery is considered, preventing a stale fallback.
+        if let Err(error) = &result
+            && invalidates_persistence_authority(error)
+        {
+            session
+                .mark_persistence_failed("compaction persistence authority is no longer trusted");
+        }
         match result {
             Ok(CompactionOutcome::Compacted(report)) => {
                 self.emit(
@@ -203,6 +230,7 @@ where
                         message: failure_message(&error),
                     },
                 );
+                // `is_recoverable` excludes every authority-invalidating error.
                 Ok(original)
             }
             Err(error) => {

@@ -1,3 +1,9 @@
+//! Builds provider-visible candidates together with their durable provenance.
+//!
+//! Candidate messages and lineage remain positionally aligned. Deterministic
+//! rewrites derive lineage only for changed positions, while semantic rewrites
+//! bind the projected summary to the durable range it replaces.
+
 use std::collections::BTreeSet;
 
 use kuncode_core::completion::Message;
@@ -16,6 +22,11 @@ use crate::{
     session_store::Seq,
 };
 
+/// Complete candidate state awaiting the final safety and persistence gates.
+///
+/// `messages` and `lineage` always have equal lengths. The source range covers
+/// the durable facts represented by the lossy rewrite and must not extend past
+/// the artifact-audited journal frontier.
 pub(super) struct CandidateState {
     pub(super) messages: Vec<Message>,
     pub(super) lineage: Vec<MessageLineage>,
@@ -43,6 +54,8 @@ pub(super) fn deterministic_candidate(
     }
     let mut source_start = None;
     let mut source_end = None;
+    // Preserve exact lineage for untouched messages; only rewritten positions
+    // lose their verbatim-journal authority and contribute source coverage.
     for (index, (candidate, source_message)) in messages.iter().zip(session.messages()).enumerate()
     {
         if candidate == source_message {
@@ -62,6 +75,8 @@ pub(super) fn deterministic_candidate(
         );
     }
     let starts = group_message_starts(groups);
+    // Marker references are authorized only at the result position whose full
+    // payload was durably persisted by the artifact pass.
     for outcome in artifacts.outcomes() {
         let ArtifactSpillOutcome::Spilled {
             location,
@@ -111,6 +126,8 @@ pub(super) fn semantic_candidate(
     let coverage = MessageCoverage::closed(summary.source_seq_start, summary.source_seq_end);
     let mut lineage = vec![MessageLineage::derived(coverage, false, refs)];
     if let Some(index) = selection.current_request_anchor_index() {
+        // Keep the current request byte-for-byte even when it lies in the
+        // summarized prefix, so model paraphrasing cannot change the task.
         let anchor = selection
             .current_request_anchor()
             .ok_or(CompactionError::InvalidLineage)?;

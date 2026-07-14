@@ -1,4 +1,4 @@
-//! Protected-tail selection and human-authored request anchoring.
+//! Non-empty protected-tail selection and human-authored request anchoring.
 
 use std::ops::Range;
 
@@ -22,21 +22,26 @@ pub struct HumanRequestAnchor {
     pub message: Message,
 }
 
-/// A contiguous suffix excluded from every lossy compaction pass.
+/// A non-empty contiguous suffix excluded from every lossy compaction pass.
+///
+/// The suffix always starts no later than the most recent closed tool exchange,
+/// so protocol safety takes precedence over the caller's nominal token budget.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProtectedRecentTail {
     /// Returns the half-open range into the grouped history.
     pub group_range: Range<usize>,
     /// Estimator cost of the selected suffix.
     pub estimated_tokens: u64,
-    /// Caller-provided budget used to expand the mandatory suffix.
+    /// Caller-provided budget used to expand, but never shrink, the mandatory suffix.
     pub budget_tokens: u64,
 }
 
 /// Selects a protected suffix within `recent_tail_budget_tokens`.
 ///
-/// The latest closed tool exchange, or final ordinary group when none exists,
-/// is mandatory and remains whole even when its contiguous suffix exceeds the budget.
+/// For non-empty canonical input, the latest closed tool exchange and everything
+/// after it form the mandatory suffix. When no exchange exists, the final group
+/// is mandatory. That suffix remains whole even when it exceeds the budget;
+/// earlier complete groups are included only while the complete suffix fits.
 pub fn select_protected_recent_tail(
     groups: &[ProtocolGroup],
     recent_tail_budget_tokens: u64,

@@ -1,4 +1,8 @@
 //! Target-aware selection of a complete summary prefix and verbatim tail.
+//!
+//! The target is an optimization stop, not a validity boundary: selection only
+//! requests semantic work when a complete unprotected prefix remains and the
+//! deterministic candidate has not reached that target.
 
 use kuncode_core::completion::Message;
 use thiserror::Error;
@@ -56,6 +60,9 @@ impl CandidateLoad {
 }
 
 /// Protocol-safe split awaiting durable source binding by the orchestrator.
+///
+/// Both sides contain whole canonical groups. The prefix is the complete
+/// unprotected history; the protected suffix is retained byte-for-byte.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CompactionSelection {
     summarize: Vec<ProtocolGroup>,
@@ -128,7 +135,11 @@ pub enum SelectionError {
     Protocol(#[from] ProtocolError),
 }
 
-/// Selects a summary prefix without splitting protocol groups.
+/// Selects the complete unprotected prefix without splitting protocol groups.
+///
+/// A deterministic candidate that reaches the target is accepted immediately.
+/// If no safe prefix remains, a candidate below soft is still valid because the
+/// target is not a hard boundary; otherwise the input is uncompressible.
 ///
 /// # Errors
 /// Returns [`SelectionError`] when protocol groups, the protected suffix,

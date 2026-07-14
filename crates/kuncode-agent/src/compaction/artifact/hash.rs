@@ -1,3 +1,5 @@
+//! Computes content identities used to bind artifacts and their source results.
+
 use sha2::{Digest, Sha256};
 
 use kuncode_core::completion::ToolResult;
@@ -6,6 +8,13 @@ pub(super) fn sha256_hex(input: &[u8]) -> String {
     format!("{:x}", Sha256::digest(input))
 }
 
+/// Hashes the complete serialized [`ToolResult`] used by later slimming checks.
+///
+/// Binding the serde JSON representation includes protocol identifiers and
+/// content structure, not only the visible payload text.
+///
+/// # Errors
+/// Returns an error when the complete result cannot be serialized.
 pub(crate) fn tool_result_hash(result: &ToolResult) -> Result<String, serde_json::Error> {
     serde_json::to_vec(result).map(|encoded| format!("sha256-{}", sha256_hex(&encoded)))
 }

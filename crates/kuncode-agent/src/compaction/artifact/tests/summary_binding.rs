@@ -12,6 +12,8 @@ use super::support::{FixedCounter, persisted_session, tool_exchange};
 
 #[tokio::test]
 async fn spilled_artifacts_authorize_a_summary_at_the_advanced_frontier() {
+    // The summary must bind to the artifact receipt frontier; the earlier audit
+    // frontier does not cover the durable payload named by the marker.
     let root = TestDir::new();
     let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
         .await

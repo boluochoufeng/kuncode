@@ -1,3 +1,5 @@
+//! Validated rollout thresholds and context-window reservations.
+
 use thiserror::Error;
 
 use super::TokenEstimationError;
@@ -54,6 +56,10 @@ pub enum CompactionConfigError {
 }
 
 /// Validated rollout and context-window settings.
+///
+/// The target is an optimization goal below the soft trigger, while the hard
+/// threshold is the fail-closed request boundary. The recent ratio reserves a
+/// separate safety suffix and does not weaken protocol-level protection.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CompactionConfig {
     mode: CompactionMode,
@@ -67,7 +73,7 @@ pub struct CompactionConfig {
 }
 
 impl CompactionConfig {
-    /// Creates settings with the initial rollout ratios from the design.
+    /// Creates settings with the crate's built-in rollout ratios.
     ///
     /// # Errors
     /// Returns [`CompactionConfigError::InvalidWindow`] when reservations leave

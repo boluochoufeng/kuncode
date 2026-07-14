@@ -1,3 +1,9 @@
+//! Bounded marker construction for explicitly authorized tool results.
+//!
+//! Marker preparation fails safe to verbatim retention unless the source has
+//! durable lineage, represents a successful complete harness output, and the
+//! final marker is both capped and strictly cheaper than the original result.
+
 use kuncode_core::{
     completion::{AssistantContent, Message, ToolResult, ToolResultContent},
     non_empty_vec::NonEmptyVec,
@@ -52,6 +58,8 @@ pub(super) async fn prepare_slimmed_result(
     let Ok(output) = serde_json::from_str::<ToolOutput>(payload) else {
         return PreparedSlimming::Retain(SlimmingRetention::Parse);
     };
+    // Error and truncation details may be necessary to diagnose or continue the
+    // current task, so a bounded projection cannot safely replace either form.
     if !output.ok {
         return PreparedSlimming::Retain(SlimmingRetention::FailedOutput);
     }
@@ -63,6 +71,8 @@ pub(super) async fn prepare_slimmed_result(
     };
     let data = output.data.as_ref().and_then(Value::as_object);
     let arguments = call.function.arguments.as_object();
+    // Only preview is reduced; reaching zero distinguishes oversized fixed
+    // evidence from a candidate that merely needs a smaller excerpt.
     let mut preview_bytes = INITIAL_PREVIEW_BYTES.min(payload.len());
     loop {
         let marker = SlimmedToolResultMarker {

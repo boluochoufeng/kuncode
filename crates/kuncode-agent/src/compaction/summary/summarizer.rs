@@ -1,3 +1,9 @@
+//! Runs semantic compaction as an isolated, tool-free model request.
+//!
+//! Provider structured-output support narrows the expected shape but is not a
+//! trust boundary. The response is still untrusted until request-bound decoding,
+//! provenance checks, semantic checks, and resource bounds all succeed.
+
 use std::num::NonZeroU32;
 
 use async_trait::async_trait;
@@ -84,6 +90,9 @@ pub trait ContextSummarizer: Send + Sync {
 }
 
 /// No-tool summarizer backed by the same provider abstraction as the agent.
+///
+/// Disabling tools and reasoning isolates compression from the normal agent loop;
+/// the generated text cannot directly schedule actions or mutate conversation state.
 pub struct LlmContextSummarizer<M> {
     model: M,
     max_output_tokens: NonZeroU32,

@@ -16,7 +16,9 @@ fn production_issuer_binds_the_selected_durable_prefix() {
     let session_id = SessionId::new("summary-source");
     let messages = vec![Message::user("old"), Message::assistant("recent")];
     let mut session = AgentSession::new();
-    session.attach_session_id(session_id.clone());
+    session
+        .attach_session_id(session_id.clone())
+        .expect("fresh session should attach");
     session.push_with_journal_seq(messages[0].clone(), Some(Seq::new(1)));
     session.push_with_journal_seq(messages[1].clone(), Some(Seq::new(2)));
     let groups = group_messages(&messages).expect("history should be closed");
@@ -43,8 +45,13 @@ fn production_issuer_rejects_missing_or_cross_session_provenance() {
     let messages = vec![Message::user("old"), Message::assistant("recent")];
     let groups = group_messages(&messages).expect("history should be closed");
     let selection = selection(&groups, &messages);
-    let mut session = AgentSession::from_messages(messages);
-    session.attach_session_id(SessionId::new("active"));
+    let mut session = AgentSession::new();
+    session
+        .attach_session_id(SessionId::new("active"))
+        .expect("fresh session should attach");
+    for message in &messages {
+        session.push(message.clone());
+    }
 
     let missing = fixture_spill_result_for_session(
         SessionId::new("active"),
@@ -73,7 +80,9 @@ fn production_issuer_rejects_selection_with_a_rebound_prefix() {
     let artifacts =
         fixture_spill_result_for_session(session_id.clone(), groups.clone(), Seq::new(2), vec![]);
     let mut session = AgentSession::new();
-    session.attach_session_id(session_id);
+    session
+        .attach_session_id(session_id)
+        .expect("fresh session should attach");
     session.push_with_journal_seq(messages[0].clone(), Some(Seq::new(1)));
     session.push_with_journal_seq(messages[1].clone(), Some(Seq::new(2)));
 
@@ -81,6 +90,8 @@ fn production_issuer_rejects_selection_with_a_rebound_prefix() {
     let forged_groups = group_messages(&forged_messages).expect("forged history should be closed");
     let rebound = selection(&forged_groups, &forged_messages);
 
+    // Matching indices are insufficient: the issuer must bind the exact selected
+    // messages to the audited durable snapshot before minting a summary request.
     assert_eq!(
         session.issue_summary_request(&artifacts, &rebound),
         Err(SummarySourceError::SnapshotMismatch)

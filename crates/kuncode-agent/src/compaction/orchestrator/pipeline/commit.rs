@@ -1,4 +1,8 @@
 //! Receipt-bound atomic commit and in-memory installation.
+//!
+//! The validated candidate is persisted as one compaction-event/checkpoint
+//! transaction. Only the returned receipt may authorize installation, and the
+//! session validates that receipt before replacing any in-memory messages.
 
 use kuncode_core::completion::Usage;
 
@@ -17,6 +21,10 @@ use crate::{
     },
 };
 
+/// Validated candidate and compare-and-swap facts for one durable commit.
+///
+/// `input_hash` binds the original active messages while `expected_head` binds
+/// the journal frontier after any artifact writes performed by this attempt.
 pub(super) struct CommitPlan {
     pub(super) session_id: SessionId,
     pub(super) input_hash: String,
@@ -34,6 +42,8 @@ pub(super) async fn commit_and_install(
     input: CompactionDependencies<'_>,
     plan: CommitPlan,
 ) -> Result<CompactionOutcome, CompactionError> {
+    // Revalidate both halves of the snapshot immediately before persistence:
+    // neither active messages nor the artifact-advanced frontier may drift.
     if input.session.durable_seq() != Some(plan.expected_head)
         || active_messages_sha256(input.session.messages())? != plan.input_hash
     {
@@ -111,9 +121,13 @@ pub(super) async fn commit_and_install(
         ),
         checkpoint,
     };
+    // The store commits the audit event and checkpoint reference atomically;
+    // its receipt is the sole authority for installing the lossy candidate.
     let committed = match input.store.commit_compaction(commit).await {
         Ok(receipt) => receipt,
         Err(error) => {
+            // Either outcome means the local frontier may no longer identify
+            // the store state, so subsequent lossy mutation must fail closed.
             if matches!(
                 error,
                 crate::session_store::SessionStoreError::CommitOutcomeUnknown { .. }
@@ -127,6 +141,9 @@ pub(super) async fn commit_and_install(
         }
     };
     let checkpoint_seq = committed.checkpoint_seq();
+    // Installation verifies receipt session, output hash, and freshness before
+    // assigning messages. A rejection occurs after a possible durable commit,
+    // so the session can no longer claim authoritative persistence state.
     if let Err(error) = input.session.install_compacted_context(prepared, committed) {
         input
             .session

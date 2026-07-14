@@ -91,6 +91,7 @@ async fn stale_journal_head_rolls_back_every_compaction_record() {
         )
         .await
         .expect("first message should commit");
+    // Simulate an append that lands after the candidate binds to `expected`.
     store
         .append(
             &session,

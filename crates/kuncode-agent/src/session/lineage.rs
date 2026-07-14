@@ -1,4 +1,7 @@
 //! Trusted in-memory provenance carried alongside provider-visible messages.
+//!
+//! Lineage is created only at harness-controlled append and compaction
+//! boundaries. A user-role message is not evidence that a human authored it.
 
 use std::collections::BTreeSet;
 
@@ -53,7 +56,10 @@ impl MessageCoverage {
         }
     }
 
-    /// Creates an ordered non-empty range already validated by the compactor.
+    /// Creates a range whose bounds were already validated by the compactor.
+    ///
+    /// Callers must guarantee `Seq::ZERO < start <= end` and that `end` does not
+    /// exceed the audited durable head. This constructor performs no validation.
     pub(crate) const fn closed(start: Seq, end: Seq) -> Self {
         Self { start, end }
     }
@@ -143,6 +149,9 @@ impl MessageLineage {
 }
 
 /// Complete in-memory state authorized for one receipt-bound installation.
+///
+/// Messages and lineage must remain non-empty and aligned one-for-one; the
+/// constructor is the gate that preserves that invariant across replacement.
 pub(crate) struct PreparedActiveContext {
     pub(super) messages: Vec<Message>,
     pub(super) lineage: Vec<MessageLineage>,
@@ -150,6 +159,7 @@ pub(crate) struct PreparedActiveContext {
 }
 
 impl PreparedActiveContext {
+    /// Returns a candidate only when its provider and provenance vectors align.
     pub(crate) fn new(
         messages: Vec<Message>,
         lineage: Vec<MessageLineage>,
@@ -164,5 +174,6 @@ impl PreparedActiveContext {
 }
 
 pub(super) fn untrusted_lineage(len: usize) -> Vec<MessageLineage> {
+    // Imported or cloned roles carry no proof of human authorship or durability.
     vec![MessageLineage::default(); len]
 }

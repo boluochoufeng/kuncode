@@ -1,3 +1,8 @@
+//! Produces deterministic, UTF-8-safe previews for stored artifact payloads.
+//!
+//! Previews prefer complete leading and trailing lines, but the byte ceiling is
+//! authoritative and includes the omission marker itself.
+
 const CANONICAL_ARTIFACT_PREVIEW_BYTES: usize = 4_096;
 const MIN_OMISSION_PREVIEW_BYTES: usize = 32;
 
@@ -5,6 +10,11 @@ pub(super) fn canonical_artifact_preview(payload: &str) -> String {
     adaptive_preview(payload, CANONICAL_ARTIFACT_PREVIEW_BYTES)
 }
 
+/// Returns a head-tail preview that never exceeds `max_bytes` or splits UTF-8.
+///
+/// Very small budgets yield an empty string because a useful omission marker
+/// cannot fit. Line boundaries are preferred only when they preserve the hard
+/// byte bound.
 pub(crate) fn adaptive_preview(value: &str, max_bytes: usize) -> String {
     if max_bytes < MIN_OMISSION_PREVIEW_BYTES {
         return String::new();

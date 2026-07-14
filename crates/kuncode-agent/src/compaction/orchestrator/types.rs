@@ -1,3 +1,8 @@
+//! Contracts shared by the compaction orchestrator and its runtime caller.
+//!
+//! One attempt uses a frozen request shape and consistent estimators so the
+//! baseline, intermediate candidates, and final candidate remain comparable.
+
 use async_trait::async_trait;
 use kuncode_core::completion::{CompletionRequest, Message, Usage};
 use thiserror::Error;
@@ -45,6 +50,9 @@ pub(crate) trait GroupTokenEstimator: Send + Sync {
 }
 
 /// Collaborators frozen for one compaction attempt.
+///
+/// The projector retains the normal request's system, tool, and runtime shape;
+/// changing any collaborator mid-attempt would invalidate token comparisons.
 pub(crate) struct CompactionDependencies<'a> {
     pub(crate) config: &'a CompactionConfig,
     pub(crate) measured_before: ContextBudget,
@@ -59,6 +67,9 @@ pub(crate) struct CompactionDependencies<'a> {
 }
 
 /// Passes that materially contributed to an installed candidate.
+///
+/// Deterministic and semantic variants are eligibility-driven and therefore
+/// may be absent. `AtomicCommit` is appended only after receipt-bound install.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CompactionPass {
     ArtifactSpill,
@@ -103,6 +114,9 @@ pub(crate) enum CompactionOutcome {
 }
 
 /// Typed failure from a pass that leaves the old active context installed.
+///
+/// Persistence failures can still poison session authority when the durable
+/// outcome or frontier no longer agrees with the in-memory session.
 #[derive(Debug, Error)]
 pub(crate) enum CompactionError {
     #[error("lossy compaction requires a durable active session")]

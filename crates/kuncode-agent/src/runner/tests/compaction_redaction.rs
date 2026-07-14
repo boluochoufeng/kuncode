@@ -1,3 +1,5 @@
+// Verifies that compaction telemetry exposes stable codes without secret payloads.
+
 #[derive(Clone, Default)]
 struct SummaryErrorModel {
     requests: Arc<Mutex<Vec<CompletionRequest>>>,
@@ -51,7 +53,9 @@ async fn soft_summary_provider_body_is_absent_from_all_events() {
         .await
         .expect("session should be created");
     let mut session = AgentSession::new();
-    session.attach_session_id(session_id.clone());
+    session
+        .attach_session_id(session_id.clone())
+        .expect("fresh session should attach");
     for (message, human) in [
         (Message::user("old human goal"), true),
         (Message::assistant("old analysis"), false),

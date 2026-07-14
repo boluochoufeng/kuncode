@@ -1,7 +1,9 @@
 //! Loads `.kuncode/settings.json` into permission and automatic-compaction policy.
 //!
 //! The file shape mirrors Claude Code's `permissions` block. Rules are parsed
-//! with [`RuleOrigin::ProjectSettings`] so denials remain explainable.
+//! with [`RuleOrigin::ProjectSettings`] so denials remain explainable. Active
+//! compaction settings are validated here before they can reach runtime
+//! assembly; absent or disabled settings deliberately produce no runtime policy.
 
 use std::{num::NonZeroU32, path::Path};
 
@@ -35,6 +37,8 @@ struct PermissionsSection {
     default_mode: Option<String>,
 }
 
+// Keep budget and threshold keys closed so a typo cannot silently select a
+// default and change when lossy compaction runs.
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CompactionSection {
@@ -49,6 +53,11 @@ struct CompactionSection {
     recent_ratio: Option<f64>,
 }
 
+/// Validated settings for an active project compaction policy.
+///
+/// Only `shadow` and `enabled` sections reach this type. An absent section, an
+/// explicitly disabled section, or a section whose mode is omitted maps to
+/// [`None`] before runtime assembly.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ProjectCompaction {
     policy: CompactionConfig,
@@ -56,6 +65,21 @@ pub(crate) struct ProjectCompaction {
 }
 
 impl ProjectCompaction {
+    /// Returns the output allowance excluded from the usable input window.
+    ///
+    /// Runtime assembly also installs this value as the provider request output
+    /// limit, keeping request construction and compaction accounting aligned.
+    pub(crate) const fn reserved_output(self) -> u64 {
+        self.policy.reserved_output()
+    }
+
+    /// Binds the validated project policy to the concrete provider model.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentCompactionConfigError::BlankModelId`] when `model_id` is
+    /// empty or whitespace. The parsed non-zero 32-bit summary budget already
+    /// satisfies the runtime range requirement.
     pub(crate) fn into_runtime(
         self,
         model_id: &str,
@@ -75,14 +99,21 @@ pub struct ProjectSettings {
     pub policy: PermissionPolicy,
     /// Default mode requested by the file, if any.
     pub default_mode: Option<PermissionMode>,
+    /// Present only for a validated `shadow` or `enabled` compaction section.
     pub(crate) compaction: Option<ProjectCompaction>,
 }
 
 /// Loads `.kuncode/settings.json` under `root`.
 ///
-/// A missing file is not an error (returns defaults). A malformed file, a bad
-/// rule, or an unknown mode *is* an error, so the user learns their config is
-/// broken instead of silently running with less protection than they think.
+/// A missing file returns defaults. Compaction fields form a closed schema, so
+/// unknown budget or threshold names fail instead of silently using defaults.
+///
+/// # Errors
+///
+/// Returns [`SettingsError`] when the file cannot be read, its JSON or field
+/// schema is invalid, a permission rule or mode is invalid, or an active
+/// compaction section has an unsupported mode, missing context limit, invalid
+/// budget, or inconsistent thresholds.
 pub fn load_project_settings(root: &Path) -> Result<ProjectSettings, SettingsError> {
     let path = root.join(SETTINGS_PATH);
     let raw = match std::fs::read_to_string(&path) {
@@ -134,6 +165,12 @@ fn parse_compaction(
             SettingsError::Compaction("agent default max_tokens is unavailable".to_string())
         })?,
     };
+    if reserved_output == 0 || reserved_output > u64::from(u32::MAX) {
+        return Err(SettingsError::Compaction(format!(
+            "reservedOutput must be within 1..={}, got {reserved_output}",
+            u32::MAX
+        )));
+    }
     let policy = CompactionConfig::new(
         mode,
         context_limit,
@@ -184,8 +221,11 @@ pub enum SettingsError {
     Parse(serde_json::Error),
     Rule(String, String),
     Mode(String),
+    /// The compaction mode is neither `disabled`, `shadow`, nor `enabled`.
     CompactionMode(String),
+    /// Active compaction cannot derive a usable window without `contextLimit`.
     CompactionContextLimit,
+    /// A compaction budget, window, or threshold invariant was rejected.
     Compaction(String),
 }
 

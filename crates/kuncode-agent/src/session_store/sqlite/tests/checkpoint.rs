@@ -58,6 +58,8 @@ async fn latest_checkpoint_then_replay_after_rebuilds_active_context() {
         .await
         .expect("checkpoint should load")
         .expect("checkpoint should exist");
+    // The reference remains replayable journal history, while only message facts
+    // after the covered range extend the checkpoint's active context.
     let tail = store
         .replay_after(&session, checkpoint.covers_through_seq)
         .await

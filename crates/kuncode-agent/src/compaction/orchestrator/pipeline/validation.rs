@@ -1,4 +1,8 @@
 //! Final safety gates applied before durable candidate commit.
+//!
+//! A candidate must preserve the protected suffix, strictly reduce the frozen
+//! provider request below the soft boundary, keep messages aligned with lineage,
+//! and reference only ordered coverage at or before the audited journal head.
 
 use super::super::{
     candidate::CandidateState,
@@ -33,6 +37,8 @@ pub(super) fn validate_candidate(
     if candidate.messages.len() != candidate.lineage.len() {
         return Err(CompactionError::InvalidLineage);
     }
+    // Source and per-message coverage may only claim facts visible at the
+    // artifact-audited frontier; future or reversed ranges are not installable.
     if candidate.source_start > candidate.source_end || candidate.source_end > expected_head {
         return Err(CompactionError::InvalidLineage);
     }

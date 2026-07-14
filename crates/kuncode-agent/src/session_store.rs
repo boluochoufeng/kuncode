@@ -21,14 +21,14 @@ pub use artifact::{CommittedArtifact, NewToolArtifact, ToolArtifactRef};
 pub use error::SessionStoreError;
 pub use model::{
     Checkpoint, CommittedCompaction, CompactionEvent, CompactionMetadata, CompactionPassKind,
-    CompactionReason, JournalEntry, JournalKind, NewCheckpoint, NewCompactionCommit,
-    NewJournalEntry, NewSession, Seq, SessionId,
+    CompactionReason, JournalEntry, JournalKind, JournalSnapshot, NewCheckpoint,
+    NewCompactionCommit, NewJournalEntry, NewSession, Seq, SessionId,
 };
 
 /// Persists the complete session journal and manages active-context checkpoints.
 ///
-/// Implementations return a sequence or receipt only after the underlying commit
-/// succeeds, allowing callers to advance the in-memory durable frontier safely.
+/// Implementations return a sequence or receipt only after the corresponding facts
+/// are durably visible, allowing callers to advance the in-memory frontier safely.
 #[async_trait]
 pub trait SessionStore: Send + Sync {
     /// Creates an isolated durable session.
@@ -71,7 +71,7 @@ pub trait SessionStore: Send + Sync {
         session: &SessionId,
     ) -> Result<Option<Checkpoint>, SessionStoreError>;
 
-    /// Writes a checkpoint and appends its journal reference in the same transaction.
+    /// Writes a checkpoint and appends its journal reference in one atomic commit.
     ///
     /// # Errors
     /// Returns an error when checkpoint coverage is invalid or serialization or the
@@ -80,8 +80,9 @@ pub trait SessionStore: Send + Sync {
 
     /// Commits a compaction event and checkpoint atomically using the journal head as CAS.
     ///
-    /// The `compaction` journal entry, checkpoint row, and `checkpoint_ref` journal
-    /// entry are all durable before success is returned; failure leaves no partial commit.
+    /// The `compaction` journal entry, checkpoint, and `checkpoint_ref` journal entry
+    /// are all durable before success is returned; failure leaves no partially visible
+    /// commit.
     ///
     /// # Errors
     /// Returns [`SessionStoreError::JournalHeadConflict`] for a stale expected head,
@@ -102,6 +103,32 @@ pub trait SessionStore: Send + Sync {
         session: &SessionId,
         seq: Seq,
     ) -> Result<Vec<JournalEntry>, SessionStoreError>;
+
+    /// Reads the current head and selected facts from one consistent observation.
+    ///
+    /// Implementations should override the default full-replay fallback with a
+    /// bounded query when exact sequence lookup is available. The head and entries
+    /// must not come from separate reads; returned entries must be unique, restricted
+    /// to `seqs`, and ordered by sequence. Requested sequences that do not exist are
+    /// omitted so the consumer can treat absence as an integrity failure where needed.
+    ///
+    /// # Errors
+    /// Returns a storage error when the snapshot cannot be read or decoded.
+    async fn journal_snapshot(
+        &self,
+        session: &SessionId,
+        seqs: &[Seq],
+    ) -> Result<JournalSnapshot, SessionStoreError> {
+        let requested = seqs
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut all = self.replay_after(session, Seq::ZERO).await?;
+        let head = all.iter().map(|entry| entry.seq).max().unwrap_or(Seq::ZERO);
+        all.retain(|entry| requested.contains(&entry.seq));
+        all.sort_by_key(|entry| entry.seq);
+        Ok(JournalSnapshot::new(head, all))
+    }
 }
 
 /// Returns the fixed SQLite session-store path under the user's home directory.

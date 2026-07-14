@@ -13,7 +13,9 @@ async fn run_turn_persists_messages_to_session_store() {
     let model = FakeModel::new([response(AssistantContent::text("done"))]);
     let runner = AgentRunner::new(model, ToolRegistry::new()).with_session_store(store.clone());
     let mut session = AgentSession::new();
-    session.attach_session_id(session_id.clone());
+    session
+        .attach_session_id(session_id.clone())
+        .expect("fresh session should attach");
 
     runner
         .run_turn(&mut session, "hi")
@@ -43,7 +45,9 @@ async fn append_failure_keeps_message_in_memory_without_advancing_frontier() {
     let model = FakeModel::new([response(AssistantContent::text("done"))]);
     let runner = AgentRunner::new(model, ToolRegistry::new()).with_session_store(store);
     let mut session = AgentSession::new();
-    session.attach_session_id(SessionId::new("missing-session"));
+    session
+        .attach_session_id(SessionId::new("missing-session"))
+        .expect("fresh session should attach");
 
     runner
         .run_turn(&mut session, "kept in memory")

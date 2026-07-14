@@ -25,16 +25,24 @@ Submit the COMPLETE list every call: it replaces the previous plan wholesale \
 (an empty list clears it). Each item has `content` (imperative, e.g. \"Add \
 tests\"), `active_form` (present continuous shown while running, e.g. \"Adding \
 tests\"), and `status` (pending | in_progress | completed). Keep at most one \
-item in_progress at a time; mark a step completed before starting the next.";
+item in_progress at a time and at most 64 items total; mark a step completed \
+before starting the next.";
 
 /// Arguments for [`TodoWrite`].
+///
+/// Unknown top-level fields are rejected at the model boundary so misspelled
+/// plan keys cannot be accepted while their intended value is ignored.
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct TodoWriteArgs {
-    /// The complete task plan. Replaces the previous plan entirely.
+    /// The complete task plan, bounded in both advertised item count and encoded
+    /// size before it replaces the authoritative session state.
+    #[schemars(length(max = 64))]
     pub todos: Vec<TodoItem>,
 }
 
-/// Confirmation echoed back to the model: the plan as stored after the write.
+/// Confirmation echoed back to the model after the authoritative session plan
+/// has been replaced.
 #[derive(Debug, Serialize)]
 pub struct TodoWriteOutput {
     /// The stored plan after this overwrite.
@@ -101,6 +109,11 @@ impl TypedTool for TodoWrite {
         _args: &serde_json::Value,
         output: &ToolOutput,
     ) -> ToolResultRetention {
+        // A complete success is only an acknowledgement of harness-owned plan
+        // state; the current TodoHandle snapshot supersedes it and is projected
+        // independently on later requests. Failed or truncated output may carry
+        // non-reconstructible evidence and therefore never receives
+        // authorization for lossy transcript slimming.
         if output.ok && !output.truncated {
             ToolResultRetention::Slimmable
         } else {
@@ -210,5 +223,14 @@ mod tests {
         .expect("valid args");
         assert_eq!(request.action, PermissionAction::Meta);
         assert!(request.resource.is_none());
+    }
+
+    #[test]
+    fn definition_exposes_the_domain_item_limit() {
+        let tool = TodoWrite::new();
+        let maximum =
+            TypedTool::definition(&tool).parameters["properties"]["todos"]["maxItems"].as_u64();
+
+        assert_eq!(maximum, Some(64));
     }
 }

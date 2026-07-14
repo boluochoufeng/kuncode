@@ -9,8 +9,8 @@
 //!
 //! The system message is the cached prefix of every request, so volatile content
 //! (e.g. the live task plan) is deliberately *not* a section here: changing it
-//! would invalidate the KV cache for the whole transcript that follows. The plan
-//! lives in the transcript (the `todo_write` result) instead.
+//! would invalidate the KV cache for the whole transcript that follows. The
+//! runner projects the live plan as a final request-only state envelope instead.
 
 use std::path::PathBuf;
 

@@ -8,8 +8,8 @@ use crate::{
         protocol::{group_messages, select_protected_recent_tail},
     },
     session_store::{
-        CommittedArtifact, JournalEntry, NewSession, NewToolArtifact, Seq, SessionId, SessionStore,
-        SessionStoreError, sqlite::SqliteSessionStore,
+        CommittedArtifact, JournalEntry, JournalSnapshot, NewSession, NewToolArtifact, Seq,
+        SessionId, SessionStore, SessionStoreError, sqlite::SqliteSessionStore,
     },
     test_support::TestDir,
 };
@@ -17,6 +17,7 @@ use crate::{
 enum WrongReceipt {
     OtherSession(SessionId),
     OtherArtifact,
+    NonPositiveSequence,
 }
 
 struct WrongReceiptStore<'a> {
@@ -26,12 +27,22 @@ struct WrongReceiptStore<'a> {
 
 #[async_trait]
 impl ArtifactStore for WrongReceiptStore<'_> {
+    // Each case targets a distinct binding dimension; OtherArtifact deliberately
+    // substitutes the complete artifact metadata tuple rather than one field.
     async fn replay(
         &self,
         session: &SessionId,
-        after: Seq,
+        seq: Seq,
     ) -> Result<Vec<JournalEntry>, SessionStoreError> {
-        self.inner.replay_after(session, after).await
+        self.inner.replay_after(session, seq).await
+    }
+
+    async fn journal_snapshot(
+        &self,
+        session: &SessionId,
+        seqs: &[Seq],
+    ) -> Result<JournalSnapshot, SessionStoreError> {
+        SessionStore::journal_snapshot(self.inner, session, seqs).await
     }
 
     async fn put(
@@ -54,6 +65,11 @@ impl ArtifactStore for WrongReceiptStore<'_> {
                     .put_tool_artifact(session, expected_journal_head, other)
                     .await
             }
+            WrongReceipt::NonPositiveSequence => Ok(CommittedArtifact::from_committed_write(
+                session.clone(),
+                &artifact,
+                Seq::ZERO,
+            )),
         }
     }
 }
@@ -82,6 +98,19 @@ async fn rejects_receipt_for_another_artifact_before_replacing_the_result() {
     let wrapper = WrongReceiptStore {
         inner: &fixture.store,
         wrong: WrongReceipt::OtherArtifact,
+    };
+
+    let result = spill_artifacts(fixture.input(), &wrapper, &FixedCounter::new(9_000, 100)).await;
+
+    assert_eq!(result, Err(ArtifactSpillError::ReceiptMismatch));
+}
+
+#[tokio::test]
+async fn rejects_receipt_with_a_non_positive_journal_sequence() {
+    let fixture = receipt_fixture().await;
+    let wrapper = WrongReceiptStore {
+        inner: &fixture.store,
+        wrong: WrongReceipt::NonPositiveSequence,
     };
 
     let result = spill_artifacts(fixture.input(), &wrapper, &FixedCounter::new(9_000, 100)).await;

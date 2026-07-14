@@ -1,4 +1,7 @@
 //! Read-only planning for shadow compaction rollout.
+//!
+//! Shadow mode estimates eligible boundaries and possible savings without
+//! writing artifacts, checkpoints, journal facts, or active session state.
 
 use kuncode_core::completion::{Message, ToolResultContent, UserContent};
 
@@ -22,6 +25,12 @@ pub(super) struct ShadowReport {
     pub(super) requires_summary: bool,
 }
 
+/// Estimates compaction shape without invoking any persistence or mutation seam.
+///
+/// # Errors
+/// Returns [`CompactionError`] when protocol grouping, safe-tail selection, or
+/// group token estimation fails. Individual artifact estimates are conservative
+/// best-effort observations and are skipped when unavailable.
 pub(super) async fn observe(
     messages: &[Message],
     config: &CompactionConfig,

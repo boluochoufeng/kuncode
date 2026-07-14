@@ -1,3 +1,9 @@
+//! Closed, versioned wire schema for lossy semantic continuity.
+//!
+//! These types are decoded from model-controlled JSON. Every object rejects
+//! unknown fields so schema drift and injected side channels fail closed instead
+//! of being silently ignored.
+
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -7,6 +13,9 @@ use crate::session_store::Seq;
 pub const CONTINUITY_SUMMARY_VERSION: u32 = 1;
 
 /// Lossy semantic continuity extracted from one durable journal range.
+///
+/// The range is provenance, not a claim that the summary preserves every source
+/// detail. Durable journal facts remain authoritative when the projection differs.
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ContinuitySummary {
@@ -17,11 +26,16 @@ pub struct ContinuitySummary {
     #[schemars(range(min = 1, max = 1))]
     pub version: u32,
     /// First durable journal fact represented by this summary.
+    ///
+    /// Encoded as the journal's signed integer coordinate on the wire so summary
+    /// provenance can be compared directly with durable [`Seq`] values.
     #[serde(with = "seq_serde")]
     #[schemars(with = "i64")]
     #[schemars(range(min = 1))]
     pub source_seq_start: Seq,
     /// Last durable journal fact represented by this summary.
+    ///
+    /// Uses the same durable wire coordinate as [`Self::source_seq_start`].
     #[serde(with = "seq_serde")]
     #[schemars(with = "i64")]
     #[schemars(range(min = 1))]
@@ -95,6 +109,8 @@ pub enum SummaryTodoStatus {
 }
 
 mod seq_serde {
+    //! Preserves the journal sequence wire representation during serialization.
+
     use serde::{Deserialize, Deserializer, Serializer};
 
     use crate::session_store::Seq;

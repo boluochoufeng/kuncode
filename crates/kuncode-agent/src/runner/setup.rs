@@ -1,4 +1,7 @@
 //! Runner construction, event emission, and durable transcript writes.
+//!
+//! Durable appends precede in-memory mutation. Any append uncertainty poisons
+//! later lossy compaction even though the message remains available in memory.
 
 use std::{panic::AssertUnwindSafe, sync::Arc};
 
@@ -97,12 +100,18 @@ where
     }
 
     /// Replaces the model used only for semantic context summaries.
+    ///
+    /// Summary calls still use the active turn's cancellation and durable commit
+    /// boundaries; replacing the model does not create a separate session path.
     pub fn with_summary_model(mut self, model: M) -> Self {
         self.summary_model = model;
         self
     }
 
     /// Replaces request token accounting for compaction decisions.
+    ///
+    /// The same estimator is also wrapped for protocol-group and artifact
+    /// accounting so every threshold uses one provider-visible token unit.
     pub fn with_token_estimator(mut self, estimator: Arc<dyn TokenEstimator>) -> Self {
         self.group_estimator = Arc::new(RequestGroupEstimator::new(estimator.clone()));
         self.token_estimator = estimator;
@@ -139,6 +148,8 @@ where
         session: &mut AgentSession,
         prompt: impl Into<String>,
     ) {
+        // Harness feedback uses the user role for provider compatibility but is
+        // deliberately not marked as direct human input.
         self.push_message(session, Message::user(prompt)).await;
     }
 
@@ -148,6 +159,7 @@ where
         prompt: impl Into<String>,
     ) {
         let message = Message::user(prompt);
+        // Only this direct turn-input boundary grants human-authored lineage.
         let journal_seq = self.persist_message(session, &message).await;
         session.push_human_with_journal_seq(message, journal_seq);
     }
@@ -174,9 +186,15 @@ where
     ) -> Option<crate::session_store::Seq> {
         let session_id = session.session_id().cloned();
         let mut journal_seq = None;
-        if let (Some(store), Some(session_id)) = (&self.session_store, session_id)
+        if let Some(session_id) = session_id
             && session.is_durable()
         {
+            let Some(store) = &self.session_store else {
+                // Keep the in-memory message usable, but revoke authority because
+                // no journal receipt can prove that it is durably represented.
+                session.mark_persistence_failed("attached session store is unavailable");
+                return None;
+            };
             match NewJournalEntry::message(message) {
                 Ok(entry) => match store.append(&session_id, entry).await {
                     Ok(seq) => journal_seq = Some(seq),

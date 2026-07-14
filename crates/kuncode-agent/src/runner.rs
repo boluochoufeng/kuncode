@@ -74,8 +74,11 @@ impl Default for AgentConfig {
 /// Runtime metadata required to commit semantic compaction checkpoints.
 #[derive(Clone, Debug)]
 pub struct AgentCompactionConfig {
+    /// Controls rollout mode and derives all input-budget thresholds.
     policy: CompactionConfig,
+    /// Recorded with summary checkpoints so their model provenance is auditable.
     model_id: String,
+    /// Independent output cap for the semantic-summary call.
     summary_max_tokens: u64,
 }
 
@@ -145,6 +148,8 @@ impl AgentTurn {
 #[derive(Clone)]
 pub struct AgentRunner<M> {
     model: M,
+    // Summary calls may use a separately configured model, but share the same
+    // request-boundary cancellation and durable commit rules.
     summary_model: M,
     registry: ToolRegistry,
     config: AgentConfig,
@@ -153,7 +158,11 @@ pub struct AgentRunner<M> {
     approver: Arc<dyn Approver>,
     observer: Option<Arc<dyn AgentObserver>>,
     hooks: Arc<Hooks>,
+    // Lossy compaction requires both enabled policy and durable storage; shadow
+    // observation remains read-only and does not need persistence.
     session_store: Option<Arc<dyn SessionStore>>,
+    // Both estimators must report provider-visible units so trigger, pass, and
+    // final-request accounting remain comparable.
     token_estimator: Arc<dyn TokenEstimator>,
     group_estimator: Arc<dyn GroupTokenEstimator>,
 }
@@ -173,9 +182,13 @@ struct PendingToolCall {
     arguments: serde_json::Value,
 }
 
+// Keeps execution provenance beside retention authorization until the result is
+// appended. Rejected or synthetic results must remain verbatim.
 struct CallOutcome {
     output: ToolOutput,
     executed: bool,
+    // Only an executed tool can grant a non-verbatim retention policy from its
+    // authoritative arguments and output; payload shape alone is insufficient.
     retention: ToolResultRetention,
 }
 

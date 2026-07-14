@@ -169,6 +169,29 @@ fn invalid_compaction_window_is_an_error() {
 }
 
 #[test]
+fn invalid_reserved_output_provider_range_is_an_error() {
+    let zero = load_json(
+        "compaction-output-zero",
+        r#"{ "compaction": {
+            "mode": "enabled",
+            "contextLimit": 65536,
+            "reservedOutput": 0
+        } }"#,
+    );
+    let oversized = load_json(
+        "compaction-output-oversized",
+        r#"{ "compaction": {
+            "mode": "enabled",
+            "contextLimit": 8589934592,
+            "reservedOutput": 4294967296
+        } }"#,
+    );
+
+    assert!(matches!(zero, Err(SettingsError::Compaction(_))));
+    assert!(matches!(oversized, Err(SettingsError::Compaction(_))));
+}
+
+#[test]
 fn invalid_compaction_ratios_are_an_error() {
     let result = load_json(
         "compaction-ratios-invalid",

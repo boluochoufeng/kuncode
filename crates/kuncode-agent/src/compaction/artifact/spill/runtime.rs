@@ -1,3 +1,8 @@
+//! Applies audited lineage and spill policy to candidate protocol groups.
+//!
+//! Runtime coordinates provider-visible token decisions with durable source
+//! positions while keeping the original groups untouched on isolated failures.
+
 use std::collections::BTreeMap;
 
 use kuncode_core::{
@@ -89,6 +94,8 @@ impl<'a> SpillRuntime<'a> {
         let Message::User { content } = message else {
             return Ok(());
         };
+        // Work on a detached message so an isolated count, parse, or store
+        // failure leaves the exact active payload available to later passes.
         let mut candidate = content.clone().into_vec();
         for (content_index, block) in candidate.iter_mut().enumerate() {
             let UserContent::ToolResult(result) = block else {
@@ -99,6 +106,8 @@ impl<'a> SpillRuntime<'a> {
                 result_message_index,
                 content_index,
             };
+            // Only results with exact verbatim journal lineage may cross the
+            // lossy artifact boundary; derived context remains inline.
             let Some(source_journal_seq) = self.result_message_seq(location)? else {
                 continue;
             };
@@ -211,6 +220,8 @@ impl<'a> SpillRuntime<'a> {
 }
 
 pub(super) fn group_message_starts(groups: &[ProtocolGroup]) -> Vec<usize> {
+    // Protocol-group coordinates differ from flattened lineage coordinates;
+    // recording each start keeps receipt decisions attached to the audited row.
     let mut next = 0;
     groups
         .iter()

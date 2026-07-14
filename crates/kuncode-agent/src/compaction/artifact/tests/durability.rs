@@ -186,7 +186,9 @@ fn attached_session(
     frontier: crate::session_store::Seq,
 ) -> AgentSession {
     let mut session = AgentSession::new();
-    session.attach_session_id(session_id);
+    session
+        .attach_session_id(session_id)
+        .expect("fresh session should attach");
     for (index, message) in messages.iter().enumerate() {
         let seq = i64::try_from(index + 1)
             .ok()

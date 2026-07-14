@@ -7,7 +7,11 @@ fn compaction_settings(tag: &str) -> crate::settings::ProjectCompaction {
     fs::create_dir_all(dir.join(".kuncode")).expect("temp dir");
     fs::write(
         dir.join(".kuncode/settings.json"),
-        r#"{ "compaction": { "mode": "enabled", "contextLimit": 131072 } }"#,
+        r#"{ "compaction": {
+            "mode": "enabled",
+            "contextLimit": 131072,
+            "reservedOutput": 8192
+        } }"#,
     )
     .expect("write settings");
     let settings = load_project_settings(&dir).expect("load settings");
@@ -38,6 +42,7 @@ fn active_compaction_is_installed_for_concrete_model() {
     let config = agent_config(Some(settings), "deepseek-v4-flash").expect("valid runtime model");
 
     assert!(config.compaction.is_some());
+    assert_eq!(config.max_tokens, Some(8_192));
 }
 
 #[test]

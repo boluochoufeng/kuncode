@@ -1,4 +1,4 @@
-//! Durable tool-result artifact inputs and commit receipts.
+//! Store-neutral tool-result artifact inputs and durable commit receipts.
 
 use sha2::{Digest, Sha256};
 
@@ -12,8 +12,9 @@ const CONTENT_HASH_PREFIX: &str = "sha256-";
 
 /// Tool-result payload captured by the harness before active-context trimming.
 ///
-/// The artifact is not exposed as a workspace file. Future compaction code uses
-/// the returned [`ToolArtifactRef`] as a short marker in the active context.
+/// Exactly one complete-payload source is retained by the store. The artifact is not
+/// exposed as a workspace file; compaction uses the returned [`ToolArtifactRef`] as a
+/// short marker in the active context.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NewToolArtifact {
     artifact_id: String,
@@ -30,8 +31,7 @@ impl NewToolArtifact {
     ///
     /// # Errors
     /// Returns an error when `content_hash` is non-canonical or does not match
-    /// `payload`, or when the payload length cannot fit SQLite's signed integer
-    /// range.
+    /// `payload`, or when the payload length cannot fit the durable byte-count field.
     pub fn inline(
         content_hash: impl Into<String>,
         preview: impl Into<String>,
@@ -70,12 +70,12 @@ impl NewToolArtifact {
         self.bytes
     }
 
-    /// Returns the short preview safe to retain in the active context.
+    /// Returns the preview proposed for the active-context marker.
     pub fn preview(&self) -> &str {
         &self.preview
     }
 
-    /// Returns the inline payload persisted directly by SQLite.
+    /// Returns the inline payload persisted directly by the artifact store.
     pub fn payload_text(&self) -> Option<&str> {
         self.payload_text.as_deref()
     }

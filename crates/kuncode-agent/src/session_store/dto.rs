@@ -1,3 +1,11 @@
+//! Versioned, provider-neutral message representation used by durable storage.
+//!
+//! Explicit role and content tags decouple stored history from provider wire JSON and
+//! core enum layout. Provider-issued identifiers, signatures, encrypted/redacted data,
+//! and additional parameters are preserved exactly so replay can reconstruct requests
+//! without inventing or normalizing opaque fields. Optional metadata is omitted rather
+//! than encoded as `null`, keeping absence stable in the canonical representation.
+
 use kuncode_core::completion::Message;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -21,6 +29,7 @@ struct StoredMessagesPayload {
 }
 
 #[derive(Serialize, Deserialize)]
+// The explicit role tag is part of the durable schema, independent of Rust enum layout.
 #[serde(tag = "role", rename_all = "snake_case")]
 enum StoredMessage {
     System {
@@ -37,6 +46,7 @@ enum StoredMessage {
 }
 
 #[derive(Serialize, Deserialize)]
+// Content tags prevent provider-specific untagged decoding from entering persistence.
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum StoredUserContent {
     Text {

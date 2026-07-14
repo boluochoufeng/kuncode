@@ -1,11 +1,13 @@
-//! Stable digests for context snapshots crossing durable commit boundaries.
+//! Canonical digests for context snapshots crossing durable commit boundaries.
 
 use kuncode_core::completion::Message;
 use sha2::{Digest, Sha256};
 
 use super::{SessionStoreError, dto};
 
-/// Hashes the versioned store encoding rather than provider-specific message JSON.
+/// Hashes the UTF-8 bytes of the versioned, provider-neutral store encoding.
+///
+/// The result is a bare 64-character lowercase SHA-256 digest with no algorithm prefix.
 pub(crate) fn active_messages_sha256(messages: &[Message]) -> Result<String, SessionStoreError> {
     let encoded = dto::messages_to_string(messages)?;
     Ok(format!("{:x}", Sha256::digest(encoded.as_bytes())))

@@ -1,3 +1,9 @@
+//! Resource limits for model-controlled continuity summaries.
+//!
+//! The raw JSON ceiling bounds decoding exposure, while collection and field
+//! ceilings prevent a compact wire payload from expanding into unbounded retained
+//! allocations across recursive compaction passes.
+
 use std::collections::BTreeSet;
 
 use super::SummaryError;

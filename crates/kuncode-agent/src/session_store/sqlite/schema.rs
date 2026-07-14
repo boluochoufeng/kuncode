@@ -1,3 +1,5 @@
+//! SQLite schema creation and literal-only compatibility migrations.
+
 use sqlx::{AssertSqlSafe, Row, SqlitePool};
 
 use crate::session_store::SessionStoreError;
@@ -79,6 +81,8 @@ pub(super) async fn migrate(pool: &SqlitePool) -> Result<(), SessionStoreError> 
     )
     .await?;
 
+    // SQL rejects source-less artifacts. Exact-one source semantics and content
+    // integrity remain application checks because SQLite cannot verify the payload.
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS tool_artifacts (
@@ -135,6 +139,8 @@ async fn add_column_if_missing(
     column: &'static str,
     column_ddl: &'static str,
 ) -> Result<(), SessionStoreError> {
+    // Every argument is a private compile-time literal. `AssertSqlSafe` must not
+    // be generalized to runtime or user-controlled schema identifiers.
     let pragma = format!("PRAGMA table_info({table})");
     let rows = sqlx::query(AssertSqlSafe(pragma)).fetch_all(pool).await?;
     for row in rows {

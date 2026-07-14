@@ -27,6 +27,10 @@ pub enum AgentError {
     #[error("agent transcript is empty")]
     EmptyTranscript,
 
+    /// Harness-owned request state could not be encoded for the provider.
+    #[error("agent request encoding failed: {0}")]
+    RequestEncoding(String),
+
     /// Automatic compaction could not produce a request below the hard limit.
     #[error("context compaction failed: {message}")]
     Compaction {

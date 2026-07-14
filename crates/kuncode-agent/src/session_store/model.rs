@@ -38,12 +38,12 @@ impl Seq {
     /// Frontier used before the journal contains any durable facts.
     pub const ZERO: Self = Self(0);
 
-    /// Constructs a sequence from SQLite's signed integer representation.
+    /// Constructs a sequence from the durable store's signed representation.
     pub const fn new(value: i64) -> Self {
         Self(value)
     }
 
-    /// Returns the underlying integer required for SQLite binding.
+    /// Returns the underlying integer required for storage bindings.
     pub const fn get(self) -> i64 {
         self.0
     }
@@ -85,7 +85,7 @@ pub enum JournalKind {
 }
 
 impl JournalKind {
-    /// Returns the stable protocol value written to SQLite's `kind` column.
+    /// Returns the stable protocol value written to the journal kind field.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Message => "message",
@@ -136,6 +136,37 @@ pub struct JournalEntry {
     pub payload_json: Value,
 }
 
+/// Journal head plus requested facts captured by one storage observation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct JournalSnapshot {
+    head: Seq,
+    entries: Vec<JournalEntry>,
+}
+
+impl JournalSnapshot {
+    /// Wraps a caller-supplied storage observation without validation.
+    ///
+    /// The caller must ensure `head` and `entries` came from the same observation,
+    /// that entries are unique, ordered, no later than `head`, and restricted to the
+    /// requested sequences. Requested sequences missing from storage stay omitted.
+    pub fn new(head: Seq, entries: Vec<JournalEntry>) -> Self {
+        Self { head, entries }
+    }
+
+    /// Returns the authoritative journal head observed with [`Self::entries`].
+    pub const fn head(&self) -> Seq {
+        self.head
+    }
+
+    /// Returns the requested facts that existed in the observed snapshot.
+    ///
+    /// Missing requested sequences are not synthesized; integrity-sensitive callers
+    /// must verify presence, kind, and payload themselves.
+    pub fn entries(&self) -> &[JournalEntry] {
+        &self.entries
+    }
+}
+
 impl JournalEntry {
     /// Decodes a message-category payload into a completion message.
     ///
@@ -148,6 +179,11 @@ impl JournalEntry {
 }
 
 /// Complete candidate for an active-context checkpoint write.
+///
+/// Summary provenance is an all-or-none group: [`source_seq_start`](Self::source_seq_start),
+/// [`source_seq_end`](Self::source_seq_end), [`summary_json`](Self::summary_json),
+/// [`model`](Self::model), and [`token_usage_json`](Self::token_usage_json) must either
+/// all be present or all be absent. The store validates this at the write boundary.
 #[derive(Clone, Debug)]
 pub struct NewCheckpoint {
     /// Session that owns the checkpoint.
@@ -168,7 +204,13 @@ pub struct NewCheckpoint {
     pub token_usage_json: Option<Value>,
 }
 
-/// Committed checkpoint used to rebuild the active context.
+/// Active-context projection validated at the write boundary and persisted for future recovery.
+///
+/// The v1 runtime writes this storage substrate but does not read it to resume sessions;
+/// no CLI or runtime resume path is implemented.
+///
+/// Stores must only materialize summary provenance when every summary field was
+/// committed together; partial provenance cannot authorize summary reconstruction.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Checkpoint {
     /// Sequence of the corresponding `checkpoint_ref` journal fact.

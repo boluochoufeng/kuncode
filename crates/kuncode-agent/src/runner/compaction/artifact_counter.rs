@@ -1,4 +1,7 @@
 //! Provider-visible tool-result counting through the active request estimator.
+//!
+//! Artifact eligibility uses the same token unit as full request budgeting;
+//! serialized JSON bytes are not a substitute for provider-visible tokens.
 
 use async_trait::async_trait;
 use kuncode_core::{

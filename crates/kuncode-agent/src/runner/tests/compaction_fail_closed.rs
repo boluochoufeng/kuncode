@@ -1,13 +1,20 @@
+// Adversarial persistence tests for authority-invalidating compaction failures.
+//
+// Even under soft pressure, ambiguous writes or corrupted durable facts must
+// poison the session and prevent a provider request from using stale context.
+
 #[derive(Clone, Copy)]
 enum AmbiguousWrite {
     Artifact,
     ArtifactConflict,
+    ArtifactHeadIntegrity,
     Compaction,
 }
 
 struct AmbiguousStore {
     inner: Arc<SqliteSessionStore>,
     write: AmbiguousWrite,
+    tamper_pool: Option<sqlx::SqlitePool>,
 }
 
 #[async_trait]
@@ -42,7 +49,7 @@ impl SessionStore for AmbiguousStore {
                     actual: expected_journal_head.get() + 1,
                 })
             }
-            AmbiguousWrite::Compaction => {
+            AmbiguousWrite::ArtifactHeadIntegrity | AmbiguousWrite::Compaction => {
                 self.inner
                     .put_tool_artifact(session, expected_journal_head, artifact)
                     .await
@@ -71,7 +78,9 @@ impl SessionStore for AmbiguousStore {
     ) -> Result<crate::session_store::CommittedCompaction, crate::session_store::SessionStoreError>
     {
         match self.write {
-            AmbiguousWrite::Artifact | AmbiguousWrite::ArtifactConflict => {
+            AmbiguousWrite::Artifact
+            | AmbiguousWrite::ArtifactConflict
+            | AmbiguousWrite::ArtifactHeadIntegrity => {
                 self.inner.commit_compaction(commit).await
             }
             AmbiguousWrite::Compaction => ambiguous("compaction"),
@@ -85,6 +94,31 @@ impl SessionStore for AmbiguousStore {
     ) -> Result<Vec<crate::session_store::JournalEntry>, crate::session_store::SessionStoreError>
     {
         self.inner.replay_after(session, seq).await
+    }
+
+    async fn journal_snapshot(
+        &self,
+        session: &SessionId,
+        seqs: &[Seq],
+    ) -> Result<crate::session_store::JournalSnapshot, crate::session_store::SessionStoreError> {
+        let snapshot = self.inner.journal_snapshot(session, seqs).await?;
+        if matches!(self.write, AmbiguousWrite::ArtifactHeadIntegrity) {
+            let tamper = self
+                .tamper_pool
+                .as_ref()
+                .expect("head-integrity fixture requires a tamper connection");
+            sqlx::query(
+                "UPDATE journal_entries SET seq = 'not-an-integer' \
+                 WHERE session_id = ? AND seq = \
+                   (SELECT MAX(seq) FROM journal_entries WHERE session_id = ?)",
+            )
+            .bind(session.as_str())
+            .bind(session.as_str())
+            .execute(tamper)
+            .await
+            .expect("fixture should corrupt the journal head after the snapshot");
+        }
+        Ok(snapshot)
     }
 }
 
@@ -123,6 +157,7 @@ async fn soft_artifact_cas_conflict_fails_closed_without_model_request() {
     let store = Arc::new(AmbiguousStore {
         inner,
         write: AmbiguousWrite::ArtifactConflict,
+        tamper_pool: None,
     });
     let mut runner = configured_runner(model.clone(), CompactionMode::Enabled)
         .with_session_store(store);
@@ -134,6 +169,431 @@ async fn soft_artifact_cas_conflict_fails_closed_without_model_request() {
         .continue_session(&mut session)
         .await
         .expect_err("a stale journal frontier must fail closed");
+
+    // Then
+    assert!(matches!(error, AgentError::Compaction { .. }));
+    assert!(model.requests().is_empty());
+    assert!(!session.is_durable());
+    assert!(session.take_persistence_error().is_some());
+}
+
+#[tokio::test]
+async fn soft_mistyped_head_after_snapshot_fails_closed_without_model_request() {
+    // Given
+    let root = TestDir::new();
+    let database = root.path().join("sessions.sqlite3");
+    let inner = Arc::new(
+        SqliteSessionStore::open(&database)
+            .await
+            .expect("store should open"),
+    );
+    let session_id = inner
+        .create_session(NewSession::new(root.path().to_path_buf()))
+        .await
+        .expect("session should be created");
+    let mut session = durable_tool_history(inner.as_ref(), &session_id).await;
+    let tamper_pool = sqlx::SqlitePool::connect_with(
+        sqlx::sqlite::SqliteConnectOptions::new().filename(&database),
+    )
+    .await
+    .expect("tamper connection should open");
+    let store = Arc::new(AmbiguousStore {
+        inner,
+        write: AmbiguousWrite::ArtifactHeadIntegrity,
+        tamper_pool: Some(tamper_pool),
+    });
+    let model = FakeModel::new([response(AssistantContent::text("must not be requested"))]);
+    let mut runner = configured_runner(model.clone(), CompactionMode::Enabled)
+        .with_session_store(store);
+    runner.token_estimator = Arc::new(ScriptedRequestEstimator);
+    runner.group_estimator = Arc::new(FixedRunnerGroupEstimator(100));
+
+    // When
+    let error = runner
+        .continue_session(&mut session)
+        .await
+        .expect_err("a mistyped CAS head must terminate the loop");
+
+    // Then
+    assert!(matches!(error, AgentError::Compaction { .. }));
+    assert!(model.requests().is_empty());
+    assert!(!session.is_durable());
+    assert!(session.take_persistence_error().is_some());
+}
+
+#[tokio::test]
+async fn soft_stale_journal_audit_fails_closed_without_model_request() {
+    // Given
+    let root = TestDir::new();
+    let store = Arc::new(
+        SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+            .await
+            .expect("store should open"),
+    );
+    let session_id = store
+        .create_session(NewSession::new(root.path().to_path_buf()))
+        .await
+        .expect("session should be created");
+    let mut session = durable_tool_history(store.as_ref(), &session_id).await;
+    store
+        .append(
+            &session_id,
+            crate::session_store::NewJournalEntry::raw(
+                crate::session_store::JournalKind::SessionNote,
+                serde_json::json!({"note": "concurrent durable fact"}),
+            ),
+        )
+        .await
+        .expect("concurrent fact should persist");
+    let model = FakeModel::new([response(AssistantContent::text("must not be requested"))]);
+    let mut runner = configured_runner(model.clone(), CompactionMode::Enabled)
+        .with_session_store(store);
+    runner.token_estimator = Arc::new(ScriptedRequestEstimator);
+    runner.group_estimator = Arc::new(FixedRunnerGroupEstimator(100));
+
+    // When
+    let error = runner
+        .continue_session(&mut session)
+        .await
+        .expect_err("a stale audit frontier must terminate the loop");
+
+    // Then
+    assert!(matches!(error, AgentError::Compaction { .. }));
+    assert!(model.requests().is_empty());
+    assert!(!session.is_durable());
+    assert!(session.take_persistence_error().is_some());
+}
+
+#[tokio::test]
+async fn soft_journal_message_mismatch_fails_closed_without_model_request() {
+    // Given
+    let root = TestDir::new();
+    let store = Arc::new(
+        SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+            .await
+            .expect("store should open"),
+    );
+    let session_id = store
+        .create_session(NewSession::new(root.path().to_path_buf()))
+        .await
+        .expect("session should be created");
+    let durable = [
+        tool_exchange_message("old", &ToolOutput::success("durable").to_model_content()),
+        tool_exchange_message("recent", &ToolOutput::success("recent").to_model_content()),
+    ]
+    .concat();
+    let active = [
+        tool_exchange_message("old", &ToolOutput::success("tampered").to_model_content()),
+        tool_exchange_message("recent", &ToolOutput::success("recent").to_model_content()),
+    ]
+    .concat();
+    let mut session = AgentSession::new();
+    session
+        .attach_session_id(session_id.clone())
+        .expect("fresh session should attach");
+    for (durable_message, active_message) in durable.into_iter().zip(active) {
+        let seq = store
+            .append(
+                &session_id,
+                crate::session_store::NewJournalEntry::message(&durable_message)
+                    .expect("message should encode"),
+            )
+            .await
+            .expect("message should persist");
+        session.push_with_journal_seq(active_message, Some(seq));
+    }
+    let model = FakeModel::new([response(AssistantContent::text("must not be requested"))]);
+    let mut runner = configured_runner(model.clone(), CompactionMode::Enabled)
+        .with_session_store(store);
+    runner.token_estimator = Arc::new(ScriptedRequestEstimator);
+    runner.group_estimator = Arc::new(FixedRunnerGroupEstimator(100));
+
+    // When
+    let error = runner
+        .continue_session(&mut session)
+        .await
+        .expect_err("a journal message mismatch must terminate the loop");
+
+    // Then
+    assert!(matches!(error, AgentError::Compaction { .. }));
+    assert!(model.requests().is_empty());
+    assert!(!session.is_durable());
+    assert!(session.take_persistence_error().is_some());
+}
+
+#[tokio::test]
+async fn soft_corrupt_journal_message_fails_closed_without_model_request() {
+    // Given
+    let root = TestDir::new();
+    let store = Arc::new(
+        SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+            .await
+            .expect("store should open"),
+    );
+    let session_id = store
+        .create_session(NewSession::new(root.path().to_path_buf()))
+        .await
+        .expect("session should be created");
+    let messages = [
+        tool_exchange_message("old", &ToolOutput::success("durable").to_model_content()),
+        tool_exchange_message("recent", &ToolOutput::success("recent").to_model_content()),
+    ]
+    .concat();
+    let mut session = AgentSession::new();
+    session
+        .attach_session_id(session_id.clone())
+        .expect("fresh session should attach");
+    for (index, message) in messages.into_iter().enumerate() {
+        let entry = if index == 0 {
+            crate::session_store::NewJournalEntry::raw(
+                crate::session_store::JournalKind::Message,
+                serde_json::json!({"schema_version": 1, "message": "corrupt"}),
+            )
+        } else {
+            crate::session_store::NewJournalEntry::message(&message)
+                .expect("message should encode")
+        };
+        let seq = store
+            .append(&session_id, entry)
+            .await
+            .expect("journal fact should persist");
+        session.push_with_journal_seq(message, Some(seq));
+    }
+    let model = FakeModel::new([response(AssistantContent::text("must not be requested"))]);
+    let mut runner = configured_runner(model.clone(), CompactionMode::Enabled)
+        .with_session_store(store);
+    runner.token_estimator = Arc::new(ScriptedRequestEstimator);
+    runner.group_estimator = Arc::new(FixedRunnerGroupEstimator(100));
+
+    // When
+    let error = runner
+        .continue_session(&mut session)
+        .await
+        .expect_err("corrupt durable payload must terminate the loop");
+
+    // Then
+    assert!(matches!(error, AgentError::Compaction { .. }));
+    assert!(model.requests().is_empty());
+    assert!(!session.is_durable());
+    assert!(session.take_persistence_error().is_some());
+}
+
+#[tokio::test]
+async fn soft_undecodable_journal_row_fails_closed_without_model_request() {
+    // Given
+    let root = TestDir::new();
+    let database = root.path().join("sessions.sqlite3");
+    let store = Arc::new(
+        SqliteSessionStore::open(&database)
+            .await
+            .expect("store should open"),
+    );
+    let session_id = store
+        .create_session(NewSession::new(root.path().to_path_buf()))
+        .await
+        .expect("session should be created");
+    let mut session = durable_tool_history(store.as_ref(), &session_id).await;
+    let tamper = sqlx::SqlitePool::connect_with(
+        sqlx::sqlite::SqliteConnectOptions::new().filename(&database),
+    )
+    .await
+    .expect("tamper connection should open");
+    sqlx::query(
+        "UPDATE journal_entries SET payload_json = X'FF' \
+         WHERE session_id = ? AND kind = 'message' AND seq = 1",
+    )
+    .bind(session_id.as_str())
+    .execute(&tamper)
+    .await
+    .expect("fixture should corrupt the durable journal row");
+    tamper.close().await;
+    let model = FakeModel::new([response(AssistantContent::text("must not be requested"))]);
+    let mut runner = configured_runner(model.clone(), CompactionMode::Enabled)
+        .with_session_store(store);
+    runner.token_estimator = Arc::new(ScriptedRequestEstimator);
+    runner.group_estimator = Arc::new(FixedRunnerGroupEstimator(100));
+
+    // When
+    let error = runner
+        .continue_session(&mut session)
+        .await
+        .expect_err("undecodable durable row must terminate the loop");
+
+    // Then
+    assert!(matches!(error, AgentError::Compaction { .. }));
+    assert!(model.requests().is_empty());
+    assert!(!session.is_durable());
+    assert!(session.take_persistence_error().is_some());
+}
+
+#[tokio::test]
+async fn soft_tampered_durable_artifact_fails_closed_without_model_request() {
+    assert_tampered_durable_artifact_fails_closed(TamperedArtifactFact::Payload).await;
+}
+
+#[tokio::test]
+async fn soft_mistyped_durable_artifact_fails_closed_without_model_request() {
+    assert_tampered_durable_artifact_fails_closed(TamperedArtifactFact::Bytes).await;
+}
+
+#[tokio::test]
+async fn soft_malformed_artifact_journal_fails_closed_without_model_request() {
+    assert_tampered_durable_artifact_fails_closed(TamperedArtifactFact::Journal).await;
+}
+
+#[tokio::test]
+async fn soft_ambiguous_artifact_journal_fails_closed_without_model_request() {
+    assert_tampered_durable_artifact_fails_closed(TamperedArtifactFact::DuplicateJournalKey).await;
+}
+
+#[tokio::test]
+async fn soft_non_positive_artifact_journal_seq_fails_closed_without_model_request() {
+    assert_tampered_durable_artifact_fails_closed(TamperedArtifactFact::JournalSeq).await;
+}
+
+#[derive(Clone, Copy)]
+enum TamperedArtifactFact {
+    Payload,
+    Bytes,
+    Journal,
+    DuplicateJournalKey,
+    JournalSeq,
+}
+
+async fn assert_tampered_durable_artifact_fails_closed(tampered: TamperedArtifactFact) {
+    // Given
+    let root = TestDir::new();
+    let database = root.path().join("sessions.sqlite3");
+    let store = Arc::new(
+        SqliteSessionStore::open(&database)
+            .await
+            .expect("store should open"),
+    );
+    let session_id = store
+        .create_session(NewSession::new(root.path().to_path_buf()))
+        .await
+        .expect("session should be created");
+    let mut session = durable_tool_history(store.as_ref(), &session_id).await;
+    let payload = ToolOutput::success("L".repeat(LARGE_RESULT_BYTES)).to_model_content();
+    let digest = <sha2::Sha256 as sha2::Digest>::digest(payload.as_bytes());
+    let hash = format!("sha256-{digest:x}");
+    let artifact = crate::session_store::NewToolArtifact::inline(
+        &hash,
+        crate::compaction::artifact::adaptive_preview(&payload, 4_096),
+        &payload,
+    )
+    .expect("artifact should be valid");
+    let artifact_id = artifact.artifact_id().to_string();
+    let receipt = store
+        .put_tool_artifact(
+            &session_id,
+            session.durable_seq().expect("session should be durable"),
+            artifact,
+        )
+        .await
+        .expect("artifact should persist");
+    session.advance_durable_seq(receipt.journal_seq());
+    if matches!(tampered, TamperedArtifactFact::JournalSeq) {
+        let later = store
+            .append(
+                &session_id,
+                crate::session_store::NewJournalEntry::raw(
+                    crate::session_store::JournalKind::SessionNote,
+                    serde_json::json!({"note": "later durable fact"}),
+                ),
+            )
+            .await
+            .expect("later fact should persist");
+        session.advance_durable_seq(later);
+    }
+    let tamper = sqlx::SqlitePool::connect_with(
+        sqlx::sqlite::SqliteConnectOptions::new().filename(&database),
+    )
+    .await
+    .expect("tamper connection should open");
+    match tampered {
+        TamperedArtifactFact::Payload => {
+            sqlx::query(
+                "UPDATE tool_artifacts SET payload_text = ? \
+                 WHERE session_id = ? AND artifact_id = ?",
+            )
+            .bind("tampered durable payload")
+            .bind(session_id.as_str())
+            .bind(&artifact_id)
+            .execute(&tamper)
+            .await
+            .expect("fixture should tamper the durable row");
+        }
+        TamperedArtifactFact::Bytes => {
+            sqlx::query(
+                "UPDATE tool_artifacts SET bytes = 'not-an-integer' \
+                 WHERE session_id = ? AND artifact_id = ?",
+            )
+            .bind(session_id.as_str())
+            .bind(&artifact_id)
+            .execute(&tamper)
+            .await
+            .expect("fixture should corrupt the durable row type");
+        }
+        TamperedArtifactFact::Journal => {
+            sqlx::query(
+                "UPDATE journal_entries SET payload_json = X'FF' \
+                 WHERE session_id = ? AND kind = 'tool_artifact'",
+            )
+            .bind(session_id.as_str())
+            .execute(&tamper)
+            .await
+            .expect("fixture should corrupt the artifact journal fact");
+        }
+        TamperedArtifactFact::DuplicateJournalKey => {
+            let original: String = sqlx::query_scalar(
+                "SELECT payload_json FROM journal_entries \
+                 WHERE session_id = ? AND kind = 'tool_artifact'",
+            )
+            .bind(session_id.as_str())
+            .fetch_one(&tamper)
+            .await
+            .expect("artifact journal fact should exist");
+            let closing = original
+                .rfind('}')
+                .expect("fixture journal payload should be an object");
+            let ambiguous = format!(
+                "{},\"artifact_id\":\"tool-result-sha256-duplicate\"}}",
+                &original[..closing]
+            );
+            sqlx::query(
+                "UPDATE journal_entries SET payload_json = ? \
+                 WHERE session_id = ? AND kind = 'tool_artifact'",
+            )
+            .bind(ambiguous)
+            .bind(session_id.as_str())
+            .execute(&tamper)
+            .await
+            .expect("fixture should add a duplicate journal field");
+        }
+        TamperedArtifactFact::JournalSeq => {
+            sqlx::query(
+                "UPDATE journal_entries SET seq = -1 \
+                 WHERE session_id = ? AND kind = 'tool_artifact'",
+            )
+            .bind(session_id.as_str())
+            .execute(&tamper)
+            .await
+            .expect("fixture should corrupt the earlier artifact sequence");
+        }
+    }
+    tamper.close().await;
+    let model = FakeModel::new([response(AssistantContent::text("must not be requested"))]);
+    let mut runner = configured_runner(model.clone(), CompactionMode::Enabled)
+        .with_session_store(store);
+    runner.token_estimator = Arc::new(ScriptedRequestEstimator);
+    runner.group_estimator = Arc::new(FixedRunnerGroupEstimator(100));
+
+    // When
+    let error = runner
+        .continue_session(&mut session)
+        .await
+        .expect_err("tampered durable artifact must terminate the loop");
 
     // Then
     assert!(matches!(error, AgentError::Compaction { .. }));
@@ -160,6 +620,7 @@ async fn assert_unknown_outcome_blocks(write: AmbiguousWrite) {
     let store = Arc::new(AmbiguousStore {
         inner,
         write,
+        tamper_pool: None,
     });
     let mut runner = configured_runner(model.clone(), CompactionMode::Enabled)
         .with_session_store(store)
@@ -206,7 +667,9 @@ async fn durable_tool_history(
     let messages = [tool_exchange_message("old", &large), tool_exchange_message("recent", &small)]
         .concat();
     let mut session = AgentSession::new();
-    session.attach_session_id(session_id.clone());
+    session
+        .attach_session_id(session_id.clone())
+        .expect("fresh session should attach");
     for message in messages {
         let seq = store
             .append(

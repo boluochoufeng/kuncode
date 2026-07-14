@@ -25,6 +25,8 @@ fn strict_parser_applies_wire_and_context_validation() {
 
 #[test]
 fn strict_parser_rejects_resource_exhaustion_shapes() {
+    // The outer limit rejects the payload before deserialization can allocate
+    // model-selected strings and collections.
     let oversized = " ".repeat(256 * 1_024 + 1);
     assert_eq!(
         request().parse_and_validate(&oversized),

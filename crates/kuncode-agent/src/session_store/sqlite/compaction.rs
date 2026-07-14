@@ -1,3 +1,7 @@
+//! Atomic persistence of compaction facts and checkpoint material for future resume.
+//!
+//! Version 1 commits these records but does not read them to restore runtime context.
+
 use sqlx::SqlitePool;
 
 use crate::session_store::{
@@ -15,6 +19,8 @@ pub(super) async fn commit(
 ) -> Result<CommittedCompaction, SessionStoreError> {
     validate_commit(&commit)?;
     let mut tx = pool.begin().await?;
+    // The writer lock preserves the candidate's source head until the compaction
+    // fact, checkpoint row, and checkpoint reference become atomically visible.
     compare_and_lock(&mut tx, &commit.session_id, commit.expected_journal_head).await?;
     let now = timestamp();
     let compaction_seq = next_seq(&mut tx, &commit.session_id).await?;
@@ -99,6 +105,8 @@ fn validate_commit(commit: &NewCompactionCommit) -> Result<(), SessionStoreError
         ));
     }
     let passes = commit.event.metadata().passes();
+    // `AtomicCommit` records the persistence boundary, so it must appear once
+    // and after every transformation that contributed to the committed output.
     if passes.last() != Some(&crate::session_store::CompactionPassKind::AtomicCommit)
         || passes
             .iter()

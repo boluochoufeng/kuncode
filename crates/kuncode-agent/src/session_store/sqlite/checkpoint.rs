@@ -1,3 +1,8 @@
+//! Atomic checkpoint persistence reserved for future active-context resume.
+//!
+//! Version 1 writes these records, but the runtime does not read them to resume
+//! sessions yet.
+
 use sqlx::{Row, SqlitePool};
 
 use crate::session_store::{
@@ -68,6 +73,8 @@ pub(super) async fn insert(
         .map(serde_json::to_string)
         .transpose()?;
 
+    // Sharing one journal coordinate and transaction makes the checkpoint row
+    // and `CheckpointRef` an atomic durable unit for a future resume path.
     sqlx::query(
         r#"
         INSERT INTO active_context_checkpoints (
@@ -136,6 +143,8 @@ fn validate_checkpoint(
         )));
     }
 
+    // Generated summaries require complete provenance. Partial metadata cannot
+    // prove which durable source range and model produced the active messages.
     match (
         checkpoint.summary_json.as_ref(),
         checkpoint.source_seq_start,

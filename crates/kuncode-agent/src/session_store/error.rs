@@ -10,7 +10,7 @@ pub enum SessionStoreError {
     /// A SQLite query or transaction failed.
     #[error("session store database failed: {0}")]
     Sqlx(#[from] sqlx::Error),
-    /// SQLite may have committed even though the client did not receive a receipt.
+    /// A durable write may have committed even though the client received no receipt.
     #[error("{operation} commit outcome is unknown: {message}")]
     CommitOutcomeUnknown {
         /// Durable operation whose receipt could not be established.
@@ -52,7 +52,7 @@ pub enum SessionStoreError {
         /// Digest computed from the complete inline payload.
         computed: String,
     },
-    /// The artifact length cannot be represented by SQLite's signed integer type.
+    /// The artifact length cannot be represented by the store's signed byte count.
     #[error("tool artifact is too large to store: {bytes} bytes")]
     ToolArtifactTooLarge {
         /// Actual payload byte length supplied by the caller.
@@ -87,6 +87,32 @@ pub enum SessionStoreError {
         /// Artifact whose journal identity failed validation.
         artifact_id: String,
     },
+    /// A stored artifact row fails its content-addressed identity checks.
+    #[error("stored tool artifact `{artifact_id}` is invalid in session `{session_id}`: {message}")]
+    ToolArtifactStoredIntegrity {
+        /// Session containing the invalid durable row.
+        session_id: String,
+        /// Artifact whose stored identity or payload failed validation.
+        artifact_id: String,
+        /// Validation failure retained for storage diagnostics.
+        message: String,
+    },
+    /// A tool-artifact journal fact is malformed and cannot authorize a receipt.
+    #[error("tool artifact journal is invalid in session `{session_id}`: {message}")]
+    ToolArtifactJournalIntegrity {
+        /// Session containing the malformed durable fact.
+        session_id: String,
+        /// Decode or schema failure retained for storage diagnostics.
+        message: String,
+    },
+    /// A durable journal row has an invalid coordinate, kind, or payload representation.
+    #[error("journal row is invalid in session `{session_id}`: {message}")]
+    JournalStoredIntegrity {
+        /// Session containing the invalid durable row.
+        session_id: String,
+        /// Column or JSON decode failure retained for storage diagnostics.
+        message: String,
+    },
     /// A compaction commit violates session, source-range, or checkpoint invariants.
     #[error("invalid compaction commit: {0}")]
     InvalidCompaction(String),
@@ -106,6 +132,85 @@ impl SessionStoreError {
         Self::CommitOutcomeUnknown {
             operation,
             message: error.to_string(),
+        }
+    }
+
+    // Durable decode failures disprove that live lineage can be audited against the
+    // journal; transient access failures only make this particular read unavailable.
+    pub(crate) const fn invalidates_journal_read_authority(&self) -> bool {
+        match self {
+            Self::Json(_)
+            | Self::InvalidMessagePayload(_)
+            | Self::UnsupportedPayloadVersion { .. }
+            | Self::JournalStoredIntegrity { .. } => true,
+            Self::Io(_)
+            | Self::Sqlx(_)
+            | Self::CommitOutcomeUnknown { .. }
+            | Self::InvalidCheckpoint(_)
+            | Self::InvalidToolArtifact(_)
+            | Self::InvalidToolArtifactHashFormat { .. }
+            | Self::ToolArtifactDigestMismatch { .. }
+            | Self::ToolArtifactTooLarge { .. }
+            | Self::ToolArtifactConflict { .. }
+            | Self::ToolArtifactJournalMissing { .. }
+            | Self::ToolArtifactJournalMismatch { .. }
+            | Self::ToolArtifactStoredIntegrity { .. }
+            | Self::ToolArtifactJournalIntegrity { .. }
+            | Self::InvalidCompaction(_)
+            | Self::JournalHeadConflict { .. } => false,
+        }
+    }
+
+    // Conflicting or malformed durable artifact facts invalidate content-addressed
+    // identity. Candidate errors and transient access failures do not establish drift.
+    pub(crate) const fn invalidates_artifact_authority(&self) -> bool {
+        match self {
+            Self::ToolArtifactConflict { .. }
+            | Self::ToolArtifactJournalMissing { .. }
+            | Self::ToolArtifactJournalMismatch { .. }
+            | Self::ToolArtifactStoredIntegrity { .. }
+            | Self::ToolArtifactJournalIntegrity { .. }
+            | Self::JournalStoredIntegrity { .. } => true,
+            Self::Io(_)
+            | Self::Sqlx(_)
+            | Self::CommitOutcomeUnknown { .. }
+            | Self::Json(_)
+            | Self::InvalidMessagePayload(_)
+            | Self::UnsupportedPayloadVersion { .. }
+            | Self::InvalidCheckpoint(_)
+            | Self::InvalidToolArtifact(_)
+            | Self::InvalidToolArtifactHashFormat { .. }
+            | Self::ToolArtifactDigestMismatch { .. }
+            | Self::ToolArtifactTooLarge { .. }
+            | Self::InvalidCompaction(_)
+            | Self::JournalHeadConflict { .. } => false,
+        }
+    }
+
+    // Unknown commits, stale frontiers, and durable integrity failures destroy the
+    // proof needed to install a lossy checkpoint. Pre-commit validation and transient
+    // access failures leave the previously acknowledged frontier authoritative.
+    pub(crate) const fn invalidates_compaction_authority(&self) -> bool {
+        match self {
+            Self::CommitOutcomeUnknown { .. }
+            | Self::JournalHeadConflict { .. }
+            | Self::ToolArtifactConflict { .. }
+            | Self::ToolArtifactJournalMissing { .. }
+            | Self::ToolArtifactJournalMismatch { .. }
+            | Self::ToolArtifactStoredIntegrity { .. }
+            | Self::ToolArtifactJournalIntegrity { .. }
+            | Self::JournalStoredIntegrity { .. } => true,
+            Self::Io(_)
+            | Self::Sqlx(_)
+            | Self::Json(_)
+            | Self::InvalidMessagePayload(_)
+            | Self::UnsupportedPayloadVersion { .. }
+            | Self::InvalidCheckpoint(_)
+            | Self::InvalidToolArtifact(_)
+            | Self::InvalidToolArtifactHashFormat { .. }
+            | Self::ToolArtifactDigestMismatch { .. }
+            | Self::ToolArtifactTooLarge { .. }
+            | Self::InvalidCompaction(_) => false,
         }
     }
 }

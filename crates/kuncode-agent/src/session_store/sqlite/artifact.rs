@@ -1,3 +1,5 @@
+//! Idempotent artifact persistence tied to an auditable journal fact.
+
 use sqlx::{Row, SqlitePool};
 
 use super::{head::compare_and_lock, next_seq, timestamp, touch_session};
@@ -6,6 +8,10 @@ use crate::session_store::{
     ToolArtifactRef,
     artifact::{artifact_source, validate_artifact_content, validate_artifact_id},
 };
+
+mod journal;
+
+use journal::load_journal_seq;
 
 pub(super) async fn put(
     pool: &SqlitePool,
@@ -17,6 +23,8 @@ pub(super) async fn put(
     let mut tx = pool.begin().await?;
     compare_and_lock(&mut tx, session, expected_journal_head).await?;
     let now = timestamp();
+    // The content-derived id makes retries idempotent, but `OR IGNORE` may also
+    // conceal a conflicting row. Durable state is therefore revalidated below.
     let result = sqlx::query(
         r#"
         INSERT OR IGNORE INTO tool_artifacts (
@@ -67,8 +75,18 @@ pub(super) async fn put(
         touch_session(&mut tx, session, &now).await?;
     }
 
+    // Receipts are derived only from the row and journal fact observed inside
+    // this transaction, never from the candidate that attempted the write.
     let stored = load_artifact(&mut tx, session, artifact.artifact_id()).await?;
-    stored.validate_identity()?;
+    // SQLite only requires at least one storage source. The application layer
+    // enforces the exclusive inline/external representation and content binding.
+    stored
+        .validate_identity()
+        .map_err(|error| SessionStoreError::ToolArtifactStoredIntegrity {
+            session_id: session.as_str().to_string(),
+            artifact_id: stored.artifact_id.clone(),
+            message: error.to_string(),
+        })?;
     if !stored.matches(&artifact) {
         return Err(SessionStoreError::ToolArtifactConflict {
             session_id: session.as_str().to_string(),
@@ -84,52 +102,6 @@ pub(super) async fn put(
         stored.into_reference(),
         journal_seq,
     ))
-}
-
-async fn load_journal_seq(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    session: &SessionId,
-    artifact: &StoredArtifact,
-) -> Result<Seq, SessionStoreError> {
-    let row = sqlx::query(
-        r#"
-        SELECT seq, payload_json
-        FROM journal_entries
-        WHERE session_id = ?
-          AND kind = ?
-          AND json_extract(payload_json, '$.artifact_id') = ?
-        ORDER BY seq ASC
-        LIMIT 1
-        "#,
-    )
-    .bind(session.as_str())
-    .bind(JournalKind::ToolArtifact.as_str())
-    .bind(&artifact.artifact_id)
-    .fetch_optional(&mut **tx)
-    .await?;
-    let Some(row) = row else {
-        return Err(SessionStoreError::ToolArtifactJournalMissing {
-            session_id: session.as_str().to_string(),
-            artifact_id: artifact.artifact_id.clone(),
-        });
-    };
-    let seq: i64 = row.try_get("seq")?;
-    let payload_text: String = row.try_get("payload_json")?;
-    let payload: serde_json::Value = serde_json::from_str(&payload_text)?;
-    if payload
-        .get("content_hash")
-        .and_then(serde_json::Value::as_str)
-        != Some(artifact.content_hash.as_str())
-        || payload.get("bytes").and_then(serde_json::Value::as_i64) != Some(artifact.bytes)
-        || payload.get("preview").and_then(serde_json::Value::as_str)
-            != Some(artifact.preview.as_str())
-    {
-        return Err(SessionStoreError::ToolArtifactJournalMismatch {
-            session_id: session.as_str().to_string(),
-            artifact_id: artifact.artifact_id.clone(),
-        });
-    }
-    Ok(Seq::new(seq))
 }
 
 async fn load_artifact(
@@ -150,13 +122,37 @@ async fn load_artifact(
     .await?;
 
     Ok(StoredArtifact {
-        artifact_id: row.try_get("artifact_id")?,
-        content_hash: row.try_get("content_hash")?,
-        bytes: row.try_get("bytes")?,
-        preview: row.try_get("preview")?,
-        payload_text: row.try_get("payload_text")?,
-        storage_ref: row.try_get("storage_ref")?,
+        artifact_id: row
+            .try_get("artifact_id")
+            .map_err(|error| stored_decode_error(session, artifact_id, error))?,
+        content_hash: row
+            .try_get("content_hash")
+            .map_err(|error| stored_decode_error(session, artifact_id, error))?,
+        bytes: row
+            .try_get("bytes")
+            .map_err(|error| stored_decode_error(session, artifact_id, error))?,
+        preview: row
+            .try_get("preview")
+            .map_err(|error| stored_decode_error(session, artifact_id, error))?,
+        payload_text: row
+            .try_get("payload_text")
+            .map_err(|error| stored_decode_error(session, artifact_id, error))?,
+        storage_ref: row
+            .try_get("storage_ref")
+            .map_err(|error| stored_decode_error(session, artifact_id, error))?,
     })
+}
+
+fn stored_decode_error(
+    session: &SessionId,
+    artifact_id: &str,
+    error: sqlx::Error,
+) -> SessionStoreError {
+    SessionStoreError::ToolArtifactStoredIntegrity {
+        session_id: session.as_str().to_string(),
+        artifact_id: artifact_id.to_string(),
+        message: error.to_string(),
+    }
 }
 
 struct StoredArtifact {

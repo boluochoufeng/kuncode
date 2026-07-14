@@ -1,12 +1,15 @@
 //! Adapts the session store to artifact-pass persistence operations.
+//!
+//! Delegation preserves the store's snapshot and compare-and-swap contracts;
+//! the adapter must not reconstruct journal authority from separate reads.
 
 use async_trait::async_trait;
 
 use crate::{
     compaction::artifact::ArtifactStore,
     session_store::{
-        CommittedArtifact, JournalEntry, NewToolArtifact, Seq, SessionId, SessionStore,
-        SessionStoreError,
+        CommittedArtifact, JournalEntry, JournalSnapshot, NewToolArtifact, Seq, SessionId,
+        SessionStore, SessionStoreError,
     },
 };
 
@@ -17,9 +20,17 @@ impl ArtifactStore for SessionArtifactStore<'_> {
     async fn replay(
         &self,
         session: &SessionId,
-        after: Seq,
+        seq: Seq,
     ) -> Result<Vec<JournalEntry>, SessionStoreError> {
-        self.0.replay_after(session, after).await
+        self.0.replay_after(session, seq).await
+    }
+
+    async fn journal_snapshot(
+        &self,
+        session: &SessionId,
+        seqs: &[Seq],
+    ) -> Result<JournalSnapshot, SessionStoreError> {
+        self.0.journal_snapshot(session, seqs).await
     }
 
     async fn put(

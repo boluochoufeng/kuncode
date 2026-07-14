@@ -1,11 +1,14 @@
-//! Canonical message grouping that preserves complete tool exchanges.
+//! Canonical message grouping that makes complete tool exchanges indivisible.
+//!
+//! Open or malformed exchanges are rejected before lossy passes can observe a
+//! partial request/result sequence.
 
 use std::collections::BTreeMap;
 
 use kuncode_core::completion::{AssistantContent, Message, ToolCall, UserContent};
 use thiserror::Error;
 
-/// An indivisible portion of conversation history.
+/// An indivisible portion of conversation history used by lossy passes.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ProtocolGroup {
     /// A message that does not participate in a tool exchange.
@@ -107,6 +110,9 @@ pub(crate) fn flatten_groups(groups: &[ProtocolGroup]) -> Vec<Message> {
 }
 
 /// Clones history into complete tool exchanges and ordinary message groups.
+///
+/// Successful output is canonical: flattening and regrouping it preserves the
+/// same boundaries, while every tool exchange contains all expected results.
 ///
 /// # Errors
 ///

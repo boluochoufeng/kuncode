@@ -5,13 +5,20 @@
 //! [`AgentSession`](crate::session::AgentSession) — like the permission state —
 //! and the tool reaches it through a [`TodoHandle`] carried on the
 //! [`ToolContext`](crate::tool::ToolContext), so the tool itself stays stateless
-//! and shareable across sessions.
+//! and shareable across sessions. The runner projects a non-empty plan as
+//! harness-owned request state, so both item count and encoded size are bounded
+//! before model-controlled text can become recurring context.
 
 use std::sync::{Arc, Mutex, PoisonError};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+// These limits bound both in-memory plan growth and the harness-authored JSON
+// projection repeated on subsequent provider requests.
+const MAX_TODO_ITEMS: usize = 64;
+const MAX_TODO_JSON_BYTES: usize = 32 * 1024;
 
 /// Status of one plan item. Serialized `snake_case`, matching the schema shown
 /// to the model and the `snake_case` tagging used elsewhere (e.g.
@@ -51,6 +58,25 @@ pub struct TodoItem {
 /// fix the list and resubmit — these are model-recoverable, never harness errors.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum TodoError {
+    /// The proposed whole-list overwrite exceeds the bounded runtime-state shape.
+    #[error("todo plan contains {actual} items; maximum is {maximum}")]
+    TooManyItems {
+        /// Number of submitted items.
+        actual: usize,
+        /// Maximum accepted item count.
+        maximum: usize,
+    },
+    /// The serialized plan would consume an unbounded share of every request.
+    #[error("todo plan encodes to {actual} bytes; maximum is {maximum}")]
+    PlanTooLarge {
+        /// Exact JSON size of the submitted list.
+        actual: usize,
+        /// Maximum accepted JSON size.
+        maximum: usize,
+    },
+    /// Stable JSON encoding failed before the plan could be installed.
+    #[error("todo plan encoding failed: {0}")]
+    Encoding(String),
     /// More than one item is [`InProgress`](TodoStatus::InProgress). The plan is
     /// meant to focus on a single active task at a time.
     #[error("at most one task may be in_progress at a time, found {0}")]
@@ -95,8 +121,9 @@ impl TodoList {
     ///
     /// # Errors
     ///
-    /// Returns [`TodoError`] when more than one item is `in_progress`, or any
-    /// item has empty `content` / `active_form`.
+    /// Returns [`TodoError`] when the plan exceeds its item or encoded-size
+    /// bound, stable encoding fails, more than one item is `in_progress`, or
+    /// any item has empty `content` / `active_form`.
     pub fn replace(&mut self, items: Vec<TodoItem>) -> Result<(), TodoError> {
         validate(&items)?;
         self.items = items;
@@ -107,6 +134,22 @@ impl TodoList {
 
 /// Validates a proposed plan without mutating anything.
 fn validate(items: &[TodoItem]) -> Result<(), TodoError> {
+    if items.len() > MAX_TODO_ITEMS {
+        return Err(TodoError::TooManyItems {
+            actual: items.len(),
+            maximum: MAX_TODO_ITEMS,
+        });
+    }
+    // Measure the domain representation used inside the request-only runtime
+    // envelope rather than an estimate of the model's submitted arguments.
+    let encoded =
+        serde_json::to_vec(items).map_err(|error| TodoError::Encoding(error.to_string()))?;
+    if encoded.len() > MAX_TODO_JSON_BYTES {
+        return Err(TodoError::PlanTooLarge {
+            actual: encoded.len(),
+            maximum: MAX_TODO_JSON_BYTES,
+        });
+    }
     for (index, item) in items.iter().enumerate() {
         if item.content.trim().is_empty() {
             return Err(TodoError::EmptyContent(index));
@@ -224,6 +267,42 @@ mod tests {
         list.replace(vec![]).expect("clearing is valid");
         assert!(list.items().is_empty());
         assert_eq!(list.generation(), 2);
+    }
+
+    #[test]
+    fn oversized_plan_is_rejected_without_mutating_existing_state() {
+        let mut list = TodoList::default();
+        list.replace(vec![item("kept", TodoStatus::InProgress)])
+            .expect("initial plan should be valid");
+        let generation = list.generation();
+        let oversized = (0..=MAX_TODO_ITEMS)
+            .map(|index| item(&format!("task-{index}"), TodoStatus::Pending))
+            .collect();
+
+        let error = list
+            .replace(oversized)
+            .expect_err("unbounded plans must be rejected");
+
+        assert!(matches!(error, TodoError::TooManyItems { .. }));
+        assert_eq!(list.generation(), generation);
+        assert_eq!(list.items()[0].content, "kept");
+    }
+
+    #[test]
+    fn oversized_plan_encoding_is_rejected_without_mutating_existing_state() {
+        let mut list = TodoList::default();
+        list.replace(vec![item("kept", TodoStatus::InProgress)])
+            .expect("initial plan should be valid");
+        let generation = list.generation();
+        let oversized = vec![item(&"x".repeat(MAX_TODO_JSON_BYTES), TodoStatus::Pending)];
+
+        let error = list
+            .replace(oversized)
+            .expect_err("oversized request state must be rejected");
+
+        assert!(matches!(error, TodoError::PlanTooLarge { .. }));
+        assert_eq!(list.generation(), generation);
+        assert_eq!(list.items()[0].content, "kept");
     }
 
     #[test]

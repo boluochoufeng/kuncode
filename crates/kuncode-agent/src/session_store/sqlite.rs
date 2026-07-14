@@ -21,6 +21,7 @@ mod artifact;
 mod checkpoint;
 mod compaction;
 mod head;
+mod journal;
 mod schema;
 #[cfg(test)]
 mod tests;
@@ -225,22 +226,28 @@ impl SessionStore for SqliteSessionStore {
 
         rows.into_iter().map(row_to_entry).collect()
     }
+
+    async fn journal_snapshot(
+        &self,
+        session: &SessionId,
+        seqs: &[Seq],
+    ) -> Result<crate::session_store::JournalSnapshot, SessionStoreError> {
+        journal::snapshot(&self.pool, session, seqs).await
+    }
 }
 
 pub(super) async fn next_seq(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     session: &SessionId,
 ) -> Result<Seq, SessionStoreError> {
-    let value: i64 = sqlx::query_scalar(
-        r#"
-        SELECT COALESCE(MAX(seq), 0) + 1
-        FROM journal_entries
-        WHERE session_id = ?
-        "#,
-    )
-    .bind(session.as_str())
-    .fetch_one(&mut **tx)
-    .await?;
+    let head = head::read(tx, session).await?;
+    let value =
+        head.get()
+            .checked_add(1)
+            .ok_or_else(|| SessionStoreError::JournalStoredIntegrity {
+                session_id: session.as_str().to_string(),
+                message: "journal sequence exhausted SQLite's signed integer range".to_string(),
+            })?;
     Ok(Seq::new(value))
 }
 

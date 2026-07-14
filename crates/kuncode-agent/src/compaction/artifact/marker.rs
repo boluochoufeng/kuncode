@@ -1,3 +1,8 @@
+//! Builds bounded provider-visible markers for durably stored tool results.
+//!
+//! Marker metadata preserves the result identity and status needed for model
+//! continuity while previews and untrusted text fields remain strictly bounded.
+
 use kuncode_core::{
     completion::{ToolResult, ToolResultContent},
     non_empty_vec::NonEmptyVec,
@@ -99,6 +104,8 @@ pub(super) async fn build_marker_result(
         if preview_bytes == 0 {
             return Err(ArtifactSpillFailure::MarkerTooLarge);
         }
+        // Metadata is mandatory, so only the preview may shrink to satisfy the
+        // provider-visible cap without weakening the artifact binding.
         preview_bytes /= 2;
     }
 }

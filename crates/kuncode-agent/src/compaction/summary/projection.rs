@@ -21,6 +21,13 @@ struct CompactedContext<'a> {
     continuity_summary: &'a ContinuitySummary,
 }
 
+/// Projects continuity as user-role data guarded by a system instruction.
+///
+/// The envelope label communicates how the model must treat the payload; it does
+/// not authenticate the summary or grant it authority over current runtime state.
+///
+/// # Errors
+/// Returns [`serde_json::Error`] when the validated summary cannot be encoded.
 pub(crate) fn project_summary_message(
     summary: &ContinuitySummary,
 ) -> Result<Message, serde_json::Error> {
@@ -32,7 +39,11 @@ pub(crate) fn project_summary_message(
     serde_json::to_string(&payload).map(Message::user)
 }
 
-/// Detects the reserved continuity envelope so its system guard follows the data.
+/// Detects the reserved envelope shape so its system guard follows the data.
+///
+/// This syntactic check grants no authenticity, provenance, or authority. Any user
+/// can submit the same JSON shape, and callers must continue treating it as
+/// untrusted historical data.
 pub(crate) fn is_compacted_context_message(message: &Message) -> bool {
     let Message::User { content } = message else {
         return false;

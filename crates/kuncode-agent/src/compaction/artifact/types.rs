@@ -1,3 +1,5 @@
+//! Defines artifact-pass contracts, outcomes, and durable storage seams.
+
 use async_trait::async_trait;
 use kuncode_core::completion::ToolResult;
 use thiserror::Error;
@@ -5,8 +7,8 @@ use thiserror::Error;
 use crate::{
     compaction::protocol::ProtocolGroup,
     session_store::{
-        CommittedArtifact, JournalEntry, NewToolArtifact, Seq, SessionId, SessionStore,
-        SessionStoreError,
+        CommittedArtifact, JournalEntry, JournalSnapshot, NewToolArtifact, Seq, SessionId,
+        SessionStore, SessionStoreError,
     },
     tool::ToolResultRetention,
 };
@@ -49,19 +51,55 @@ impl ArtifactTokenCounterError {
 }
 
 /// Narrow durable-write seam used by the deterministic spill pass.
+///
+/// Implementations must keep snapshot rows and their head in one consistent
+/// observation and return receipts only for payloads already durable in the
+/// named session.
 #[async_trait]
 pub trait ArtifactStore: Send + Sync {
-    /// Reads the authoritative journal before any lossy candidate is produced.
+    /// Replays journal facts strictly after `seq` in ascending sequence order.
+    ///
+    /// The default snapshot implementation replays from [`Seq::ZERO`] and then
+    /// filters exact requested facts. Stores with direct lookup should override
+    /// [`Self::journal_snapshot`] without weakening its consistency contract.
     ///
     /// # Errors
-    /// Returns [`SessionStoreError`] when journal replay cannot be completed.
+    /// Returns [`SessionStoreError`] when the journal cannot be read.
     async fn replay(
         &self,
         session: &SessionId,
-        after: Seq,
+        seq: Seq,
     ) -> Result<Vec<JournalEntry>, SessionStoreError>;
 
+    /// Reads the authoritative head and requested source facts before lossy work.
+    ///
+    /// The returned head and entries must share one storage snapshot. Entries
+    /// must be unique, restricted to `seqs`, and ordered by sequence. Missing
+    /// requested sequences remain omitted so the consumer's equality audit can
+    /// treat absent facts as an integrity failure.
+    ///
+    /// # Errors
+    /// Returns [`SessionStoreError`] when the journal snapshot cannot be read.
+    async fn journal_snapshot(
+        &self,
+        session: &SessionId,
+        seqs: &[Seq],
+    ) -> Result<JournalSnapshot, SessionStoreError> {
+        let requested = seqs
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut all = self.replay(session, Seq::ZERO).await?;
+        let head = all.iter().map(|entry| entry.seq).max().unwrap_or(Seq::ZERO);
+        all.retain(|entry| requested.contains(&entry.seq));
+        all.sort_by_key(|entry| entry.seq);
+        Ok(JournalSnapshot::new(head, all))
+    }
+
     /// Persists a complete payload before any candidate marker is installed.
+    ///
+    /// The write compares `expected_journal_head` with the active head and the
+    /// receipt must describe the exact durable artifact, not merely the request.
     ///
     /// # Errors
     /// Returns [`SessionStoreError`] when the journal head changed, the artifact
@@ -82,9 +120,17 @@ where
     async fn replay(
         &self,
         session: &SessionId,
-        after: Seq,
+        seq: Seq,
     ) -> Result<Vec<JournalEntry>, SessionStoreError> {
-        self.replay_after(session, after).await
+        SessionStore::replay_after(self, session, seq).await
+    }
+
+    async fn journal_snapshot(
+        &self,
+        session: &SessionId,
+        seqs: &[Seq],
+    ) -> Result<JournalSnapshot, SessionStoreError> {
+        SessionStore::journal_snapshot(self, session, seqs).await
     }
 
     async fn put(

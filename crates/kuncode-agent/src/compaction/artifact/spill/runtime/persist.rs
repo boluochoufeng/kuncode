@@ -1,3 +1,5 @@
+//! Persists one complete artifact before authorizing its candidate marker.
+
 use kuncode_core::completion::{ToolResult, ToolResultContent};
 
 use super::{SpillRuntime, failed};
@@ -69,6 +71,8 @@ pub(super) async fn spill_large_result(
             ));
         }
     };
+    // The complete payload must become durable before the provider-visible
+    // candidate can contain a marker that no longer carries that payload.
     let expected_artifact = artifact.clone();
     let receipt = match runtime
         .store
@@ -85,6 +89,9 @@ pub(super) async fn spill_large_result(
         }) => {
             return Err(ArtifactSpillError::PersistenceOutcomeUnknown { operation, message });
         }
+        Err(error) if error.invalidates_artifact_authority() => {
+            return Err(ArtifactSpillError::ArtifactIntegrity(error.to_string()));
+        }
         Err(error) => {
             return Ok(failed(
                 pass,
@@ -94,9 +101,13 @@ pub(super) async fn spill_large_result(
             ));
         }
     };
+    // A successful return alone is insufficient: the receipt must bind the
+    // same session, artifact identity, content hash, size, and preview.
     if !receipt.proves(runtime.session, &expected_artifact) {
         return Err(ArtifactSpillError::ReceiptMismatch);
     }
+    // Advance authority before exposing the marker so subsequent writes use
+    // the durable receipt's journal coordinate rather than the audit frontier.
     pass.frontier = pass.frontier.max(receipt.journal_seq());
     pass.outcomes.push(ArtifactSpillOutcome::Spilled {
         location,

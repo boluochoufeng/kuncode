@@ -10,8 +10,8 @@ use crate::{
     compaction::artifact::{ArtifactStore, ArtifactTokenCounter, ArtifactTokenCounterError},
     session::AgentSession,
     session_store::{
-        CommittedArtifact, JournalEntry, NewJournalEntry, NewToolArtifact, Seq, SessionId,
-        SessionStore, SessionStoreError, sqlite::SqliteSessionStore,
+        CommittedArtifact, JournalEntry, JournalSnapshot, NewJournalEntry, NewToolArtifact, Seq,
+        SessionId, SessionStore, SessionStoreError, sqlite::SqliteSessionStore,
     },
     tool::ToolOutput,
 };
@@ -104,7 +104,9 @@ impl RejectingStore {
             })
             .collect::<Vec<_>>();
         let mut session = AgentSession::new();
-        session.attach_session_id(SessionId::new("test-session"));
+        session
+            .attach_session_id(SessionId::new("test-session"))
+            .expect("fresh session should attach");
         for (message, entry) in messages.iter().zip(&entries) {
             session.push_with_journal_seq(message.clone(), Some(entry.seq));
         }
@@ -125,10 +127,34 @@ impl ArtifactStore for RejectingStore {
     async fn replay(
         &self,
         _session: &SessionId,
-        _after: Seq,
+        seq: Seq,
     ) -> Result<Vec<JournalEntry>, SessionStoreError> {
+        Ok(self
+            .entries
+            .iter()
+            .filter(|entry| entry.seq > seq)
+            .cloned()
+            .collect())
+    }
+
+    async fn journal_snapshot(
+        &self,
+        _session: &SessionId,
+        seqs: &[Seq],
+    ) -> Result<JournalSnapshot, SessionStoreError> {
         self.replay_calls.fetch_add(1, Ordering::SeqCst);
-        Ok(self.entries.clone())
+        let requested = seqs
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        let head = self.entries.last().map_or(Seq::ZERO, |entry| entry.seq);
+        let entries = self
+            .entries
+            .iter()
+            .filter(|entry| requested.contains(&entry.seq))
+            .cloned()
+            .collect();
+        Ok(JournalSnapshot::new(head, entries))
     }
 
     async fn put(
@@ -156,7 +182,9 @@ pub(super) async fn persisted_session(
     messages: &[Message],
 ) -> AgentSession {
     let mut session = AgentSession::new();
-    session.attach_session_id(session_id.clone());
+    session
+        .attach_session_id(session_id.clone())
+        .expect("fresh session should attach");
     for message in messages {
         let seq = store
             .append(

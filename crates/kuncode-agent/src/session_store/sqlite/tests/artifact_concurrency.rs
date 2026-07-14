@@ -27,6 +27,8 @@ async fn concurrent_artifact_writers_return_one_typed_head_conflict() {
         .create_session(NewSession::new(root.path().to_path_buf()))
         .await
         .expect("session should be created");
+    // Both writers prove against the same head; the barrier makes them exercise
+    // the writer-lock CAS instead of intentionally sequencing the operations.
     let barrier = tokio::sync::Barrier::new(2);
     let first_write = async {
         barrier.wait().await;

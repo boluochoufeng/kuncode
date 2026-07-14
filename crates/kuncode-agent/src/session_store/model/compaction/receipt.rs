@@ -3,7 +3,10 @@
 use super::NewCompactionCommit;
 use crate::session_store::{Seq, SessionId, SessionStoreError, active_messages_sha256};
 
-/// Receipt proving the compaction event and checkpoint committed atomically.
+/// Store-issued receipt used to authorize installation of a compacted context.
+///
+/// The issuing store is responsible for atomic durability; this value binds the reported
+/// journal coordinates and output digest to the in-memory installation boundary.
 #[derive(Debug, PartialEq, Eq)]
 pub struct CommittedCompaction {
     session_id: SessionId,
@@ -13,14 +16,16 @@ pub struct CommittedCompaction {
 }
 
 impl CommittedCompaction {
-    /// Builds a receipt after an external store atomically commits the supplied plan.
+    /// Builds a receipt after a store reports the supplied plan atomically committed.
     ///
-    /// This validates the session binding, journal order, and installed-message
-    /// digest before exposing a receipt to the runner.
+    /// This validates plan-to-receipt session binding, increasing journal coordinates,
+    /// and the installed-message digest. It does not query storage, so the caller remains
+    /// responsible for reporting only durable coordinates from one atomic commit.
     ///
     /// # Errors
-    /// Returns [`SessionStoreError::InvalidCompaction`] when the plan cannot
-    /// authorize the reported durable sequences or active context.
+    /// Returns [`SessionStoreError::InvalidCompaction`] when the plan cannot authorize
+    /// the reported sequences or active context. Returns the corresponding serialization
+    /// error if the checkpoint messages cannot be encoded in canonical store form.
     pub fn from_committed_write(
         commit: &NewCompactionCommit,
         compaction_seq: Seq,

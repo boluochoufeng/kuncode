@@ -9,8 +9,9 @@ use crate::{
         protocol::{group_messages, select_protected_recent_tail},
     },
     session_store::{
-        CommittedArtifact, JournalEntry, JournalKind, NewJournalEntry, NewSession, NewToolArtifact,
-        Seq, SessionId, SessionStore, SessionStoreError, sqlite::SqliteSessionStore,
+        CommittedArtifact, JournalEntry, JournalKind, JournalSnapshot, NewJournalEntry, NewSession,
+        NewToolArtifact, Seq, SessionId, SessionStore, SessionStoreError,
+        sqlite::SqliteSessionStore,
     },
     test_support::TestDir,
 };
@@ -25,9 +26,17 @@ impl ArtifactStore for InterleavingStore<'_> {
     async fn replay(
         &self,
         session: &SessionId,
-        after: Seq,
+        seq: Seq,
     ) -> Result<Vec<JournalEntry>, SessionStoreError> {
-        self.inner.replay_after(session, after).await
+        self.inner.replay_after(session, seq).await
+    }
+
+    async fn journal_snapshot(
+        &self,
+        session: &SessionId,
+        seqs: &[Seq],
+    ) -> Result<JournalSnapshot, SessionStoreError> {
+        SessionStore::journal_snapshot(self.inner, session, seqs).await
     }
 
     async fn put(

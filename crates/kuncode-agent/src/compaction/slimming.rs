@@ -1,4 +1,9 @@
 //! Explicit-policy projection of old tool results into bounded markers.
+//!
+//! Production authorization is deny-by-default: only old, unprotected results
+//! carrying harness-minted retention authority are considered, and marker
+//! preparation still requires durable lineage, successful complete output, and
+//! a strictly smaller bounded projection.
 
 use std::collections::BTreeSet;
 
@@ -25,6 +30,12 @@ pub use types::{
 };
 
 /// Applies only selected projections authorized by the same artifact pass.
+///
+/// This lower-level boundary validates location, age, sidecar identity, and
+/// artifact disposition. Production callers must obtain `authorized` from the
+/// harness-owned retention policy; model-visible tool names or arguments are
+/// not authorization. Failed, truncated, uncountable, or non-saving candidates
+/// remain verbatim.
 ///
 /// # Errors
 /// Returns [`ToolResultSlimmingError`] when protocol groups, protection, or an
