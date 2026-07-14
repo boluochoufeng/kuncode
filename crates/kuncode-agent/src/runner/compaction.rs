@@ -35,8 +35,8 @@ mod shadow;
 use artifact_counter::RequestArtifactCounter;
 use cancellable_summary::CancellableSummarizer;
 use events::{
-    elapsed_ms, failure_event, failure_message, invalidates_persistence_authority, is_recoverable,
-    pressure_reason,
+    elapsed_ms, failure_code, failure_event, failure_message, invalidates_persistence_authority,
+    is_recoverable, pressure_reason,
 };
 
 impl<M> AgentRunner<M>
@@ -247,7 +247,7 @@ where
 
 fn compaction_error(error: CompactionError) -> AgentError {
     AgentError::Compaction {
-        message: failure_message(&error),
+        message: failure_code(&error).to_string(),
     }
 }
 
