@@ -31,8 +31,12 @@ struct ScriptedModel {
 
 impl ScriptedModel {
     fn new(response: ScriptedResponse) -> Self {
+        Self::with_responses([response])
+    }
+
+    fn with_responses(responses: impl IntoIterator<Item = ScriptedResponse>) -> Self {
         Self {
-            responses: Arc::new(Mutex::new(VecDeque::from([response]))),
+            responses: Arc::new(Mutex::new(responses.into_iter().collect())),
             requests: Arc::default(),
         }
     }
@@ -100,31 +104,40 @@ async fn valid_output_uses_one_non_streaming_tool_free_request() {
 }
 
 #[tokio::test]
-async fn rejects_non_json_wrong_version_and_unknown_artifacts() {
-    for raw in [
-        "```json\n{}\n```".to_string(),
-        summary_json_with(serde_json::json!(2), serde_json::json!([])),
-        summary_json_with(
-            serde_json::json!(1),
-            serde_json::json!([
-                "tool-result-sha256-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-            ]),
-        ),
-    ] {
-        let model = ScriptedModel::new(Ok(response(AssistantContent::text(raw))));
-        let error = LlmContextSummarizer::new(model, 2_048)
-            .expect("summary output budget should be valid")
-            .summarize(request())
-            .await
-            .expect_err("untrusted output should be rejected");
-        assert!(matches!(error, SummarizerError::InvalidSummary { .. }));
-        assert_eq!(error.usage(), Some(usage()));
-    }
+async fn invalid_summary_gets_one_safe_correction_retry_and_aggregates_usage() {
+    let rejected_output = "RAW_INVALID_SUMMARY_SENTINEL";
+    let model = ScriptedModel::with_responses([
+        Ok(response(AssistantContent::text(rejected_output))),
+        Ok(response(AssistantContent::text(valid_summary_json()))),
+    ]);
+    let summarizer = LlmContextSummarizer::new(model.clone(), 2_048)
+        .expect("summary output budget should be valid");
+
+    let generated = summarizer
+        .summarize(request())
+        .await
+        .expect("a corrected summary should be accepted");
+
+    assert_eq!(generated.usage, usage() + usage());
+    let requests = model.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].chat_history[1], requests[1].chat_history[1]);
+    assert_eq!(requests[0].output_schema, requests[1].output_schema);
+    let Message::System { content } = requests[1].chat_history.first() else {
+        panic!("correction request should keep system authority first");
+    };
+    assert!(content.contains("invalid_summary"));
+    assert!(!content.contains(rejected_output));
+    assert!(
+        !serde_json::to_string(&requests[1].chat_history)
+            .expect("correction prompt should encode")
+            .contains(rejected_output)
+    );
 }
 
 #[tokio::test]
-async fn rejects_extra_blocks_and_propagates_provider_failure() {
-    let response = CompletionResponse {
+async fn invalid_response_shape_gets_one_correction_retry() {
+    let invalid_shape = CompletionResponse {
         choice: NonEmptyVec::from_first_rest(
             AssistantContent::text(valid_summary_json()),
             vec![AssistantContent::tool_call(
@@ -137,16 +150,116 @@ async fn rejects_extra_blocks_and_propagates_provider_failure() {
         raw_response: serde_json::json!({}),
         message_id: None,
     };
-    let shape_error = LlmContextSummarizer::new(ScriptedModel::new(Ok(response)), 2_048)
+    let model = ScriptedModel::with_responses([
+        Ok(invalid_shape),
+        Ok(response(AssistantContent::text(valid_summary_json()))),
+    ]);
+
+    let generated = LlmContextSummarizer::new(model.clone(), 2_048)
         .expect("summary output budget should be valid")
         .summarize(request())
         .await
-        .expect_err("extra content should be rejected");
+        .expect("a corrected response shape should be accepted");
+
+    assert_eq!(generated.usage, usage() + usage());
+    let requests = model.requests();
+    assert_eq!(requests.len(), 2);
+    let Message::System { content } = requests[1].chat_history.first() else {
+        panic!("correction request should keep system authority first");
+    };
+    assert!(content.contains("invalid_response_shape"));
+}
+
+#[tokio::test]
+async fn second_invalid_summary_fails_closed_without_a_third_call() {
+    let model = ScriptedModel::with_responses([
+        Ok(response(AssistantContent::text("first invalid output"))),
+        Ok(response(AssistantContent::text("second invalid output"))),
+        Ok(response(AssistantContent::text(valid_summary_json()))),
+    ]);
+
+    let error = LlmContextSummarizer::new(model.clone(), 2_048)
+        .expect("summary output budget should be valid")
+        .summarize(request())
+        .await
+        .expect_err("the second rejected summary must fail closed");
+
+    assert!(matches!(error, SummarizerError::InvalidSummary { .. }));
+    assert_eq!(error.usage(), Some(usage() + usage()));
+    assert_eq!(model.requests().len(), 2);
+}
+
+#[tokio::test]
+async fn correction_provider_failure_preserves_first_response_usage() {
+    let model = ScriptedModel::with_responses([
+        Ok(response(AssistantContent::text("invalid output"))),
+        Err(CompletionError::ResponseError("offline".to_string())),
+    ]);
+
+    let error = LlmContextSummarizer::new(model.clone(), 2_048)
+        .expect("summary output budget should be valid")
+        .summarize(request())
+        .await
+        .expect_err("correction provider failure should propagate");
+
+    assert_eq!(error.usage(), Some(usage()));
+    assert_eq!(model.requests().len(), 2);
+}
+
+#[tokio::test]
+async fn rejects_non_json_wrong_version_and_unknown_artifacts() {
+    for raw in [
+        "```json\n{}\n```".to_string(),
+        summary_json_with(serde_json::json!(2), serde_json::json!([])),
+        summary_json_with(
+            serde_json::json!(1),
+            serde_json::json!([
+                "tool-result-sha256-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            ]),
+        ),
+    ] {
+        let model = ScriptedModel::with_responses([
+            Ok(response(AssistantContent::text(raw.clone()))),
+            Ok(response(AssistantContent::text(raw))),
+        ]);
+        let error = LlmContextSummarizer::new(model, 2_048)
+            .expect("summary output budget should be valid")
+            .summarize(request())
+            .await
+            .expect_err("untrusted output should be rejected");
+        assert!(matches!(error, SummarizerError::InvalidSummary { .. }));
+        assert_eq!(error.usage(), Some(usage() + usage()));
+    }
+}
+
+#[tokio::test]
+async fn rejects_extra_blocks_and_propagates_provider_failure() {
+    let invalid_shape = || CompletionResponse {
+        choice: NonEmptyVec::from_first_rest(
+            AssistantContent::text(valid_summary_json()),
+            vec![AssistantContent::tool_call(
+                "call-1",
+                "compact",
+                serde_json::json!({}),
+            )],
+        ),
+        usage: usage(),
+        raw_response: serde_json::json!({}),
+        message_id: None,
+    };
+    let shape_error = LlmContextSummarizer::new(
+        ScriptedModel::with_responses([Ok(invalid_shape()), Ok(invalid_shape())]),
+        2_048,
+    )
+    .expect("summary output budget should be valid")
+    .summarize(request())
+    .await
+    .expect_err("extra content should be rejected");
     assert!(matches!(
         shape_error,
         SummarizerError::InvalidResponseShape { .. }
     ));
-    assert_eq!(shape_error.usage(), Some(usage()));
+    assert_eq!(shape_error.usage(), Some(usage() + usage()));
 
     let provider_error = LlmContextSummarizer::new(
         ScriptedModel::new(Err(CompletionError::ResponseError("offline".to_string()))),

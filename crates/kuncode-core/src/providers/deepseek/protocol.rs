@@ -506,9 +506,12 @@ pub struct DeepSeekCompletionRequest {
 impl TryFrom<completion::CompletionRequest> for DeepSeekCompletionRequest {
     type Error = completion::CompletionError;
     fn try_from(req: completion::CompletionRequest) -> Result<Self, Self::Error> {
-        if req.output_schema.is_some() {
-            tracing::warn!("DeepSeek dosen't support structed outputs");
-        }
+        // DeepSeek cannot transport the schema itself, but JSON object mode
+        // still enforces a parseable envelope for a schema-bearing prompt.
+        let response_format = req
+            .output_schema
+            .as_ref()
+            .map(|_| ResponseFormat::JsonObject);
 
         let model = req.model.ok_or_else(|| {
             CompletionError::RequestError("Invalid request: lacking of model ID".to_string())
@@ -564,7 +567,7 @@ impl TryFrom<completion::CompletionRequest> for DeepSeekCompletionRequest {
             stream_options: None,
             thinking,
             reasoning_effort,
-            response_format: None,
+            response_format,
         })
     }
 }
@@ -716,6 +719,27 @@ mod tests {
         assert!(model < tools);
         assert!(tools < tool_choice);
         assert!(tool_choice < messages);
+    }
+
+    #[test]
+    fn output_schema_requests_json_object_response_format() {
+        let request = crate::completion::CompletionRequestBuilder::new(dm::Message::user("hello"))
+            .model("deepseek-test")
+            .output_schema(Some(serde_json::json!({
+                "type": "object",
+                "properties": { "answer": { "type": "string" } },
+                "required": ["answer"]
+            })))
+            .build();
+
+        let wire = super::DeepSeekCompletionRequest::try_from(request)
+            .expect("request should map to wire");
+        let json = serde_json::to_value(wire).expect("wire request should serialize");
+
+        assert_eq!(
+            json["response_format"],
+            serde_json::json!({ "type": "json_object" })
+        );
     }
 
     #[test]

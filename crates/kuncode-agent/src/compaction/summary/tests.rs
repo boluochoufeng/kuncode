@@ -44,6 +44,76 @@ fn generated_schema_is_strict_and_uses_durable_wire_names() {
 }
 
 #[test]
+fn prompt_carries_the_exact_continuity_summary_schema() {
+    let context = SummaryValidationContext::new(
+        Seq::new(1),
+        Seq::new(1),
+        Seq::new(1),
+        std::iter::empty::<&str>(),
+    )
+    .expect("validation source should be valid");
+    let request = SummaryRequest::new(None, vec![Message::user("history")], context)
+        .expect("summary request should be valid");
+    let expected_schema =
+        serde_json::to_string(&continuity_summary_schema().expect("schema should encode"))
+            .expect("schema JSON should encode");
+
+    let prompt = build_summary_prompt(&request).expect("prompt should serialize");
+    let Message::System { content } = prompt.first() else {
+        panic!("first prompt message should be system authority");
+    };
+
+    assert!(
+        content.contains(&expected_schema),
+        "the trusted prompt must include the same schema used for provider output"
+    );
+}
+
+#[test]
+fn prompt_carries_a_request_bound_json_output_example() {
+    let context = SummaryValidationContext::new(
+        Seq::new(2),
+        Seq::new(8),
+        Seq::new(8),
+        std::iter::empty::<&str>(),
+    )
+    .expect("validation source should be valid");
+    let request = SummaryRequest::new(None, vec![Message::user("history")], context)
+        .expect("summary request should be valid");
+
+    let prompt = build_summary_prompt(&request).expect("prompt should serialize");
+    let Message::System { content } = prompt.first() else {
+        panic!("first prompt message should be system authority");
+    };
+    let example: serde_json::Value = serde_json::from_str(
+        content
+            .lines()
+            .last()
+            .expect("system prompt should end with a JSON example"),
+    )
+    .expect("output example should be valid JSON");
+    let actual_fields = example
+        .as_object()
+        .expect("output example should be an object")
+        .keys()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    let schema = continuity_summary_schema().expect("schema should encode");
+    let expected_fields = schema["required"]
+        .as_array()
+        .expect("schema should list required fields")
+        .iter()
+        .map(|field| field.as_str().expect("required field should be text"))
+        .collect::<std::collections::BTreeSet<_>>();
+
+    assert_eq!(actual_fields, expected_fields);
+    assert_eq!(example["source_seq_start"], 2);
+    assert_eq!(example["source_seq_end"], 8);
+    assert_eq!(example["current_goal"], "");
+    assert_eq!(example["workspace"]["working_directory"], "");
+}
+
+#[test]
 fn wire_schema_rejects_missing_and_unknown_fields() {
     for field in [
         "schema_version",
