@@ -8,7 +8,7 @@ use crate::{
         protocol::{group_messages, select_protected_recent_tail},
         slimming::slim_tool_results,
     },
-    session_store::{NewSession, Seq, SessionStore, sqlite::SqliteSessionStore},
+    session_store::{NewSession, Seq, SessionStore, turso::TursoSessionStore},
     test_support::TestDir,
     tool::ToolOutput,
 };
@@ -29,7 +29,7 @@ use support::{AdaptiveMarkerCounter, FixedCounter, persisted_session, tool_excha
 async fn spills_only_when_result_exceeds_threshold() {
     // Given: an old durable exchange and a protected recent exchange.
     let root = TestDir::new();
-    let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+    let store = TursoSessionStore::open(root.path().join("sessions.db"))
         .await
         .expect("store should open");
     let session_id = store
@@ -67,7 +67,7 @@ async fn spills_only_when_result_exceeds_threshold() {
 async fn keeps_result_at_exact_threshold_inline_and_authorizes_slimming() {
     // Given: one durable old exchange before a protected tool exchange.
     let root = TestDir::new();
-    let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+    let store = TursoSessionStore::open(root.path().join("sessions.db"))
         .await
         .expect("store should open");
     let session_id = store
@@ -123,7 +123,7 @@ async fn keeps_result_at_exact_threshold_inline_and_authorizes_slimming() {
 async fn preserves_payload_when_counting_fails() {
     // Given: an eligible durable exchange and a counter failure.
     let root = TestDir::new();
-    let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+    let store = TursoSessionStore::open(root.path().join("sessions.db"))
         .await
         .expect("store should open");
     let session_id = store
@@ -163,7 +163,7 @@ async fn repeated_spill_reuses_the_same_artifact_receipt() {
     // Given: the same durable source is evaluated twice.
     let root = TestDir::new();
     let store = Arc::new(
-        SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+        TursoSessionStore::open(root.path().join("sessions.db"))
             .await
             .expect("store should open"),
     );

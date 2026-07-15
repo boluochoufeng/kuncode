@@ -68,7 +68,7 @@ fn revalidates_recursive_version_and_artifacts() {
 #[test]
 fn recursive_prompt_and_fixture_replace_a_superseded_conclusion() {
     let old = "Use JSONL because no database is available";
-    let current = "Use SQLite; JSONL is superseded because atomic CAS is required";
+    let current = "Use Turso; JSONL is superseded because atomic CAS is required";
     let mut previous = fixture_summary();
     previous.decisions = vec![old.to_string()];
     let context =
@@ -77,7 +77,7 @@ fn recursive_prompt_and_fixture_replace_a_superseded_conclusion() {
     let request = SummaryRequest::new(
         Some(previous.clone()),
         vec![Message::user(
-            "Correction: use SQLite, not JSONL, because compaction needs atomic CAS.",
+            "Correction: use Turso, not JSONL, because compaction needs atomic CAS.",
         )],
         context,
     )
@@ -95,7 +95,7 @@ fn recursive_prompt_and_fixture_replace_a_superseded_conclusion() {
         panic!("summary source should be JSON text");
     };
     assert!(text.text_ref().contains(old));
-    assert!(text.text_ref().contains("Correction: use SQLite"));
+    assert!(text.text_ref().contains("Correction: use Turso"));
 
     // The previous conclusion remains source evidence, but the replacement output
     // carries only the currently supported decision rather than accumulating both.

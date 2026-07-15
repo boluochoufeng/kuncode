@@ -2,12 +2,12 @@ use super::support::{
     AgentError, AgentRunner, AgentSession, Arc, AssistantContent, CancellationToken,
     CollectingObserver, CompactionMode, CompletionRequest, EventKind, FakeModel,
     FixedRunnerGroupEstimator, Message, NewSession, NonEmptyVec, RequestShapeEstimator, Seq,
-    SessionId, SessionStore, SqliteSessionStore, TestDir, TodoWrite, TokenCountPrecision,
-    TokenEstimate, TokenEstimationError, TokenEstimator, ToolOutput, ToolRegistry, UserContent,
+    SessionId, SessionStore, TestDir, TodoWrite, TokenCountPrecision, TokenEstimate,
+    TokenEstimationError, TokenEstimator, ToolOutput, ToolRegistry, TursoSessionStore, UserContent,
     async_trait, configured_runner, event_label, response,
 };
 
-// End-to-end automatic compaction tests against the SQLite durability boundary.
+// End-to-end automatic compaction tests against the Turso durability boundary.
 //
 // These scenarios distinguish journal-backed active messages from the final
 // request-only runtime envelope and verify commit-before-install ordering.
@@ -41,11 +41,11 @@ impl TokenEstimator for SlimmingAwareEstimator {
 }
 
 #[tokio::test]
-async fn enabled_runner_commits_sqlite_compaction_before_sending_reduced_request() {
+async fn enabled_runner_commits_turso_compaction_before_sending_reduced_request() {
     // Given
     let root = TestDir::new();
     let store = Arc::new(
-        SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+        TursoSessionStore::open(root.path().join("sessions.db"))
             .await
             .expect("store should open"),
     );
@@ -191,7 +191,7 @@ async fn enabled_runner_commits_sqlite_compaction_before_sending_reduced_request
 async fn cancellation_after_durable_commit_waits_for_installation() {
     // Given
     let root = TestDir::new();
-    let inner = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+    let inner = TursoSessionStore::open(root.path().join("sessions.db"))
         .await
         .expect("store should open");
     let store = Arc::new(CommitGateStore::new(inner));
@@ -264,7 +264,7 @@ async fn todo_retention_drives_runner_slimming_without_summary() {
     // Given: a real todo_write result followed by a newer protected exchange.
     let root = TestDir::new();
     let store = Arc::new(
-        SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+        TursoSessionStore::open(root.path().join("sessions.db"))
             .await
             .expect("store should open"),
     );
@@ -391,13 +391,13 @@ async fn todo_retention_drives_runner_slimming_without_summary() {
 }
 
 struct CommitGateStore {
-    inner: SqliteSessionStore,
+    inner: TursoSessionStore,
     committed: Notify,
     release: Notify,
 }
 
 impl CommitGateStore {
-    fn new(inner: SqliteSessionStore) -> Self {
+    fn new(inner: TursoSessionStore) -> Self {
         Self {
             inner,
             committed: Notify::new(),

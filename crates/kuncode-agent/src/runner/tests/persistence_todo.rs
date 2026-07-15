@@ -1,14 +1,14 @@
 use super::support::{
     AgentRunner, AgentSession, Arc, AssistantContent, CollectingObserver, EventKind, FakeModel,
-    Message, NewSession, Seq, SessionId, SessionStore, SqliteSessionStore, TestDir, TodoWrite,
-    ToolRegistry, bash, event_label, response,
+    Message, NewSession, Seq, SessionId, SessionStore, TestDir, TodoWrite, ToolRegistry,
+    TursoSessionStore, bash, event_label, response,
 };
 
 #[tokio::test]
 async fn run_turn_persists_messages_to_session_store() {
     let root = TestDir::new();
     let store = Arc::new(
-        SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+        TursoSessionStore::open(root.path().join("sessions.db"))
             .await
             .expect("store should open"),
     );
@@ -44,7 +44,7 @@ async fn run_turn_persists_messages_to_session_store() {
 async fn append_failure_keeps_message_in_memory_without_advancing_frontier() {
     let root = TestDir::new();
     let store = Arc::new(
-        SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+        TursoSessionStore::open(root.path().join("sessions.db"))
             .await
             .expect("store should open"),
     );

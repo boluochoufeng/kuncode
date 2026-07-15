@@ -1,7 +1,7 @@
 use crate::{
     session_store::{
         JournalKind, NewJournalEntry, NewSession, NewToolArtifact, Seq, SessionStore,
-        SessionStoreError, sqlite::SqliteSessionStore,
+        SessionStoreError, turso::TursoSessionStore,
     },
     test_support::TestDir,
 };
@@ -10,7 +10,7 @@ use crate::{
 async fn put_tool_artifact_rejects_tampered_durable_payload_identity() {
     // Given: a valid artifact whose durable payload is later corrupted.
     let root = TestDir::new();
-    let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+    let store = TursoSessionStore::open(root.path().join("sessions.db"))
         .await
         .expect("store should open");
     let session = store
@@ -24,22 +24,28 @@ async fn put_tool_artifact_rejects_tampered_durable_payload_identity() {
         .put_tool_artifact(&session, Seq::ZERO, artifact.clone())
         .await
         .expect("artifact should commit");
-    sqlx::query(
-        "UPDATE tool_artifacts SET payload_text = ? WHERE session_id = ? AND artifact_id = ?",
-    )
-    .bind("forged payload")
-    .bind(session.as_str())
-    .bind(receipt.reference().artifact_id())
-    .execute(&store.pool)
-    .await
-    .expect("fixture should tamper with the durable payload");
+    {
+        let connection = store.connection_for_test().await;
+        connection
+            .execute(
+                "UPDATE tool_artifacts SET payload_text = ?1 \
+                 WHERE session_id = ?2 AND artifact_id = ?3",
+                (
+                    "forged payload",
+                    session.as_str(),
+                    receipt.reference().artifact_id(),
+                ),
+            )
+            .await
+            .expect("fixture should tamper with the durable payload");
+    }
 
     // When: an idempotent write reads the corrupted durable identity.
     let result = store
         .put_tool_artifact(&session, receipt.journal_seq(), artifact)
         .await;
 
-    // Then: SQLite rejects the forged digest-to-payload binding explicitly.
+    // Then: Turso rejects the forged digest-to-payload binding explicitly.
     assert!(matches!(
         result,
         Err(SessionStoreError::ToolArtifactStoredIntegrity {
@@ -55,7 +61,7 @@ async fn put_tool_artifact_rejects_tampered_durable_payload_identity() {
 async fn put_tool_artifact_rejects_ambiguous_durable_storage_source() {
     // Given: an inline artifact row corrupted to also name external storage.
     let root = TestDir::new();
-    let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+    let store = TursoSessionStore::open(root.path().join("sessions.db"))
         .await
         .expect("store should open");
     let session = store
@@ -69,22 +75,28 @@ async fn put_tool_artifact_rejects_ambiguous_durable_storage_source() {
         .put_tool_artifact(&session, Seq::ZERO, artifact.clone())
         .await
         .expect("artifact should commit");
-    sqlx::query(
-        "UPDATE tool_artifacts SET storage_ref = ? WHERE session_id = ? AND artifact_id = ?",
-    )
-    .bind("objects/forged")
-    .bind(session.as_str())
-    .bind(receipt.reference().artifact_id())
-    .execute(&store.pool)
-    .await
-    .expect("fixture should create an ambiguous storage source");
+    {
+        let connection = store.connection_for_test().await;
+        connection
+            .execute(
+                "UPDATE tool_artifacts SET storage_ref = ?1 \
+                 WHERE session_id = ?2 AND artifact_id = ?3",
+                (
+                    "objects/forged",
+                    session.as_str(),
+                    receipt.reference().artifact_id(),
+                ),
+            )
+            .await
+            .expect("fixture should create an ambiguous storage source");
+    }
 
     // When: an idempotent write reads the ambiguous durable row.
     let result = store
         .put_tool_artifact(&session, receipt.journal_seq(), artifact)
         .await;
 
-    // Then: SQLite refuses a row that is both inline and external.
+    // Then: Turso refuses a row that is both inline and external.
     assert!(matches!(
         result,
         Err(SessionStoreError::ToolArtifactStoredIntegrity { .. })
@@ -95,7 +107,7 @@ async fn put_tool_artifact_rejects_ambiguous_durable_storage_source() {
 async fn put_tool_artifact_rejects_tampered_journal_identity() {
     // Given: a valid artifact whose audit fact is later corrupted.
     let root = TestDir::new();
-    let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+    let store = TursoSessionStore::open(root.path().join("sessions.db"))
         .await
         .expect("store should open");
     let session = store
@@ -109,14 +121,26 @@ async fn put_tool_artifact_rejects_tampered_journal_identity() {
         .put_tool_artifact(&session, Seq::ZERO, artifact.clone())
         .await
         .expect("artifact should commit");
-    sqlx::query(
-        "UPDATE journal_entries SET payload_json = json_set(payload_json, '$.bytes', 999) \
-         WHERE session_id = ? AND kind = 'tool_artifact'",
-    )
-    .bind(session.as_str())
-    .execute(&store.pool)
-    .await
-    .expect("fixture should tamper with the audit fact");
+    {
+        let payload = serde_json::json!({
+            "artifact_id": receipt.reference().artifact_id(),
+            "content_hash": receipt.reference().content_hash(),
+            "bytes": 999,
+            "preview": receipt.reference().preview(),
+        });
+        let connection = store.connection_for_test().await;
+        connection
+            .execute(
+                "UPDATE journal_entries SET payload_json = ?1 \
+                 WHERE session_id = ?2 AND kind = 'tool_artifact'",
+                (
+                    serde_json::to_string(&payload).expect("fixture payload should encode"),
+                    session.as_str(),
+                ),
+            )
+            .await
+            .expect("fixture should tamper with the audit fact");
+    }
 
     // When: an idempotent write tries to reuse the corrupted receipt fact.
     let result = store
@@ -133,7 +157,7 @@ async fn put_tool_artifact_rejects_tampered_journal_identity() {
 #[tokio::test]
 async fn put_tool_artifact_rejects_a_non_positive_journal_sequence() {
     let root = TestDir::new();
-    let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+    let store = TursoSessionStore::open(root.path().join("sessions.db"))
         .await
         .expect("store should open");
     let session = store
@@ -157,14 +181,17 @@ async fn put_tool_artifact_rejects_a_non_positive_journal_sequence() {
         )
         .await
         .expect("later fact should commit");
-    sqlx::query(
-        "UPDATE journal_entries SET seq = -1 \
-         WHERE session_id = ? AND kind = 'tool_artifact'",
-    )
-    .bind(session.as_str())
-    .execute(&store.pool)
-    .await
-    .expect("fixture should corrupt the earlier artifact sequence");
+    {
+        let connection = store.connection_for_test().await;
+        connection
+            .execute(
+                "UPDATE journal_entries SET seq = -1 \
+                 WHERE session_id = ?1 AND kind = 'tool_artifact'",
+                [session.as_str()],
+            )
+            .await
+            .expect("fixture should corrupt the earlier artifact sequence");
+    }
 
     let result = store.put_tool_artifact(&session, head, artifact).await;
 

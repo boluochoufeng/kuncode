@@ -1,7 +1,7 @@
 use crate::{
     session_store::{
         JournalKind, NewJournalEntry, NewSession, Seq, SessionStore, SessionStoreError,
-        sqlite::SqliteSessionStore,
+        turso::TursoSessionStore,
     },
     test_support::TestDir,
 };
@@ -10,7 +10,7 @@ use kuncode_core::completion::Message;
 #[tokio::test]
 async fn append_assigns_monotonic_seq_per_session() {
     let root = TestDir::new();
-    let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+    let store = TursoSessionStore::open(root.path().join("sessions.db"))
         .await
         .expect("store should open");
     let session = store
@@ -40,7 +40,7 @@ async fn append_assigns_monotonic_seq_per_session() {
 #[tokio::test]
 async fn message_journal_uses_versioned_store_payload() {
     let root = TestDir::new();
-    let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+    let store = TursoSessionStore::open(root.path().join("sessions.db"))
         .await
         .expect("store should open");
     let session = store
@@ -72,7 +72,7 @@ async fn message_journal_uses_versioned_store_payload() {
 #[tokio::test]
 async fn journal_snapshot_returns_only_requested_facts_and_the_real_head() {
     let root = TestDir::new();
-    let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+    let store = TursoSessionStore::open(root.path().join("sessions.db"))
         .await
         .expect("store should open");
     let session = store
@@ -131,7 +131,7 @@ async fn journal_snapshot_returns_only_requested_facts_and_the_real_head() {
 async fn journal_snapshot_never_mixes_head_and_rows_across_concurrent_appends() {
     let root = TestDir::new();
     let store = std::sync::Arc::new(
-        SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+        TursoSessionStore::open(root.path().join("sessions.db"))
             .await
             .expect("store should open"),
     );
@@ -186,8 +186,8 @@ async fn journal_snapshot_never_mixes_head_and_rows_across_concurrent_appends() 
 #[tokio::test]
 async fn append_rejects_a_mistyped_durable_head() {
     let root = TestDir::new();
-    let database = root.path().join("sessions.sqlite3");
-    let store = SqliteSessionStore::open(&database)
+    let database = root.path().join("sessions.db");
+    let store = TursoSessionStore::open(&database)
         .await
         .expect("store should open");
     let session = store
@@ -201,16 +201,16 @@ async fn append_rejects_a_mistyped_durable_head() {
         )
         .await
         .expect("first append should commit");
-    let tamper = sqlx::SqlitePool::connect_with(
-        sqlx::sqlite::SqliteConnectOptions::new().filename(&database),
-    )
-    .await
-    .expect("tamper connection should open");
-    sqlx::query("UPDATE journal_entries SET seq = 'not-an-integer' WHERE session_id = ?")
-        .bind(session.as_str())
-        .execute(&tamper)
-        .await
-        .expect("fixture should corrupt the durable head type");
+    {
+        let connection = store.connection_for_test().await;
+        connection
+            .execute(
+                "UPDATE journal_entries SET seq = 'not-an-integer' WHERE session_id = ?1",
+                [session.as_str()],
+            )
+            .await
+            .expect("fixture should corrupt the durable head type");
+    }
 
     let result = store
         .append(

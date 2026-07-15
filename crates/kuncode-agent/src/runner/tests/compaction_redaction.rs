@@ -2,8 +2,8 @@ use super::support::{
     AgentCompactionConfig, AgentConfig, AgentRunner, AgentSession, Arc, AssistantContent,
     CollectingObserver, CompactionConfig, CompactionMode, CompletionError, CompletionRequest,
     CompletionResponse, CompletionStream, EventKind, FakeModel, FixedRunnerGroupEstimator, Message,
-    Mutex, NewSession, RequestShapeEstimator, SessionStore, SqliteSessionStore, TestDir,
-    ToolRegistry, Value, completed_stream, response,
+    Mutex, NewSession, RequestShapeEstimator, SessionStore, TestDir, ToolRegistry,
+    TursoSessionStore, Value, completed_stream, response,
 };
 
 // Verifies that compaction telemetry exposes stable codes without secret payloads.
@@ -52,7 +52,7 @@ async fn soft_summary_provider_body_is_absent_from_all_events() {
     // Given
     let root = TestDir::new();
     let store = Arc::new(
-        SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+        TursoSessionStore::open(root.path().join("sessions.db"))
             .await
             .expect("store should open"),
     );

@@ -1,10 +1,9 @@
 use sha2::{Digest, Sha256};
-use sqlx::Row;
 
 use crate::{
     session_store::{
         JournalKind, NewJournalEntry, NewSession, NewToolArtifact, Seq, SessionStore,
-        SessionStoreError, sqlite::SqliteSessionStore,
+        SessionStoreError, turso::TursoSessionStore,
     },
     test_support::TestDir,
 };
@@ -17,7 +16,7 @@ fn inline_artifact(preview: &str, payload: &str) -> NewToolArtifact {
 #[tokio::test]
 async fn put_tool_artifact_is_idempotent_and_journaled_once() {
     let root = TestDir::new();
-    let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+    let store = TursoSessionStore::open(root.path().join("sessions.db"))
         .await
         .expect("store should open");
     let session = store
@@ -65,7 +64,7 @@ async fn put_tool_artifact_is_idempotent_and_journaled_once() {
 async fn put_tool_artifact_rejects_existing_id_with_different_metadata() {
     // Given: a durable artifact and its original receipt.
     let root = TestDir::new();
-    let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+    let store = TursoSessionStore::open(root.path().join("sessions.db"))
         .await
         .expect("store should open");
     let session = store
@@ -102,36 +101,57 @@ async fn put_tool_artifact_rejects_existing_id_with_different_metadata() {
         .put_tool_artifact(&session, first.journal_seq(), original)
         .await
         .expect("unchanged duplicate should retain its original receipt");
-    let row = sqlx::query(
-        r#"
-        SELECT content_hash, bytes, preview, payload_text, storage_ref
-        FROM tool_artifacts
-        WHERE session_id = ? AND artifact_id = ?
-        "#,
-    )
-    .bind(session.as_str())
-    .bind(first.reference().artifact_id())
-    .fetch_one(&store.pool)
-    .await
-    .expect("durable artifact should remain queryable");
-    let journal_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM journal_entries WHERE session_id = ? AND kind = ?",
-    )
-    .bind(session.as_str())
-    .bind(JournalKind::ToolArtifact.as_str())
-    .fetch_one(&store.pool)
-    .await
-    .expect("journal count should be queryable");
+    let connection = store.connection_for_test().await;
+    let mut rows = connection
+        .query(
+            r#"
+            SELECT content_hash, bytes, preview, payload_text, storage_ref
+            FROM tool_artifacts
+            WHERE session_id = ?1 AND artifact_id = ?2
+            "#,
+            (session.as_str(), first.reference().artifact_id()),
+        )
+        .await
+        .expect("durable artifact should remain queryable");
+    let row = rows
+        .next()
+        .await
+        .expect("artifact query should succeed")
+        .expect("durable artifact should exist");
+    let mut count_rows = connection
+        .query(
+            "SELECT COUNT(*) FROM journal_entries WHERE session_id = ?1 AND kind = ?2",
+            (session.as_str(), JournalKind::ToolArtifact.as_str()),
+        )
+        .await
+        .expect("journal count should be queryable");
+    let journal_count = count_rows
+        .next()
+        .await
+        .expect("journal count query should succeed")
+        .expect("journal count should exist")
+        .get::<i64>(0)
+        .expect("journal count should be an integer");
 
     assert_eq!(repeated, first);
     assert_eq!(
-        row.get::<String, _>("content_hash"),
+        row.get::<String>(0).expect("content hash should decode"),
         "sha256-95bc7d277692d7369b761d95a567c2433ae022737112bb6d85e028b2480dfa8e"
     );
-    assert_eq!(row.get::<i64, _>("bytes"), 16);
-    assert_eq!(row.get::<String, _>("preview"), "original preview");
-    assert_eq!(row.get::<String, _>("payload_text"), "original payload");
-    assert_eq!(row.get::<Option<String>, _>("storage_ref"), None);
+    assert_eq!(row.get::<i64>(1).expect("bytes should decode"), 16);
+    assert_eq!(
+        row.get::<String>(2).expect("preview should decode"),
+        "original preview"
+    );
+    assert_eq!(
+        row.get::<String>(3).expect("payload should decode"),
+        "original payload"
+    );
+    assert_eq!(
+        row.get::<Option<String>>(4)
+            .expect("storage ref should decode"),
+        None
+    );
     assert_eq!(journal_count, 1);
     assert!(!error_text.contains("original payload"));
     assert!(!error_text.contains("changed payload"));
@@ -140,7 +160,7 @@ async fn put_tool_artifact_rejects_existing_id_with_different_metadata() {
 #[tokio::test]
 async fn distinct_artifacts_receive_monotonic_journal_receipts() {
     let root = TestDir::new();
-    let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+    let store = TursoSessionStore::open(root.path().join("sessions.db"))
         .await
         .expect("store should open");
     let session = store
@@ -171,7 +191,7 @@ async fn distinct_artifacts_receive_monotonic_journal_receipts() {
 #[tokio::test]
 async fn existing_artifact_without_journal_entry_is_rejected() {
     let root = TestDir::new();
-    let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+    let store = TursoSessionStore::open(root.path().join("sessions.db"))
         .await
         .expect("store should open");
     let session = store
@@ -183,11 +203,16 @@ async fn existing_artifact_without_journal_entry_is_rejected() {
         .put_tool_artifact(&session, Seq::ZERO, artifact.clone())
         .await
         .expect("artifact should commit");
-    sqlx::query("DELETE FROM journal_entries WHERE session_id = ?")
-        .bind(session.as_str())
-        .execute(&store.pool)
-        .await
-        .expect("test fixture should remove journal entry");
+    {
+        let connection = store.connection_for_test().await;
+        connection
+            .execute(
+                "DELETE FROM journal_entries WHERE session_id = ?1",
+                [session.as_str()],
+            )
+            .await
+            .expect("test fixture should remove journal entry");
+    }
 
     let result = store.put_tool_artifact(&session, Seq::ZERO, artifact).await;
 
@@ -200,7 +225,7 @@ async fn existing_artifact_without_journal_entry_is_rejected() {
 #[tokio::test]
 async fn artifact_put_rejects_stale_head_before_new_or_idempotent_writes() {
     let root = TestDir::new();
-    let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+    let store = TursoSessionStore::open(root.path().join("sessions.db"))
         .await
         .expect("store should open");
     let session = store
@@ -237,12 +262,21 @@ async fn artifact_put_rejects_stale_head_before_new_or_idempotent_writes() {
         .replay_after(&session, Seq::ZERO)
         .await
         .expect("journal should replay");
-    let artifact_rows: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM tool_artifacts WHERE session_id = ?")
-            .bind(session.as_str())
-            .fetch_one(&store.pool)
-            .await
-            .expect("artifact rows should be queryable");
+    let connection = store.connection_for_test().await;
+    let mut rows = connection
+        .query(
+            "SELECT COUNT(*) FROM tool_artifacts WHERE session_id = ?1",
+            [session.as_str()],
+        )
+        .await
+        .expect("artifact rows should be queryable");
+    let artifact_rows = rows
+        .next()
+        .await
+        .expect("artifact count query should succeed")
+        .expect("artifact count should exist")
+        .get::<i64>(0)
+        .expect("artifact count should be an integer");
 
     for result in [repeated, new_artifact] {
         assert!(matches!(
@@ -251,6 +285,81 @@ async fn artifact_put_rejects_stale_head_before_new_or_idempotent_writes() {
                 if expected == first.journal_seq().get() && found == actual.get()
         ));
     }
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| entry.kind == JournalKind::ToolArtifact.as_str())
+            .count(),
+        1
+    );
+    assert_eq!(artifact_rows, 1);
+}
+
+#[tokio::test]
+async fn concurrent_artifact_writers_return_one_typed_head_conflict() {
+    let root = TestDir::new();
+    let database = root.path().join("sessions.db");
+    let store = TursoSessionStore::open(&database)
+        .await
+        .expect("store should open");
+    let session = store
+        .create_session(NewSession::new(root.path().to_path_buf()))
+        .await
+        .expect("session should be created");
+    // Both writers prove against the same head; the barrier makes them exercise
+    // the writer-lock CAS instead of intentionally sequencing the operations.
+    let barrier = tokio::sync::Barrier::new(2);
+    let first_write = async {
+        barrier.wait().await;
+        store
+            .put_tool_artifact(
+                &session,
+                Seq::ZERO,
+                inline_artifact("first", "first payload"),
+            )
+            .await
+    };
+    let second_write = async {
+        barrier.wait().await;
+        store
+            .put_tool_artifact(
+                &session,
+                Seq::ZERO,
+                inline_artifact("second", "second payload"),
+            )
+            .await
+    };
+
+    let (first, second) = tokio::join!(first_write, second_write);
+    let (committed, rejected) = match (first, second) {
+        (Ok(committed), Err(rejected)) | (Err(rejected), Ok(committed)) => (committed, rejected),
+        (first, second) => panic!("expected one commit and one rejection: {first:?}, {second:?}"),
+    };
+    assert!(matches!(
+        rejected,
+        SessionStoreError::JournalHeadConflict { expected: 0, actual }
+            if actual == committed.journal_seq().get()
+    ));
+    let entries = store
+        .replay_after(&session, Seq::ZERO)
+        .await
+        .expect("journal should replay");
+    let connection = store.connection_for_test().await;
+    let mut rows = connection
+        .query(
+            "SELECT COUNT(*) FROM tool_artifacts WHERE session_id = ?1",
+            [session.as_str()],
+        )
+        .await
+        .expect("artifact rows should be queryable");
+    let artifact_rows = rows
+        .next()
+        .await
+        .expect("artifact count query should succeed")
+        .expect("artifact count should exist")
+        .get::<i64>(0)
+        .expect("artifact count should be an integer");
+
     assert_eq!(
         entries
             .iter()

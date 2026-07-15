@@ -8,7 +8,7 @@ use crate::{
         artifact::{ArtifactSpillInput, spill_artifacts},
         protocol::{ProtocolGroup, group_messages, select_protected_recent_tail},
     },
-    session_store::{NewSession, SessionStore, sqlite::SqliteSessionStore},
+    session_store::{NewSession, SessionStore, turso::TursoSessionStore},
     test_support::TestDir,
     tool::ToolOutput,
 };
@@ -17,7 +17,7 @@ use crate::{
 async fn bounds_adversarial_metadata_and_recounts_final_marker() {
     // Given: a large error payload with oversized free-text metadata.
     let root = TestDir::new();
-    let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+    let store = TursoSessionStore::open(root.path().join("sessions.db"))
         .await
         .expect("store should open");
     let session_id = store

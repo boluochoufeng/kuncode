@@ -5,25 +5,25 @@ use async_trait::async_trait;
 use crate::session_store::{
     Checkpoint, CommittedArtifact, CommittedCompaction, JournalEntry, NewCheckpoint,
     NewCompactionCommit, NewJournalEntry, NewSession, NewToolArtifact, Seq, SessionId,
-    SessionStore, SessionStoreError, sqlite::SqliteSessionStore,
+    SessionStore, SessionStoreError, turso::TursoSessionStore,
 };
 
 pub(crate) struct UnknownCommitStore {
-    inner: Arc<SqliteSessionStore>,
+    inner: Arc<TursoSessionStore>,
 }
 
 pub(crate) struct RejectedReceiptStore {
-    inner: Arc<SqliteSessionStore>,
+    inner: Arc<TursoSessionStore>,
 }
 
 impl RejectedReceiptStore {
-    pub(crate) fn new(inner: Arc<SqliteSessionStore>) -> Self {
+    pub(crate) fn new(inner: Arc<TursoSessionStore>) -> Self {
         Self { inner }
     }
 }
 
 impl UnknownCommitStore {
-    pub(crate) fn new(inner: Arc<SqliteSessionStore>) -> Self {
+    pub(crate) fn new(inner: Arc<TursoSessionStore>) -> Self {
         Self { inner }
     }
 }

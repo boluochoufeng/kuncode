@@ -10,14 +10,13 @@ use crate::{
     },
     session_store::{
         CommittedArtifact, JournalEntry, JournalKind, JournalSnapshot, NewJournalEntry, NewSession,
-        NewToolArtifact, Seq, SessionId, SessionStore, SessionStoreError,
-        sqlite::SqliteSessionStore,
+        NewToolArtifact, Seq, SessionId, SessionStore, SessionStoreError, turso::TursoSessionStore,
     },
     test_support::TestDir,
 };
 
 struct InterleavingStore<'a> {
-    inner: &'a SqliteSessionStore,
+    inner: &'a TursoSessionStore,
     interleaved: AtomicBool,
 }
 
@@ -66,7 +65,7 @@ impl ArtifactStore for InterleavingStore<'_> {
 async fn concurrent_journal_append_aborts_the_entire_spill_pass() {
     // Given: journal audit succeeds before a store wrapper appends a competing fact.
     let root = TestDir::new();
-    let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+    let store = TursoSessionStore::open(root.path().join("sessions.db"))
         .await
         .expect("store should open");
     let session_id = store

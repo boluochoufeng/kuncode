@@ -291,11 +291,10 @@ mod tests {
     #[tokio::test]
     async fn public_start_creates_and_attaches_a_new_empty_journal() {
         let root = crate::test_support::TestDir::new();
-        let store = crate::session_store::sqlite::SqliteSessionStore::open(
-            root.path().join("sessions.sqlite3"),
-        )
-        .await
-        .expect("store should open");
+        let store =
+            crate::session_store::turso::TursoSessionStore::open(root.path().join("sessions.db"))
+                .await
+                .expect("store should open");
         let mut session = AgentSession::new();
 
         session

@@ -13,7 +13,7 @@ mod dto;
 mod error;
 mod hash;
 mod model;
-pub mod sqlite;
+pub mod turso;
 
 pub(crate) use hash::active_messages_sha256;
 
@@ -131,11 +131,11 @@ pub trait SessionStore: Send + Sync {
     }
 }
 
-/// Returns the fixed SQLite session-store path under the user's home directory.
+/// Returns the fixed local Turso session-store path under the user's home directory.
 pub fn session_store_path(home: &Path) -> PathBuf {
     home.join(".kuncode")
         .join("sessions")
-        .join("session-store.sqlite3")
+        .join("session-store.db")
 }
 
 /// Encodes a project root as a stable, filename-safe session grouping identifier.

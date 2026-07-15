@@ -41,7 +41,7 @@ pub(super) use crate::{
     },
     registry::ToolRegistry,
     session::AgentSession,
-    session_store::{NewSession, Seq, SessionId, SessionStore, sqlite::SqliteSessionStore},
+    session_store::{NewSession, Seq, SessionId, SessionStore, turso::TursoSessionStore},
     system_prompt::{IdentitySection, SystemPrompt},
     test_support::TestDir,
     tool::{
