@@ -11,13 +11,13 @@ use crate::{
     session_store::{
         Checkpoint, CommittedArtifact, CommittedCompaction, JournalEntry, NewCheckpoint,
         NewCompactionCommit, NewJournalEntry, NewSession, NewToolArtifact, Seq, SessionId,
-        SessionStore, SessionStoreError, sqlite::SqliteSessionStore,
+        SessionStore, SessionStoreError, turso::TursoSessionStore,
     },
     test_support::TestDir,
 };
 
 struct CheckpointReadSpy<'a> {
-    inner: &'a SqliteSessionStore,
+    inner: &'a TursoSessionStore,
     checkpoint_reads: AtomicUsize,
 }
 
@@ -84,7 +84,7 @@ impl SessionStore for CheckpointReadSpy<'_> {
 async fn spill_audits_live_lineage_without_reading_checkpoint() {
     // Given: a live durable session whose store also contains a checkpoint.
     let root = TestDir::new();
-    let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+    let store = TursoSessionStore::open(root.path().join("sessions.db"))
         .await
         .expect("store should open");
     let session_id = store

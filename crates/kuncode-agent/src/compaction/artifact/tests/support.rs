@@ -11,7 +11,7 @@ use crate::{
     session::AgentSession,
     session_store::{
         CommittedArtifact, JournalEntry, JournalSnapshot, NewJournalEntry, NewToolArtifact, Seq,
-        SessionId, SessionStore, SessionStoreError, sqlite::SqliteSessionStore,
+        SessionId, SessionStore, SessionStoreError, turso::TursoSessionStore,
     },
     tool::ToolOutput,
 };
@@ -177,7 +177,7 @@ impl ArtifactStore for RejectingStore {
 }
 
 pub(super) async fn persisted_session(
-    store: &SqliteSessionStore,
+    store: &TursoSessionStore,
     session_id: SessionId,
     messages: &[Message],
 ) -> AgentSession {

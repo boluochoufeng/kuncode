@@ -12,7 +12,7 @@ use crate::{
         },
         protocol::{group_messages, select_protected_recent_tail},
     },
-    session_store::{NewSession, SessionStore, sqlite::SqliteSessionStore},
+    session_store::{NewSession, SessionStore, turso::TursoSessionStore},
     test_support::TestDir,
     tool::ToolOutput,
 };
@@ -21,7 +21,7 @@ use crate::{
 async fn spills_valid_tool_while_preserving_failed_sibling() {
     // Given: one closed multi-tool exchange with one malformed result.
     let root = TestDir::new();
-    let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+    let store = TursoSessionStore::open(root.path().join("sessions.db"))
         .await
         .expect("store should open");
     let session_id = store

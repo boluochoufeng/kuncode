@@ -18,7 +18,7 @@ use kuncode_agent::registry::ToolRegistry;
 use kuncode_agent::runner::{AgentCompactionConfigError, AgentConfig, AgentRunner};
 use kuncode_agent::session::AgentSession;
 use kuncode_agent::session_store::{
-    NewSession, SessionStore, session_store_path, sqlite::SqliteSessionStore,
+    NewSession, SessionStore, session_store_path, turso::TursoSessionStore,
 };
 use kuncode_agent::system_prompt::{
     EnvironmentSection, IdentitySection, SystemPrompt, ToolsSection,
@@ -58,7 +58,7 @@ pub struct CliRuntime<M> {
     mode: PermissionMode,
     model_name: String,
     project_root: std::path::PathBuf,
-    session_store: Option<Arc<SqliteSessionStore>>,
+    session_store: Option<Arc<dyn SessionStore>>,
     persistence_error: Option<String>,
 }
 
@@ -104,13 +104,14 @@ impl CliRuntime<RetryModel<DeepSeekCompletionModel>> {
         // Persistence discovery is non-fatal for CLI startup. Retaining the
         // reason lets the session warn once and deny lossy compaction without
         // preventing ordinary in-memory turns.
-        let (session_store, persistence_error) = match std::env::home_dir() {
-            Some(home) => match SqliteSessionStore::open(session_store_path(&home)).await {
-                Ok(store) => (Some(Arc::new(store)), None),
-                Err(error) => (None, Some(error.to_string())),
-            },
-            None => (None, Some("home directory unavailable".to_string())),
-        };
+        let (session_store, persistence_error): (Option<Arc<dyn SessionStore>>, Option<String>) =
+            match std::env::home_dir() {
+                Some(home) => match TursoSessionStore::open(session_store_path(&home)).await {
+                    Ok(store) => (Some(Arc::new(store)), None),
+                    Err(error) => (None, Some(error.to_string())),
+                },
+                None => (None, Some("home directory unavailable".to_string())),
+            };
         let client = DeepSeekClient::from_env()?;
         // Normal turns inherit the default retry budget. Semantic summaries use
         // a separate one-retry wrapper so their fallback latency is bounded
@@ -206,7 +207,6 @@ impl<M: CompletionModel> CliRuntime<M> {
             .with_approver(approver)
             .with_observer(observer);
         if let Some(store) = self.session_store {
-            let store: Arc<dyn SessionStore> = store;
             runner.with_session_store(store)
         } else {
             runner

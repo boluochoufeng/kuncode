@@ -6,16 +6,16 @@ use crate::{
     },
     session::AgentSession,
     session_store::{
-        JournalKind, NewJournalEntry, NewSession, Seq, SessionStore, sqlite::SqliteSessionStore,
+        JournalKind, NewJournalEntry, NewSession, Seq, SessionStore, turso::TursoSessionStore,
     },
     test_support::TestDir,
 };
 
 #[tokio::test]
 async fn skips_result_without_exact_durable_lineage() {
-    // Given: active context has a closed exchange but SQLite only has its assistant fact.
+    // Given: active context has a closed exchange but Turso only has its assistant fact.
     let root = TestDir::new();
-    let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+    let store = TursoSessionStore::open(root.path().join("sessions.db"))
         .await
         .expect("store should open");
     let session_id = store
@@ -53,7 +53,7 @@ async fn skips_result_without_exact_durable_lineage() {
 async fn rejects_any_journal_fact_beyond_session_frontier() {
     // Given: complete durable messages followed by a newer non-message journal fact.
     let root = TestDir::new();
-    let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+    let store = TursoSessionStore::open(root.path().join("sessions.db"))
         .await
         .expect("store should open");
     let session_id = store
@@ -106,9 +106,9 @@ async fn rejects_any_journal_fact_beyond_session_frontier() {
 
 #[tokio::test]
 async fn rejects_verbatim_assistant_that_differs_from_durable_journal() {
-    // Given: live lineage claims a tool-call assistant message that SQLite contradicts.
+    // Given: live lineage claims a tool-call assistant message that Turso contradicts.
     let root = TestDir::new();
-    let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+    let store = TursoSessionStore::open(root.path().join("sessions.db"))
         .await
         .expect("store should open");
     let session_id = store
@@ -144,9 +144,9 @@ async fn rejects_verbatim_assistant_that_differs_from_durable_journal() {
 
 #[tokio::test]
 async fn rejects_phantom_session_frontier() {
-    // Given: active messages match SQLite but the session claims a nonexistent head.
+    // Given: active messages match Turso but the session claims a nonexistent head.
     let root = TestDir::new();
-    let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+    let store = TursoSessionStore::open(root.path().join("sessions.db"))
         .await
         .expect("store should open");
     let session_id = store
@@ -200,7 +200,7 @@ fn attached_session(
 }
 
 async fn persist_messages(
-    store: &SqliteSessionStore,
+    store: &TursoSessionStore,
     session: &crate::session_store::SessionId,
     messages: &[kuncode_core::completion::Message],
 ) -> crate::session_store::Seq {

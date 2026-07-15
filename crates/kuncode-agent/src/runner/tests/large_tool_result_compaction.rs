@@ -2,9 +2,9 @@ use super::support::{
     AgentCompactionConfig, AgentConfig, AgentRunner, AgentSession, Arc, AssistantContent,
     CollectingObserver, CompactionConfig, CompactionMode, Deserialize, EventKind, FakeModel,
     FixedRunnerGroupEstimator, JsonSchema, LARGE_RESULT_BYTES, Message, NewSession,
-    PermissionAction, PermissionRequest, ScriptedRequestEstimator, Seq, SessionStore,
-    SqliteSessionStore, TestDir, ToolContext, ToolDefinition, ToolOutput, ToolRegistry,
-    ToolResultContent, TypedTool, UserContent, Value, async_trait, definition_for, response,
+    PermissionAction, PermissionRequest, ScriptedRequestEstimator, Seq, SessionStore, TestDir,
+    ToolContext, ToolDefinition, ToolOutput, ToolRegistry, ToolResultContent, TursoSessionStore,
+    TypedTool, UserContent, Value, async_trait, definition_for, response,
 };
 
 use crate::compaction::protocol::group_messages;
@@ -58,11 +58,11 @@ impl TypedTool for ScriptedResultTool {
 }
 
 #[tokio::test]
-async fn runner_spills_old_large_tool_result_and_commits_sqlite_checkpoint() {
+async fn runner_spills_old_large_tool_result_and_commits_turso_checkpoint() {
     // Given
     let root = TestDir::new();
     let store = Arc::new(
-        SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+        TursoSessionStore::open(root.path().join("sessions.db"))
             .await
             .expect("store should open"),
     );

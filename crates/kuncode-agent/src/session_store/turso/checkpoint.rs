@@ -3,7 +3,8 @@
 //! Version 1 writes these records, but the runtime does not read them to resume
 //! sessions yet.
 
-use sqlx::{Row, SqlitePool};
+use ::turso::{Connection, Row, transaction::TransactionBehavior};
+use tokio::sync::Mutex;
 
 use crate::session_store::{
     Checkpoint, JournalKind, NewCheckpoint, Seq, SessionId, SessionStoreError, dto,
@@ -12,50 +13,70 @@ use crate::session_store::{
 use super::{next_seq, timestamp, touch_session};
 
 pub(super) async fn latest(
-    pool: &SqlitePool,
+    connection: &Mutex<Connection>,
     session: &SessionId,
 ) -> Result<Option<Checkpoint>, SessionStoreError> {
-    let row = sqlx::query(
-        r#"
-        SELECT
-          checkpoint_seq,
-          covers_through_seq,
-          source_seq_start,
-          source_seq_end,
-          active_messages_json,
-          summary_json,
-          model,
-          token_usage_json
-        FROM active_context_checkpoints
-        WHERE session_id = ?
-        ORDER BY checkpoint_seq DESC
-        LIMIT 1
-        "#,
-    )
-    .bind(session.as_str())
-    .fetch_optional(pool)
-    .await?;
+    let connection = connection.lock().await;
+    let mut rows = connection
+        .query(
+            r#"
+            SELECT
+              checkpoint_seq,
+              covers_through_seq,
+              source_seq_start,
+              source_seq_end,
+              active_messages_json,
+              summary_json,
+              model,
+              token_usage_json
+            FROM active_context_checkpoints
+            WHERE session_id = ?1
+            ORDER BY checkpoint_seq DESC
+            LIMIT 1
+            "#,
+            [session.as_str()],
+        )
+        .await?;
 
-    row.map(row_to_checkpoint).transpose()
+    rows.next()
+        .await?
+        .as_ref()
+        .map(row_to_checkpoint)
+        .transpose()
 }
 
 pub(super) async fn write(
-    pool: &SqlitePool,
+    connection: &Mutex<Connection>,
     checkpoint: NewCheckpoint,
 ) -> Result<Seq, SessionStoreError> {
-    let mut tx = pool.begin().await?;
-    let seq = next_seq(&mut tx, &checkpoint.session_id).await?;
-    let now = timestamp();
-    insert(&mut tx, &checkpoint, seq, &now).await?;
-    touch_session(&mut tx, &checkpoint.session_id, &now).await?;
-    tx.commit()
-        .await
-        .map_err(|error| SessionStoreError::commit_outcome_unknown("write checkpoint", error))?;
-    Ok(seq)
+    let mut connection = connection.lock().await;
+    let tx = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .await?;
+    let outcome = async {
+        let seq = next_seq(&tx, &checkpoint.session_id).await?;
+        let now = timestamp();
+        insert(&tx, &checkpoint, seq, &now).await?;
+        touch_session(&tx, &checkpoint.session_id, &now).await?;
+        Ok(seq)
+    }
+    .await;
+    match outcome {
+        Ok(seq) => {
+            tx.commit().await.map_err(|error| {
+                SessionStoreError::commit_outcome_unknown("write checkpoint", error)
+            })?;
+            Ok(seq)
+        }
+        Err(error) => {
+            tx.rollback().await?;
+            Err(error)
+        }
+    }
 }
 
 pub(super) async fn insert(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    connection: &Connection,
     checkpoint: &NewCheckpoint,
     seq: Seq,
     now: &str,
@@ -75,54 +96,58 @@ pub(super) async fn insert(
 
     // Sharing one journal coordinate and transaction makes the checkpoint row
     // and `CheckpointRef` an atomic durable unit for a future resume path.
-    sqlx::query(
-        r#"
-        INSERT INTO active_context_checkpoints (
-          session_id,
-          checkpoint_seq,
-          covers_through_seq,
-          source_seq_start,
-          source_seq_end,
-          active_messages_json,
-          summary_json,
-          model,
-          token_usage_json,
-          created_at
+    connection
+        .execute(
+            r#"
+            INSERT INTO active_context_checkpoints (
+              session_id,
+              checkpoint_seq,
+              covers_through_seq,
+              source_seq_start,
+              source_seq_end,
+              active_messages_json,
+              summary_json,
+              model,
+              token_usage_json,
+              created_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            "#,
+            ::turso::params![
+                checkpoint.session_id.as_str(),
+                seq.get(),
+                checkpoint.covers_through_seq.get(),
+                checkpoint.source_seq_start.map(Seq::get),
+                checkpoint.source_seq_end.map(Seq::get),
+                active_messages,
+                summary.as_deref(),
+                checkpoint.model.as_deref(),
+                token_usage.as_deref(),
+                now,
+            ],
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        "#,
-    )
-    .bind(checkpoint.session_id.as_str())
-    .bind(seq.get())
-    .bind(checkpoint.covers_through_seq.get())
-    .bind(checkpoint.source_seq_start.map(Seq::get))
-    .bind(checkpoint.source_seq_end.map(Seq::get))
-    .bind(active_messages)
-    .bind(summary)
-    .bind(&checkpoint.model)
-    .bind(token_usage)
-    .bind(now)
-    .execute(&mut **tx)
-    .await?;
+        .await?;
 
     let payload = serde_json::json!({
         "schema_version": 1,
         "checkpoint_seq": seq.get(),
         "covers_through_seq": checkpoint.covers_through_seq.get()
     });
-    sqlx::query(
-        r#"
-        INSERT INTO journal_entries (session_id, seq, kind, payload_json, created_at)
-        VALUES (?, ?, ?, ?, ?)
-        "#,
-    )
-    .bind(checkpoint.session_id.as_str())
-    .bind(seq.get())
-    .bind(JournalKind::CheckpointRef.as_str())
-    .bind(serde_json::to_string(&payload)?)
-    .bind(now)
-    .execute(&mut **tx)
-    .await?;
+    connection
+        .execute(
+            r#"
+            INSERT INTO journal_entries (session_id, seq, kind, payload_json, created_at)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            "#,
+            ::turso::params![
+                checkpoint.session_id.as_str(),
+                seq.get(),
+                JournalKind::CheckpointRef.as_str(),
+                serde_json::to_string(&payload)?,
+                now,
+            ],
+        )
+        .await?;
     Ok(())
 }
 
@@ -190,24 +215,20 @@ fn invalid_checkpoint(message: impl Into<String>) -> SessionStoreError {
     SessionStoreError::InvalidCheckpoint(message.into())
 }
 
-fn row_to_checkpoint(row: sqlx::sqlite::SqliteRow) -> Result<Checkpoint, SessionStoreError> {
-    let active_messages: String = row.try_get("active_messages_json")?;
-    let summary: Option<String> = row.try_get("summary_json")?;
-    let token_usage: Option<String> = row.try_get("token_usage_json")?;
+fn row_to_checkpoint(row: &Row) -> Result<Checkpoint, SessionStoreError> {
+    let active_messages = row.get::<String>(4)?;
+    let summary = row.get::<Option<String>>(5)?;
+    let token_usage = row.get::<Option<String>>(7)?;
     Ok(Checkpoint {
-        checkpoint_seq: Seq::new(row.try_get("checkpoint_seq")?),
-        covers_through_seq: Seq::new(row.try_get("covers_through_seq")?),
-        source_seq_start: row
-            .try_get::<Option<i64>, _>("source_seq_start")?
-            .map(Seq::new),
-        source_seq_end: row
-            .try_get::<Option<i64>, _>("source_seq_end")?
-            .map(Seq::new),
+        checkpoint_seq: Seq::new(row.get(0)?),
+        covers_through_seq: Seq::new(row.get(1)?),
+        source_seq_start: row.get::<Option<i64>>(2)?.map(Seq::new),
+        source_seq_end: row.get::<Option<i64>>(3)?.map(Seq::new),
         active_messages: dto::messages_from_str(&active_messages)?,
         summary_json: summary
             .map(|json| serde_json::from_str(&json))
             .transpose()?,
-        model: row.try_get("model")?,
+        model: row.get(6)?,
         token_usage_json: token_usage
             .map(|json| serde_json::from_str(&json))
             .transpose()?,

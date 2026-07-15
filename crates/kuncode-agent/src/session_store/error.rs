@@ -7,9 +7,15 @@ pub enum SessionStoreError {
     /// A directory, permission, or storage-file operation failed.
     #[error("session store I/O failed: {0}")]
     Io(#[from] std::io::Error),
-    /// A SQLite query or transaction failed.
+    /// A Turso query or transaction failed.
     #[error("session store database failed: {0}")]
-    Sqlx(#[from] sqlx::Error),
+    Database(#[from] turso::Error),
+    /// The local Turso SDK cannot represent a non-UTF-8 database filename.
+    #[error("session store database path is not valid UTF-8: `{path}`")]
+    InvalidDatabasePath {
+        /// Rejected path rendered for diagnostics without changing the actual filename.
+        path: std::path::PathBuf,
+    },
     /// A durable write may have committed even though the client received no receipt.
     #[error("{operation} commit outcome is unknown: {message}")]
     CommitOutcomeUnknown {
@@ -128,7 +134,7 @@ pub enum SessionStoreError {
 }
 
 impl SessionStoreError {
-    pub(crate) fn commit_outcome_unknown(operation: &'static str, error: sqlx::Error) -> Self {
+    pub(crate) fn commit_outcome_unknown(operation: &'static str, error: turso::Error) -> Self {
         Self::CommitOutcomeUnknown {
             operation,
             message: error.to_string(),
@@ -144,7 +150,8 @@ impl SessionStoreError {
             | Self::UnsupportedPayloadVersion { .. }
             | Self::JournalStoredIntegrity { .. } => true,
             Self::Io(_)
-            | Self::Sqlx(_)
+            | Self::Database(_)
+            | Self::InvalidDatabasePath { .. }
             | Self::CommitOutcomeUnknown { .. }
             | Self::InvalidCheckpoint(_)
             | Self::InvalidToolArtifact(_)
@@ -172,7 +179,8 @@ impl SessionStoreError {
             | Self::ToolArtifactJournalIntegrity { .. }
             | Self::JournalStoredIntegrity { .. } => true,
             Self::Io(_)
-            | Self::Sqlx(_)
+            | Self::Database(_)
+            | Self::InvalidDatabasePath { .. }
             | Self::CommitOutcomeUnknown { .. }
             | Self::Json(_)
             | Self::InvalidMessagePayload(_)
@@ -201,7 +209,8 @@ impl SessionStoreError {
             | Self::ToolArtifactJournalIntegrity { .. }
             | Self::JournalStoredIntegrity { .. } => true,
             Self::Io(_)
-            | Self::Sqlx(_)
+            | Self::Database(_)
+            | Self::InvalidDatabasePath { .. }
             | Self::Json(_)
             | Self::InvalidMessagePayload(_)
             | Self::UnsupportedPayloadVersion { .. }

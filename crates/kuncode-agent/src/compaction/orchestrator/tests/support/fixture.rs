@@ -8,7 +8,7 @@ use kuncode_core::{
 use crate::{
     session::AgentSession,
     session_store::{
-        NewJournalEntry, NewSession, Seq, SessionId, SessionStore, sqlite::SqliteSessionStore,
+        NewJournalEntry, NewSession, Seq, SessionId, SessionStore, turso::TursoSessionStore,
     },
     test_support::TestDir,
     tool::{ToolOutput, ToolResultRetention},
@@ -16,7 +16,7 @@ use crate::{
 
 pub(crate) struct DurableFixture {
     _root: TestDir,
-    pub(crate) store: Arc<SqliteSessionStore>,
+    pub(crate) store: Arc<TursoSessionStore>,
     pub(crate) session_id: SessionId,
     pub(crate) session: AgentSession,
 }
@@ -32,7 +32,7 @@ impl DurableFixture {
     ) -> Self {
         let root = TestDir::new();
         let store = Arc::new(
-            SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+            TursoSessionStore::open(root.path().join("sessions.db"))
                 .await
                 .expect("store should open"),
         );

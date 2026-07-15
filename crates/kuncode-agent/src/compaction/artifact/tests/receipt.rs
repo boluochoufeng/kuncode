@@ -9,7 +9,7 @@ use crate::{
     },
     session_store::{
         CommittedArtifact, JournalEntry, JournalSnapshot, NewSession, NewToolArtifact, Seq,
-        SessionId, SessionStore, SessionStoreError, sqlite::SqliteSessionStore,
+        SessionId, SessionStore, SessionStoreError, turso::TursoSessionStore,
     },
     test_support::TestDir,
 };
@@ -21,7 +21,7 @@ enum WrongReceipt {
 }
 
 struct WrongReceiptStore<'a> {
-    inner: &'a SqliteSessionStore,
+    inner: &'a TursoSessionStore,
     wrong: WrongReceipt,
 }
 
@@ -120,7 +120,7 @@ async fn rejects_receipt_with_a_non_positive_journal_sequence() {
 
 struct ReceiptFixture {
     root: TestDir,
-    store: SqliteSessionStore,
+    store: TursoSessionStore,
     session: crate::session::AgentSession,
     groups: Vec<crate::compaction::protocol::ProtocolGroup>,
     protected: crate::compaction::protocol::ProtectedRecentTail,
@@ -135,7 +135,7 @@ impl ReceiptFixture {
 
 async fn receipt_fixture() -> ReceiptFixture {
     let root = TestDir::new();
-    let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+    let store = TursoSessionStore::open(root.path().join("sessions.db"))
         .await
         .expect("store should open");
     let session_id = store

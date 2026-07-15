@@ -1,7 +1,7 @@
 mod support;
 
 mod automatic_compaction;
-mod automatic_compaction_sqlite;
+mod automatic_compaction_turso;
 mod cancellation;
 mod compaction_fail_closed;
 mod compaction_redaction;

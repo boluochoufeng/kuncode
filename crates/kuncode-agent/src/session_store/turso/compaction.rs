@@ -2,7 +2,8 @@
 //!
 //! Version 1 commits these records but does not read them to restore runtime context.
 
-use sqlx::SqlitePool;
+use ::turso::{Connection, transaction::TransactionBehavior};
+use tokio::sync::Mutex;
 
 use crate::session_store::{
     CommittedCompaction, JournalKind, NewCompactionCommit, Seq, SessionStoreError,
@@ -11,63 +12,79 @@ use crate::session_store::{
 
 use crate::session_store::hash::is_canonical_sha256;
 
-use super::{checkpoint, head::compare_and_lock, next_seq, timestamp, touch_session};
+use super::{checkpoint, compare_and_lock, next_seq, timestamp, touch_session};
 
 pub(super) async fn commit(
-    pool: &SqlitePool,
+    connection: &Mutex<Connection>,
     commit: NewCompactionCommit,
 ) -> Result<CommittedCompaction, SessionStoreError> {
     validate_commit(&commit)?;
-    let mut tx = pool.begin().await?;
-    // The writer lock preserves the candidate's source head until the compaction
-    // fact, checkpoint row, and checkpoint reference become atomically visible.
-    compare_and_lock(&mut tx, &commit.session_id, commit.expected_journal_head).await?;
-    let now = timestamp();
-    let compaction_seq = next_seq(&mut tx, &commit.session_id).await?;
-    let payload = serde_json::json!({
-        "schema_version": 2,
-        "input_hash": commit.event.input_hash(),
-        "output_hash": commit.event.output_hash(),
-        "source_seq_start": commit.event.source_seq_start().get(),
-        "source_seq_end": commit.event.source_seq_end().get(),
-        "reason": commit.event.metadata().reason().as_str(),
-        "passes": commit
-            .event
-            .metadata()
-            .passes()
-            .iter()
-            .map(|pass| pass.as_str())
-            .collect::<Vec<_>>(),
-        "summary": commit.event.metadata().summary_json(),
-        "model": commit.event.metadata().model(),
-        "token_usage": commit.event.metadata().token_usage_json(),
-    });
-    sqlx::query(
-        r#"
-        INSERT INTO journal_entries (session_id, seq, kind, payload_json, created_at)
-        VALUES (?, ?, ?, ?, ?)
-        "#,
-    )
-    .bind(commit.session_id.as_str())
-    .bind(compaction_seq.get())
-    .bind(JournalKind::Compaction.as_str())
-    .bind(serde_json::to_string(&payload)?)
-    .bind(&now)
-    .execute(&mut *tx)
-    .await?;
+    let mut connection = connection.lock().await;
+    let tx = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .await?;
+    let outcome = async {
+        // The CAS preserves the candidate's source head until every compaction
+        // fact becomes atomically visible.
+        compare_and_lock(&tx, &commit.session_id, commit.expected_journal_head).await?;
+        let now = timestamp();
+        let compaction_seq = next_seq(&tx, &commit.session_id).await?;
+        let payload = serde_json::json!({
+            "schema_version": 2,
+            "input_hash": commit.event.input_hash(),
+            "output_hash": commit.event.output_hash(),
+            "source_seq_start": commit.event.source_seq_start().get(),
+            "source_seq_end": commit.event.source_seq_end().get(),
+            "reason": commit.event.metadata().reason().as_str(),
+            "passes": commit
+                .event
+                .metadata()
+                .passes()
+                .iter()
+                .map(|pass| pass.as_str())
+                .collect::<Vec<_>>(),
+            "summary": commit.event.metadata().summary_json(),
+            "model": commit.event.metadata().model(),
+            "token_usage": commit.event.metadata().token_usage_json(),
+        });
+        tx.execute(
+            r#"
+            INSERT INTO journal_entries (session_id, seq, kind, payload_json, created_at)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            "#,
+            ::turso::params![
+                commit.session_id.as_str(),
+                compaction_seq.get(),
+                JournalKind::Compaction.as_str(),
+                serde_json::to_string(&payload)?,
+                now.as_str(),
+            ],
+        )
+        .await?;
 
-    let checkpoint_seq = next_seq(&mut tx, &commit.session_id).await?;
-    checkpoint::insert(&mut tx, &commit.checkpoint, checkpoint_seq, &now).await?;
-    touch_session(&mut tx, &commit.session_id, &now).await?;
-    tx.commit()
-        .await
-        .map_err(|error| SessionStoreError::commit_outcome_unknown("commit compaction", error))?;
-    Ok(CommittedCompaction::new(
-        commit.session_id,
-        compaction_seq,
-        checkpoint_seq,
-        commit.event.output_hash().to_owned(),
-    ))
+        let checkpoint_seq = next_seq(&tx, &commit.session_id).await?;
+        checkpoint::insert(&tx, &commit.checkpoint, checkpoint_seq, &now).await?;
+        touch_session(&tx, &commit.session_id, &now).await?;
+        Ok(CommittedCompaction::new(
+            commit.session_id.clone(),
+            compaction_seq,
+            checkpoint_seq,
+            commit.event.output_hash().to_owned(),
+        ))
+    }
+    .await;
+    match outcome {
+        Ok(committed) => {
+            tx.commit().await.map_err(|error| {
+                SessionStoreError::commit_outcome_unknown("commit compaction", error)
+            })?;
+            Ok(committed)
+        }
+        Err(error) => {
+            tx.rollback().await?;
+            Err(error)
+        }
+    }
 }
 
 fn validate_commit(commit: &NewCompactionCommit) -> Result<(), SessionStoreError> {

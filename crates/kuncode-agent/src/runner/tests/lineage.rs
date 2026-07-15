@@ -1,6 +1,6 @@
 use super::support::{
     AgentConfig, AgentRunner, AgentSession, Arc, AssistantContent, FakeModel, NewSession,
-    ScriptedHook, Seq, SessionStore, SqliteSessionStore, TestDir, ToolRegistry, bash, response,
+    ScriptedHook, Seq, SessionStore, TestDir, ToolRegistry, TursoSessionStore, bash, response,
 };
 
 // Verifies that only direct turn input receives human-authored lineage.
@@ -9,7 +9,7 @@ use super::support::{
 async fn only_real_prompt_is_human_and_durable_appends_get_exact_coverage() {
     let root = TestDir::new();
     let store = Arc::new(
-        SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+        TursoSessionStore::open(root.path().join("sessions.db"))
             .await
             .expect("store should open"),
     );

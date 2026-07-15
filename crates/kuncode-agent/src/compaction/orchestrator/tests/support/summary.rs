@@ -16,7 +16,7 @@ use crate::{
         WorkspaceSummary, build_summary_prompt,
     },
     session_store::{
-        JournalKind, NewJournalEntry, Seq, SessionId, SessionStore, sqlite::SqliteSessionStore,
+        JournalKind, NewJournalEntry, Seq, SessionId, SessionStore, turso::TursoSessionStore,
     },
 };
 
@@ -25,7 +25,7 @@ pub(crate) enum SummaryBehavior {
     Malformed,
     ProviderFailure,
     AppendDuringCall {
-        store: Arc<SqliteSessionStore>,
+        store: Arc<TursoSessionStore>,
         session_id: SessionId,
     },
 }
