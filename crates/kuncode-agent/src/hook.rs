@@ -9,7 +9,7 @@
 //! [`PermissionGate`](crate::permission::PermissionGate) did not — `PreToolOutcome`
 //! has no `Allow`, so "a hook cannot bypass the gate" holds at the type level.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use kuncode_core::completion::Message;
@@ -226,11 +226,32 @@ impl Hooks {
     /// concatenated in registration order.
     pub async fn user_prompt_submit(&self, cx: &PromptCx<'_>) -> PromptOutcome {
         let mut contexts = Vec::new();
-        for hook in &self.0 {
+        for (hook_index, hook) in self.0.iter().enumerate() {
+            let started = Instant::now();
             match hook.user_prompt_submit(cx).await {
-                PromptOutcome::Proceed => {}
-                PromptOutcome::AddContext(text) => contexts.push(text),
-                block @ PromptOutcome::Block { .. } => return block,
+                PromptOutcome::Proceed => {
+                    log_hook("user_prompt_submit", hook_index, "proceed", 0, started)
+                }
+                PromptOutcome::AddContext(text) => {
+                    log_hook(
+                        "user_prompt_submit",
+                        hook_index,
+                        "add_context",
+                        text.chars().count(),
+                        started,
+                    );
+                    contexts.push(text);
+                }
+                PromptOutcome::Block { reason } => {
+                    log_hook(
+                        "user_prompt_submit",
+                        hook_index,
+                        "block",
+                        reason.chars().count(),
+                        started,
+                    );
+                    return PromptOutcome::Block { reason };
+                }
             }
         }
         fold_additive(contexts).map_or(PromptOutcome::Proceed, PromptOutcome::AddContext)
@@ -238,9 +259,30 @@ impl Hooks {
 
     /// Veto-first: the first `Deny` short-circuits the rest.
     pub async fn pre_tool_use(&self, cx: &PreToolCx<'_>) -> PreToolOutcome {
-        for hook in &self.0 {
-            if let deny @ PreToolOutcome::Deny { .. } = hook.pre_tool_use(cx).await {
-                return deny;
+        for (hook_index, hook) in self.0.iter().enumerate() {
+            let started = Instant::now();
+            match hook.pre_tool_use(cx).await {
+                PreToolOutcome::Proceed => log_hook_with_tool(
+                    "pre_tool_use",
+                    hook_index,
+                    "proceed",
+                    &cx.request.tool,
+                    cx.iteration,
+                    0,
+                    started,
+                ),
+                PreToolOutcome::Deny { message } => {
+                    log_hook_with_tool(
+                        "pre_tool_use",
+                        hook_index,
+                        "deny",
+                        &cx.request.tool,
+                        cx.iteration,
+                        message.chars().count(),
+                        started,
+                    );
+                    return PreToolOutcome::Deny { message };
+                }
             }
         }
         PreToolOutcome::Proceed
@@ -249,9 +291,30 @@ impl Hooks {
     /// Additive: every hook runs; all feedback is concatenated in order.
     pub async fn post_tool_use(&self, cx: &PostToolCx<'_>) -> PostToolOutcome {
         let mut feedback = Vec::new();
-        for hook in &self.0 {
-            if let PostToolOutcome::AddFeedback(text) = hook.post_tool_use(cx).await {
-                feedback.push(text);
+        for (hook_index, hook) in self.0.iter().enumerate() {
+            let started = Instant::now();
+            match hook.post_tool_use(cx).await {
+                PostToolOutcome::Proceed => log_hook_with_tool(
+                    "post_tool_use",
+                    hook_index,
+                    "proceed",
+                    cx.tool,
+                    cx.iteration,
+                    0,
+                    started,
+                ),
+                PostToolOutcome::AddFeedback(text) => {
+                    log_hook_with_tool(
+                        "post_tool_use",
+                        hook_index,
+                        "add_feedback",
+                        cx.tool,
+                        cx.iteration,
+                        text.chars().count(),
+                        started,
+                    );
+                    feedback.push(text);
+                }
             }
         }
         fold_additive(feedback).map_or(PostToolOutcome::Proceed, PostToolOutcome::AddFeedback)
@@ -261,15 +324,93 @@ impl Hooks {
     /// (all continuation messages joined into one injection).
     pub async fn stop(&self, cx: &StopCx<'_>) -> StopOutcome {
         let mut messages = Vec::new();
-        for hook in &self.0 {
-            if let StopOutcome::Continue { message } = hook.stop(cx).await {
-                messages.push(message);
+        for (hook_index, hook) in self.0.iter().enumerate() {
+            let started = Instant::now();
+            match hook.stop(cx).await {
+                StopOutcome::Allow => {
+                    log_hook_with_iteration("stop", hook_index, "allow", cx.iteration, 0, started)
+                }
+                StopOutcome::Continue { message } => {
+                    log_hook_with_iteration(
+                        "stop",
+                        hook_index,
+                        "continue",
+                        cx.iteration,
+                        message.chars().count(),
+                        started,
+                    );
+                    messages.push(message);
+                }
             }
         }
         fold_additive(messages).map_or(StopOutcome::Allow, |message| StopOutcome::Continue {
             message,
         })
     }
+}
+
+fn log_hook(
+    hook: &str,
+    hook_index: usize,
+    outcome: &str,
+    contribution_chars: usize,
+    started: Instant,
+) {
+    tracing::info!(
+        target: "kuncode::hook",
+        hook,
+        hook_index,
+        outcome,
+        contribution_chars,
+        latency_ms = elapsed_ms(started),
+        "hook completed",
+    );
+}
+
+fn log_hook_with_tool(
+    hook: &str,
+    hook_index: usize,
+    outcome: &str,
+    tool: &str,
+    iteration: usize,
+    contribution_chars: usize,
+    started: Instant,
+) {
+    tracing::info!(
+        target: "kuncode::hook",
+        hook,
+        hook_index,
+        outcome,
+        tool,
+        iteration,
+        contribution_chars,
+        latency_ms = elapsed_ms(started),
+        "hook completed",
+    );
+}
+
+fn log_hook_with_iteration(
+    hook: &str,
+    hook_index: usize,
+    outcome: &str,
+    iteration: usize,
+    contribution_chars: usize,
+    started: Instant,
+) {
+    tracing::info!(
+        target: "kuncode::hook",
+        hook,
+        hook_index,
+        outcome,
+        iteration,
+        contribution_chars,
+        latency_ms = elapsed_ms(started),
+        "hook completed",
+    );
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Joins accumulated additive contributions, or `None` when there were none.

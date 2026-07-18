@@ -172,7 +172,14 @@ impl AgentSession {
     pub fn mark_persistence_failed(&mut self, reason: impl Into<String>) {
         self.non_durable = true;
         if self.persistence_error.is_none() {
-            self.persistence_error = Some(format!("session persistence failed: {}", reason.into()));
+            let reason = reason.into();
+            tracing::warn!(
+                target: "kuncode::persistence",
+                session_id = self.session_id.as_ref().map_or("-", SessionId::as_str),
+                diagnostic_chars = reason.chars().count(),
+                "session persistence authority lost",
+            );
+            self.persistence_error = Some(format!("session persistence failed: {reason}"));
         }
     }
 

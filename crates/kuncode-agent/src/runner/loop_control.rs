@@ -82,7 +82,15 @@ where
                         cancellable(cancel, self.hooks.stop(&cx)).await
                     };
                     match outcome {
-                        None => return Err((Some(iteration), AgentError::Cancelled)),
+                        None => {
+                            tracing::info!(
+                                target: "kuncode::hook",
+                                hook = "stop",
+                                iteration,
+                                "hook cancelled",
+                            );
+                            return Err((Some(iteration), AgentError::Cancelled));
+                        }
                         Some(StopOutcome::Allow) => {}
                         Some(StopOutcome::Continue { message }) => {
                             stop_continuations += 1;

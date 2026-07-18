@@ -79,7 +79,9 @@ where
     // Capture the mouse so the wheel scrolls the conversation instead of the
     // terminal's own scrollback. Best-effort: a terminal that refuses it just
     // loses wheel scrolling, and PageUp/PageDown still work.
-    let _ = execute!(io::stdout(), EnableMouseCapture);
+    if let Err(error) = execute!(io::stdout(), EnableMouseCapture) {
+        log_tui_io("enable_mouse_capture", &error, false);
+    }
     let result = event_loop(
         &mut terminal,
         &runner,
@@ -89,9 +91,17 @@ where
         &mut approval_rx,
     )
     .await;
-    let _ = execute!(io::stdout(), DisableMouseCapture);
-    ratatui::restore();
-    result
+    if let Err(error) = execute!(io::stdout(), DisableMouseCapture) {
+        log_tui_io("disable_mouse_capture", &error, false);
+    }
+    let restore_result = ratatui::try_restore();
+    if let Err(error) = &restore_result {
+        log_tui_io("restore_terminal", error, true);
+    }
+    match (result, restore_result) {
+        (Err(error), _) | (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
 }
 
 /// Idle loop: render, read a key, and either edit the input box or — on submit —
@@ -107,7 +117,7 @@ async fn event_loop<M: CompletionModel>(
     let mut events = EventStream::new();
 
     while !app.should_quit {
-        terminal.draw(|frame| ui::draw(frame, app))?;
+        io_stage("idle_draw", terminal.draw(|frame| ui::draw(frame, app)))?;
 
         match events.next().await {
             Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
@@ -130,7 +140,7 @@ async fn event_loop<M: CompletionModel>(
             }
             Some(Ok(Event::Mouse(mouse))) => handle_scroll(app, mouse),
             Some(Ok(_)) => {} // resize / non-press keys
-            Some(Err(err)) => return Err(err),
+            Some(Err(error)) => return Err(log_tui_io("idle_input", &error, true)),
             None => break, // stdin closed
         }
     }
@@ -154,6 +164,7 @@ async fn run_one_turn<M: CompletionModel>(
     event_rx: &mut UnboundedReceiver<AgentEvent>,
     approval_rx: &mut UnboundedReceiver<ApprovalRequest>,
 ) -> io::Result<()> {
+    crate::logging::log_prompt_preview(&input);
     let cancel = CancellationToken::new();
     let mut outcome = None;
     // Once the input stream ends, stop selecting on it so a perpetually-ready
@@ -168,7 +179,10 @@ async fn run_one_turn<M: CompletionModel>(
     {
         let mut turn = Box::pin(runner.run_turn_with(session, input, cancel.clone()));
         // Paint the running state immediately; subsequent redraws ride the clock.
-        terminal.draw(|frame| ui::draw(frame, app))?;
+        io_stage(
+            "turn_initial_draw",
+            terminal.draw(|frame| ui::draw(frame, app)),
+        )?;
         while outcome.is_none() {
             tokio::select! {
                 result = &mut turn => outcome = Some(result),
@@ -177,7 +191,10 @@ async fn run_one_turn<M: CompletionModel>(
                 // fixed cadence rather than once per streamed token.
                 _ = frame.tick() => {
                     app.advance_reveal(FRAME_INTERVAL, REVEAL_CPS);
-                    terminal.draw(|frame| ui::draw(frame, app))?;
+                    io_stage(
+                        "turn_stream_draw",
+                        terminal.draw(|frame| ui::draw(frame, app)),
+                    )?;
                 }
                 Some(event) = event_rx.recv() => app.apply_event(event.kind),
                 Some(req) = approval_rx.recv() => app.set_approval(req),
@@ -191,7 +208,9 @@ async fn run_one_turn<M: CompletionModel>(
                         // IO broke, so unwind to the shared restore-and-exit path
                         // rather than swallowing it (and risking a busy redraw on a
                         // persistently-ready error).
-                        Some(Err(err)) => return Err(err),
+                        Some(Err(error)) => {
+                            return Err(log_tui_io("turn_input", &error, true));
+                        }
                         None => events_closed = true,
                         _ => {}
                     }
@@ -218,7 +237,10 @@ async fn run_one_turn<M: CompletionModel>(
             while app.has_pending_reveal() && waited < MAX_DRAIN {
                 frame.tick().await;
                 app.advance_reveal(FRAME_INTERVAL, REVEAL_CPS);
-                terminal.draw(|frame| ui::draw(frame, app))?;
+                io_stage(
+                    "turn_drain_draw",
+                    terminal.draw(|frame| ui::draw(frame, app)),
+                )?;
                 waited += FRAME_INTERVAL;
             }
             app.push_assistant(text);
@@ -228,6 +250,33 @@ async fn run_one_turn<M: CompletionModel>(
     }
 
     Ok(())
+}
+
+fn io_stage<T>(stage: &str, result: io::Result<T>) -> io::Result<T> {
+    result.map_err(|error| log_tui_io(stage, &error, true))
+}
+
+fn log_tui_io(stage: &str, error: &io::Error, fatal: bool) -> io::Error {
+    if fatal {
+        tracing::error!(
+            target: "kuncode::runtime",
+            component = "tui",
+            stage,
+            io_kind = ?error.kind(),
+            diagnostic_chars = error.to_string().chars().count(),
+            "terminal I/O failed",
+        );
+    } else {
+        tracing::warn!(
+            target: "kuncode::runtime",
+            component = "tui",
+            stage,
+            io_kind = ?error.kind(),
+            diagnostic_chars = error.to_string().chars().count(),
+            "optional terminal feature unavailable",
+        );
+    }
+    io::Error::new(error.kind(), error.to_string())
 }
 
 /// Handles a key in the idle state. Returns `Some(input)` when Enter submits a

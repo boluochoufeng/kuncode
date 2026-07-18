@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use kuncode_agent::observer::AgentObserver;
+use kuncode_agent::observer::{AgentObserver, CompositeObserver};
 use kuncode_agent::permission::{Approver, PermissionMode, PermissionPolicy};
 use kuncode_agent::registry::ToolRegistry;
 use kuncode_agent::runner::{AgentCompactionConfigError, AgentConfig, AgentRunner};
@@ -27,9 +27,9 @@ use kuncode_agent::workspace::Workspace;
 use kuncode_core::completion::{CompletionModel, RetryModel, RetryPolicy};
 use kuncode_core::providers::deepseek::{DeepSeekClient, DeepSeekCompletionModel};
 
-use crate::Cli;
 use crate::config::{PermissionFlags, resolve_permissions};
 use crate::settings::{ProjectSettings, load_project_settings};
+use crate::{Cli, logging::LoggingObserver};
 
 /// Identity and behavioral instructions rendered as the first system-prompt
 /// block. Folds in guidance to maintain a plan via `todo_write`.
@@ -79,6 +79,11 @@ impl CliRuntime<RetryModel<DeepSeekCompletionModel>> {
     /// retained as degraded persistence state rather than failing assembly.
     pub async fn assemble(cli: &Cli) -> Result<Self, Box<dyn std::error::Error>> {
         let workspace = Workspace::from_current_dir().await?;
+        tracing::debug!(
+            target: "kuncode::runtime",
+            project_root = %workspace.root().display(),
+            "workspace resolved",
+        );
 
         // The merge is pure and tested in `config`; loading the project file
         // (I/O) stays in `settings`.
@@ -92,6 +97,15 @@ impl CliRuntime<RetryModel<DeepSeekCompletionModel>> {
             mode: cli.mode.as_deref(),
         };
         let resolved = resolve_permissions(project, &flags)?;
+        tracing::info!(
+            target: "kuncode::runtime",
+            model = %model_name,
+            permission_mode = ?resolved.mode,
+            max_iterations = config.max_iterations,
+            max_tokens = ?config.max_tokens,
+            compaction_enabled = config.compaction.is_some(),
+            "runtime settings resolved",
+        );
 
         // Built before `workspace` is moved into the registry below.
         let system_prompt = SystemPrompt::new(vec![
@@ -107,10 +121,29 @@ impl CliRuntime<RetryModel<DeepSeekCompletionModel>> {
         let (session_store, persistence_error): (Option<Arc<dyn SessionStore>>, Option<String>) =
             match std::env::home_dir() {
                 Some(home) => match TursoSessionStore::open(session_store_path(&home)).await {
-                    Ok(store) => (Some(Arc::new(store)), None),
-                    Err(error) => (None, Some(error.to_string())),
+                    Ok(store) => {
+                        tracing::debug!(
+                            target: "kuncode::persistence",
+                            "session store opened",
+                        );
+                        (Some(Arc::new(store)), None)
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "kuncode::persistence",
+                            diagnostic_chars = error.to_string().chars().count(),
+                            "session store unavailable",
+                        );
+                        (None, Some(error.to_string()))
+                    }
                 },
-                None => (None, Some("home directory unavailable".to_string())),
+                None => {
+                    tracing::warn!(
+                        target: "kuncode::persistence",
+                        "session store unavailable because home directory is missing",
+                    );
+                    (None, Some("home directory unavailable".to_string()))
+                }
             };
         let client = DeepSeekClient::from_env()?;
         // Normal turns inherit the default retry budget. Semantic summaries use
@@ -183,8 +216,21 @@ impl<M: CompletionModel> CliRuntime<M> {
                 .start_durable_session(store.as_ref(), NewSession::new(self.project_root.clone()))
                 .await
             {
-                Ok(()) => {}
-                Err(error) => session.mark_persistence_failed(error.to_string()),
+                Ok(()) => tracing::info!(
+                    target: "kuncode::persistence",
+                    session_id = session
+                        .session_id()
+                        .map_or("-", kuncode_agent::session_store::SessionId::as_str),
+                    "durable session started",
+                ),
+                Err(error) => {
+                    tracing::warn!(
+                        target: "kuncode::persistence",
+                        diagnostic_chars = error.to_string().chars().count(),
+                        "durable session creation failed",
+                    );
+                    session.mark_persistence_failed(error.to_string());
+                }
             },
             (None, Some(error)) => session.mark_persistence_failed(error.clone()),
             (None, None) => {}
@@ -200,6 +246,10 @@ impl<M: CompletionModel> CliRuntime<M> {
         approver: Arc<dyn Approver>,
         observer: Arc<dyn AgentObserver>,
     ) -> AgentRunner<M> {
+        let observer = Arc::new(CompositeObserver(vec![
+            observer,
+            Arc::new(LoggingObserver) as Arc<dyn AgentObserver>,
+        ]));
         let runner = AgentRunner::with_config(self.model, self.registry, self.config)
             .with_summary_model(self.summary_model)
             .with_system_prompt(self.system_prompt)

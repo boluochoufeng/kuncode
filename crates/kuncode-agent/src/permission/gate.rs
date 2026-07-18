@@ -21,7 +21,7 @@
 //! [`PermissionGate`] is a borrowed view over the runner's policy / approver /
 //! registry, so a test builds it from hand-made parts — no model or loop needed.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use crate::{
     permission::{
@@ -112,14 +112,22 @@ impl PermissionGate<'_> {
         ctx: &ToolContext,
     ) -> Decision {
         let resource = request.resource.as_deref().unwrap_or("-");
+        let started = Instant::now();
 
         match evaluate(self.policy, state, request) {
             Verdict::Allow => {
-                audit(request, resource, "allow", None);
+                audit(request, resource, "allow", None, false, started);
                 Decision::Allow
             }
             Verdict::Deny(reason) => {
-                audit(request, resource, "deny", Some(&reason.rule));
+                audit(
+                    request,
+                    resource,
+                    "deny",
+                    Some(&reason.rule),
+                    false,
+                    started,
+                );
                 Decision::Deny(rule_denied_output(&reason))
             }
             Verdict::Ask => {
@@ -131,25 +139,39 @@ impl PermissionGate<'_> {
                 };
                 match outcome {
                     ApprovalOutcome::AllowOnce => {
-                        audit(request, resource, "allow_once", None);
+                        audit(request, resource, "allow_once", None, true, started);
                         Decision::Allow
                     }
                     ApprovalOutcome::AllowAlways(rule) => {
-                        audit(request, resource, "allow_always", Some(&rule.raw));
+                        audit(
+                            request,
+                            resource,
+                            "allow_always",
+                            Some(&rule.raw),
+                            true,
+                            started,
+                        );
                         state.grant_allow(rule);
                         Decision::Allow
                     }
                     ApprovalOutcome::DenyOnce => {
-                        audit(request, resource, "deny_once", None);
+                        audit(request, resource, "deny_once", None, true, started);
                         Decision::Deny(user_denied_output(false))
                     }
                     ApprovalOutcome::DenyAlways(rule) => {
-                        audit(request, resource, "deny_always", Some(&rule.raw));
+                        audit(
+                            request,
+                            resource,
+                            "deny_always",
+                            Some(&rule.raw),
+                            true,
+                            started,
+                        );
                         state.grant_deny(rule);
                         Decision::Deny(user_denied_output(true))
                     }
                     ApprovalOutcome::Abort => {
-                        audit(request, resource, "abort", None);
+                        audit(request, resource, "abort", None, true, started);
                         Decision::Abort
                     }
                 }
@@ -158,19 +180,31 @@ impl PermissionGate<'_> {
     }
 }
 
-/// Emits one structured permission audit event. With no `tracing`
-/// subscriber installed this is a no-op; the CLI installs one so `RUST_LOG`
-/// surfaces decisions.
-fn audit(request: &PermissionRequest, resource: &str, decision: &str, rule: Option<&str>) {
+/// Emits one structured permission audit event without recording the resource
+/// or rule body, both of which may contain source paths or shell arguments.
+fn audit(
+    request: &PermissionRequest,
+    resource: &str,
+    decision: &str,
+    rule: Option<&str>,
+    approval_required: bool,
+    started: Instant,
+) {
     tracing::info!(
         target: "kuncode::permission",
         tool = %request.tool,
         action = ?request.action,
-        resource = %resource,
+        resource_chars = resource.chars().count(),
         decision = %decision,
-        rule = rule.unwrap_or("-"),
+        matched_rule = rule.is_some(),
+        approval_required,
+        latency_ms = elapsed_ms(started),
         "permission decision",
     );
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Builds the model-recoverable output for a request blocked by a rule

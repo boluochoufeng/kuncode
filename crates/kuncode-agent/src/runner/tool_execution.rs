@@ -1,5 +1,7 @@
 //! Tool-batch execution, result pairing, and transcript recording.
 
+use std::time::Instant;
+
 use kuncode_core::{
     completion::{
         AssistantContent, CompletionModel, Message, ToolResult, ToolResultContent, UserContent,
@@ -44,12 +46,28 @@ where
             // Snapshot the plan generation so a successful `todo_write` is
             // detected by the counter advancing — generic, no tool-name check.
             let todo_generation = session.todo_generation();
+            let started = Instant::now();
 
             match self
                 .gated_call(session, iteration, &id, &name, arguments, &ctx)
                 .await
             {
                 Ok(outcome) => {
+                    tracing::debug!(
+                        target: "kuncode::tool",
+                        iteration,
+                        tool_call_id = %id,
+                        tool = %name,
+                        executed = outcome.executed,
+                        ok = outcome.output.ok,
+                        error_kind = outcome
+                            .output
+                            .error
+                            .as_ref()
+                            .map_or("-", |error| error.kind.as_str()),
+                        pipeline_latency_ms = elapsed_ms(started),
+                        "tool call pipeline finished",
+                    );
                     // Snapshot the output for PostToolUse before record_result
                     // consumes it — only when a hook could actually use it.
                     let post_output = (outcome.executed && !self.hooks.is_empty())
@@ -82,6 +100,13 @@ where
                             // (re-pairing `index` would double-write it). Buffered
                             // feedback is dropped — the turn is unwinding.
                             None => {
+                                tracing::info!(
+                                    target: "kuncode::hook",
+                                    hook = "post_tool_use",
+                                    iteration,
+                                    tool = %name,
+                                    "hook cancelled",
+                                );
                                 self.pair_unpaired(session, iteration, &tool_calls[index + 1..])
                                     .await;
                                 return Err(AgentError::Cancelled);
@@ -92,6 +117,15 @@ where
                     }
                 }
                 Err(error) => {
+                    tracing::warn!(
+                        target: "kuncode::tool",
+                        iteration,
+                        tool_call_id = %id,
+                        tool = %name,
+                        error_kind = agent_error_kind(&error),
+                        pipeline_latency_ms = elapsed_ms(started),
+                        "tool call pipeline aborted the turn",
+                    );
                     // The turn is unwinding with this tool_call — and any that
                     // follow it — still unpaired. Pair `index` *honestly by why*:
                     // a harness tool error did run and fail (don't relabel it
@@ -201,6 +235,23 @@ where
             retention,
         )
         .await;
+    }
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn agent_error_kind(error: &AgentError) -> &'static str {
+    match error {
+        AgentError::Completion(_) => "completion",
+        AgentError::Tool { .. } => "tool",
+        AgentError::EmptyTranscript => "empty_transcript",
+        AgentError::RequestEncoding(_) => "request_encoding",
+        AgentError::Compaction { .. } => "compaction",
+        AgentError::Cancelled => "cancelled",
+        AgentError::PromptBlocked { .. } => "prompt_blocked",
+        AgentError::MaxIterations { .. } => "max_iterations",
     }
 }
 

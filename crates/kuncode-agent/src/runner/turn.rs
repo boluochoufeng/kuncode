@@ -1,5 +1,7 @@
 //! Public turn entry points and turn-level hook handling.
 
+use std::time::Instant;
+
 use kuncode_core::completion::CompletionModel;
 use tokio_util::sync::CancellationToken;
 
@@ -45,6 +47,12 @@ where
         cancel: CancellationToken,
     ) -> Result<AgentTurn, AgentError> {
         let prompt = prompt.into();
+        tracing::debug!(
+            target: "kuncode::agent",
+            session_id = session.session_id().map_or("-", |id| id.as_str()),
+            prompt_chars = prompt.chars().count(),
+            "user prompt accepted by runner",
+        );
 
         // `UserPromptSubmit` is a *pre-commit* hook: it runs before the prompt
         // enters the transcript, so a `Block` rejects the input without leaving
@@ -61,7 +69,14 @@ where
                 cancellable(&cancel, self.hooks.user_prompt_submit(&cx)).await
             };
             match outcome {
-                None => return Err(self.terminal_error(session, None, AgentError::Cancelled)),
+                None => {
+                    tracing::info!(
+                        target: "kuncode::hook",
+                        hook = "user_prompt_submit",
+                        "hook cancelled",
+                    );
+                    return Err(self.terminal_error(session, None, AgentError::Cancelled));
+                }
                 Some(PromptOutcome::Proceed) => self.push_human_message(session, prompt).await,
                 Some(PromptOutcome::AddContext(context)) => {
                     self.push_human_message(session, prompt).await;
@@ -107,6 +122,13 @@ where
         session: &mut AgentSession,
         cancel: CancellationToken,
     ) -> Result<AgentTurn, AgentError> {
+        let started = Instant::now();
+        tracing::info!(
+            target: "kuncode::agent",
+            session_id = session.session_id().map_or("-", |id| id.as_str()),
+            message_count = session.messages().len(),
+            "agent turn started",
+        );
         let result = self.run_loop(session, &cancel).await;
         // Drained here — after the loop, not per iteration — so the turn's
         // *final* pushes (the closing assistant message, the last tool batch,
@@ -115,8 +137,29 @@ where
         // in those last writes escape unreported forever.
         self.warn_persistence(session);
         match result {
-            Ok(turn) => Ok(turn),
-            Err((iteration, error)) => Err(self.terminal_error(session, iteration, error)),
+            Ok(turn) => {
+                tracing::info!(
+                    target: "kuncode::agent",
+                    session_id = session.session_id().map_or("-", |id| id.as_str()),
+                    iterations = turn.iterations,
+                    input_tokens = turn.usage.input_tokens,
+                    output_tokens = turn.usage.output_tokens,
+                    total_tokens = turn.usage.total_tokens,
+                    latency_ms = elapsed_ms(started),
+                    "agent turn completed",
+                );
+                Ok(turn)
+            }
+            Err((iteration, error)) => {
+                tracing::warn!(
+                    target: "kuncode::agent",
+                    session_id = session.session_id().map_or("-", |id| id.as_str()),
+                    iteration = ?iteration,
+                    latency_ms = elapsed_ms(started),
+                    "agent turn unwinding",
+                );
+                Err(self.terminal_error(session, iteration, error))
+            }
         }
     }
 
@@ -136,4 +179,8 @@ where
             self.emit(session, None, EventKind::Warning { message });
         }
     }
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }

@@ -1,5 +1,7 @@
 //! Permission, hook, cancellation, and dispatch gates for one tool call.
 
+use std::time::Instant;
+
 use kuncode_core::completion::CompletionModel;
 
 use crate::{
@@ -50,13 +52,38 @@ where
 
         // prepare: resolve + parse. An unknown tool / bad arguments never produce
         // a request, so they short-circuit here with no `ToolStart`.
+        let prepare_started = Instant::now();
         let (tool, arguments, request) = match gate.prepare(name, arguments, ctx) {
             Prepared::Ready {
                 tool,
                 args,
                 request,
-            } => (tool, args, request),
+            } => {
+                tracing::debug!(
+                    target: "kuncode::tool",
+                    iteration,
+                    tool_call_id,
+                    tool = name,
+                    outcome = "ready",
+                    latency_ms = elapsed_ms(prepare_started),
+                    "tool preparation completed",
+                );
+                (tool, args, request)
+            }
             Prepared::Rejected(output) => {
+                tracing::debug!(
+                    target: "kuncode::tool",
+                    iteration,
+                    tool_call_id,
+                    tool = name,
+                    outcome = "rejected",
+                    error_kind = output
+                        .error
+                        .as_ref()
+                        .map_or("-", |error| error.kind.as_str()),
+                    latency_ms = elapsed_ms(prepare_started),
+                    "tool preparation completed",
+                );
                 return Ok(CallOutcome {
                     output,
                     executed: false,
@@ -94,7 +121,16 @@ where
                 cancellable(&ctx.cancel, self.hooks.pre_tool_use(&cx)).await
             };
             match pre {
-                None => return Err(AgentError::Cancelled),
+                None => {
+                    tracing::info!(
+                        target: "kuncode::hook",
+                        hook = "pre_tool_use",
+                        iteration,
+                        tool = name,
+                        "hook cancelled",
+                    );
+                    return Err(AgentError::Cancelled);
+                }
                 Some(PreToolOutcome::Proceed) => {}
                 Some(PreToolOutcome::Deny { message }) => {
                     return Ok(CallOutcome {
@@ -115,9 +151,28 @@ where
             Decision::Abort => Err(AgentError::Cancelled),
             // Execute, racing cancellation so a long tool can be interrupted.
             Decision::Allow => {
+                let execution_started = Instant::now();
                 match cancellable(&ctx.cancel, tool.call(arguments.clone(), ctx)).await {
-                    None => Err(AgentError::Cancelled),
+                    None => {
+                        log_execution(
+                            iteration,
+                            tool_call_id,
+                            name,
+                            "cancelled",
+                            None,
+                            execution_started,
+                        );
+                        Err(AgentError::Cancelled)
+                    }
                     Some(Ok(output)) => {
+                        log_execution(
+                            iteration,
+                            tool_call_id,
+                            name,
+                            "completed",
+                            output.error.as_ref().map(|error| error.kind.as_str()),
+                            execution_started,
+                        );
                         let retention = tool.result_retention(&arguments, &output);
                         Ok(CallOutcome {
                             output,
@@ -129,13 +184,64 @@ where
                     // turn-level interrupt. The harness no longer synthesizes this
                     // (a cancelled token loses the race to `None` above), so this is
                     // a defensive arm for a tool that returns it itself.
-                    Some(Err(ToolError::Cancelled)) => Err(AgentError::Cancelled),
-                    Some(Err(source)) => Err(AgentError::Tool {
-                        name: name.to_string(),
-                        source,
-                    }),
+                    Some(Err(ToolError::Cancelled)) => {
+                        log_execution(
+                            iteration,
+                            tool_call_id,
+                            name,
+                            "cancelled",
+                            Some("cancelled"),
+                            execution_started,
+                        );
+                        Err(AgentError::Cancelled)
+                    }
+                    Some(Err(source)) => {
+                        log_execution(
+                            iteration,
+                            tool_call_id,
+                            name,
+                            "harness_error",
+                            Some(tool_error_kind(&source)),
+                            execution_started,
+                        );
+                        Err(AgentError::Tool {
+                            name: name.to_string(),
+                            source,
+                        })
+                    }
                 }
             }
         }
     }
+}
+
+fn log_execution(
+    iteration: usize,
+    tool_call_id: &str,
+    tool: &str,
+    outcome: &str,
+    error_kind: Option<&str>,
+    started: Instant,
+) {
+    tracing::info!(
+        target: "kuncode::tool",
+        iteration,
+        tool_call_id,
+        tool,
+        outcome,
+        error_kind = error_kind.unwrap_or("-"),
+        latency_ms = elapsed_ms(started),
+        "tool execution completed",
+    );
+}
+
+fn tool_error_kind(error: &ToolError) -> &'static str {
+    match error {
+        ToolError::Cancelled => "cancelled",
+        ToolError::Internal(_) => "internal",
+    }
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }

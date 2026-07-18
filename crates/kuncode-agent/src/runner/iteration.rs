@@ -1,5 +1,7 @@
 //! One model iteration and streaming response consumption.
 
+use std::time::Instant;
+
 use futures_util::StreamExt;
 use kuncode_core::{
     completion::{
@@ -32,16 +34,44 @@ where
         // failure never started a model call). On completion error/cancel the
         // turn-terminal `Error` closes it; on success the `Assistant` below does.
         self.emit(session, Some(iteration), EventKind::ModelStart);
+        let started = Instant::now();
         // Race the whole stream (establish + consume) against cancellation.
         // Waiting on the model is the most common place a user hits Ctrl-C, so
         // the token must cover it — not just the later tool approval/execution.
         // Dropping the future drops the stream, which closes the in-flight HTTP
         // response and halts generation.
-        let (choice, usage) =
-            match cancellable(cancel, self.stream_completion(session, iteration, request)).await {
-                Some(result) => result?,
-                None => return Err(AgentError::Cancelled),
-            };
+        let (choice, usage) = match cancellable(
+            cancel,
+            self.stream_completion(session, iteration, request, started),
+        )
+        .await
+        {
+            Some(Ok(result)) => result,
+            Some(Err(error)) => {
+                log_model_failure(iteration, &error, started);
+                return Err(error);
+            }
+            None => {
+                tracing::info!(
+                    target: "kuncode::provider",
+                    iteration,
+                    latency_ms = elapsed_ms(started),
+                    "model request cancelled",
+                );
+                return Err(AgentError::Cancelled);
+            }
+        };
+        tracing::info!(
+            target: "kuncode::provider",
+            iteration,
+            input_tokens = usage.input_tokens,
+            output_tokens = usage.output_tokens,
+            total_tokens = usage.total_tokens,
+            cached_input_tokens = usage.cached_input_tokens,
+            reasoning_tokens = usage.reasoning_tokens,
+            latency_ms = elapsed_ms(started),
+            "model request completed",
+        );
 
         let tool_calls = pending_tool_calls(&choice);
         // Build the event payload before moving `choice` into the transcript;
@@ -91,10 +121,23 @@ where
         session: &mut AgentSession,
         iteration: usize,
         request: CompletionRequest,
+        request_started: Instant,
     ) -> Result<(NonEmptyVec<AssistantContent>, Usage), AgentError> {
         let mut stream = self.model.stream(request).await?;
+        let mut first_event = true;
         while let Some(event) = stream.next().await {
-            match event? {
+            let event = event?;
+            if first_event {
+                tracing::info!(
+                    target: "kuncode::provider",
+                    iteration,
+                    event_kind = stream_event_kind(&event),
+                    time_to_first_event_ms = elapsed_ms(request_started),
+                    "model stream produced its first event",
+                );
+                first_event = false;
+            }
+            match event {
                 StreamEvent::TextDelta(text) => {
                     self.emit(session, Some(iteration), EventKind::TextDelta { text });
                 }
@@ -112,4 +155,44 @@ where
                 .into(),
         )
     }
+}
+
+fn log_model_failure(iteration: usize, error: &AgentError, started: Instant) {
+    let (error_kind, status, is_timeout, is_connect) = match error {
+        AgentError::Completion(CompletionError::HttpError(error)) => {
+            ("http", None, error.is_timeout(), error.is_connect())
+        }
+        AgentError::Completion(CompletionError::ApiError { status, .. }) => {
+            ("api", Some(*status), false, false)
+        }
+        AgentError::Completion(CompletionError::JsonError(_)) => ("json", None, false, false),
+        AgentError::Completion(CompletionError::ResponseError(_)) => {
+            ("response", None, false, false)
+        }
+        AgentError::Completion(CompletionError::RequestError(_)) => ("request", None, false, false),
+        _ => ("agent", None, false, false),
+    };
+    tracing::warn!(
+        target: "kuncode::provider",
+        iteration,
+        error_kind,
+        status = ?status,
+        is_timeout,
+        is_connect,
+        latency_ms = elapsed_ms(started),
+        "model request failed",
+    );
+}
+
+fn stream_event_kind(event: &StreamEvent) -> &'static str {
+    match event {
+        StreamEvent::TextDelta(_) => "text_delta",
+        StreamEvent::ReasoningDelta(_) => "reasoning_delta",
+        StreamEvent::ToolCallStart { .. } => "tool_call_start",
+        StreamEvent::Completed { .. } => "completed",
+    }
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }

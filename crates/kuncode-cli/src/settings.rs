@@ -21,6 +21,7 @@ const DEFAULT_SAFETY_MARGIN: u64 = 16_384;
 const DEFAULT_SUMMARY_MAX_TOKENS: u64 = 16_384;
 const DEFAULT_MAX_ITERATIONS: usize = 50;
 const DEFAULT_TODO_REMINDER_INTERVAL: usize = 3;
+const DEFAULT_LOG_LEVEL: &str = "info";
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -29,6 +30,27 @@ struct SettingsFile {
     model: ModelSection,
     agent: AgentSection,
     compaction: CompactionSection,
+    logging: LoggingSection,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct LoggingSection {
+    level: String,
+}
+
+impl Default for LoggingSection {
+    fn default() -> Self {
+        Self {
+            level: DEFAULT_LOG_LEVEL.to_string(),
+        }
+    }
+}
+
+/// File-log settings needed before the rest of the runtime is assembled.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LoggingSettings {
+    pub(crate) level: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -183,14 +205,36 @@ pub(crate) fn load_project_settings_from(
     root: &Path,
     model_override: Option<&str>,
 ) -> Result<ProjectSettings, SettingsError> {
+    let file = read_settings_file(root)?;
+
+    resolve_settings(file, model_override)
+}
+
+/// Loads only the bootstrap settings required to initialize file logging.
+///
+/// This deliberately skips semantic validation of unrelated runtime sections:
+/// logging must be available to record those later validation failures.
+pub(crate) fn load_logging_settings(root: &Path) -> Result<LoggingSettings, SettingsError> {
+    let logging = read_settings_file(root)?.logging;
+    let level = normalized_log_level(&logging.level).ok_or_else(|| {
+        SettingsError::Logging(format!(
+            "level must be one of off, error, warn, info, debug, or trace; got a value with {} characters",
+            logging.level.chars().count()
+        ))
+    })?;
+    Ok(LoggingSettings {
+        level: level.to_string(),
+    })
+}
+
+fn read_settings_file(root: &Path) -> Result<SettingsFile, SettingsError> {
     let path = root.join(SETTINGS_PATH);
     let file = match std::fs::read_to_string(&path) {
         Ok(raw) => serde_json::from_str(&raw).map_err(SettingsError::Parse)?,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => SettingsFile::default(),
         Err(err) => return Err(SettingsError::Read(err)),
     };
-
-    resolve_settings(file, model_override)
+    Ok(file)
 }
 
 fn resolve_settings(
@@ -212,6 +256,7 @@ fn resolve_settings(
     });
     validate_model_max_tokens(max_tokens, profile)?;
     validate_agent(&file.agent)?;
+    validate_log_level(&file.logging.level)?;
 
     let mut policy = PermissionPolicy::new();
     push_rules(&mut policy.allow, &file.permissions.allow)?;
@@ -347,6 +392,29 @@ fn validate_agent(agent: &AgentSection) -> Result<(), SettingsError> {
     Ok(())
 }
 
+fn validate_log_level(level: &str) -> Result<(), SettingsError> {
+    if normalized_log_level(level).is_some() {
+        Ok(())
+    } else {
+        Err(SettingsError::Logging(format!(
+            "level must be one of off, error, warn, info, debug, or trace; got a value with {} characters",
+            level.chars().count()
+        )))
+    }
+}
+
+fn normalized_log_level(level: &str) -> Option<&'static str> {
+    match level.trim().to_ascii_lowercase().as_str() {
+        "off" => Some("off"),
+        "error" => Some("error"),
+        "warn" => Some("warn"),
+        "info" => Some("info"),
+        "debug" => Some("debug"),
+        "trace" => Some("trace"),
+        _ => None,
+    }
+}
+
 fn default_agent_max_tokens() -> u64 {
     AgentConfig::default().max_tokens.unwrap_or(32_768)
 }
@@ -375,6 +443,8 @@ pub enum SettingsError {
     Model(String),
     /// An agent-loop limit or reminder cadence is invalid.
     Agent(String),
+    /// The file-log level is invalid.
+    Logging(String),
     /// The compaction mode is neither `disabled`, `shadow`, nor `enabled`.
     CompactionMode(String),
     /// Active compaction cannot derive a usable window without `contextLimit`.
@@ -395,6 +465,9 @@ impl std::fmt::Display for SettingsError {
             }
             Self::Agent(message) => {
                 write!(f, "invalid agent settings in {SETTINGS_PATH}: {message}")
+            }
+            Self::Logging(message) => {
+                write!(f, "invalid logging settings in {SETTINGS_PATH}: {message}")
             }
             Self::CompactionMode(mode) => {
                 write!(f, "invalid compaction mode `{mode}` in {SETTINGS_PATH}")
@@ -449,6 +522,70 @@ mod tests {
         assert_eq!(loaded.max_tokens, 65_536);
         assert_eq!(loaded.max_iterations, 50);
         assert_eq!(loaded.todo_reminder_interval, Some(3));
+    }
+
+    #[test]
+    fn logging_level_defaults_to_info() {
+        let dir = std::env::temp_dir().join(format!("kuncode-log-absent-{}", std::process::id()));
+
+        let loaded = load_logging_settings(&dir).expect("a missing file uses logging defaults");
+
+        assert_eq!(loaded.level, "info");
+    }
+
+    #[test]
+    fn loads_logging_level() {
+        let dir = unique_dir("logging-level");
+        fs::write(
+            dir.join(".kuncode/settings.json"),
+            r#"{ "logging": { "level": "debug" } }"#,
+        )
+        .expect("write settings");
+
+        let loaded = load_logging_settings(&dir).expect("logging settings load");
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(loaded.level, "debug");
+    }
+
+    #[test]
+    fn logging_level_is_trimmed_and_normalized() {
+        let dir = unique_dir("logging-level-normalized");
+        fs::write(
+            dir.join(".kuncode/settings.json"),
+            r#"{ "logging": { "level": " DeBuG " } }"#,
+        )
+        .expect("write settings");
+
+        let loaded = load_logging_settings(&dir).expect("logging settings load");
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(loaded.level, "debug");
+    }
+
+    #[test]
+    fn rejects_unknown_logging_level() {
+        let error = load_json(
+            "logging-invalid",
+            r#"{ "logging": { "level": "verbose" } }"#,
+        )
+        .expect_err("unknown log level must fail");
+
+        assert!(matches!(error, SettingsError::Logging(_)));
+    }
+
+    #[test]
+    fn invalid_logging_level_error_does_not_echo_the_value() {
+        let sensitive_value = "GITHUB_PAT=ghp_Example123456789012345678901234";
+        let error = load_json(
+            "logging-sensitive-invalid",
+            &format!(r#"{{ "logging": {{ "level": "{sensitive_value}" }} }}"#),
+        )
+        .expect_err("unknown log level must fail");
+        let rendered = error.to_string();
+
+        assert!(!rendered.contains(sensitive_value));
+        assert!(rendered.contains("characters"));
     }
 
     #[test]

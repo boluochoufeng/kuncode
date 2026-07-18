@@ -1,5 +1,6 @@
 mod approver;
 mod config;
+mod logging;
 mod observer;
 mod runtime;
 mod settings;
@@ -46,14 +47,31 @@ pub(crate) struct Cli {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
-    // Permission decisions log to `kuncode::permission` at INFO; surface them
-    // with e.g. `RUST_LOG=kuncode::permission=info`.
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_writer(io::stderr)
-        .init();
+    // Keep the non-blocking writer alive until every async task has stopped so
+    // shutdown flushes the final turn/error records before the process exits.
+    let _logging_guard = logging::init(std::env::current_dir().ok().as_deref());
+    logging::install_panic_hook();
 
+    let result = run().await;
+    if let Err(error) = &result {
+        tracing::error!(
+            target: "kuncode::runtime",
+            diagnostic_chars = error.to_string().chars().count(),
+            "kuncode exited with an error",
+        );
+    }
+    result
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+
+    tracing::info!(
+        target: "kuncode::runtime",
+        version = env!("CARGO_PKG_VERSION"),
+        interactive = cli.prompt.is_empty(),
+        "kuncode started",
+    );
 
     // All assembly (workspace, settings, permissions, prompt, model, tools)
     // lives in `CliRuntime`; `main` only parses, dispatches, and owns the
@@ -74,6 +92,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(TurnError::Cancelled) => eprintln!("\n^C cancelled"),
             Err(TurnError::Agent(err)) => return Err(err.into()),
         }
+        tracing::info!(target: "kuncode::runtime", "kuncode stopped");
         return Ok(());
     }
 
@@ -84,12 +103,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!(
             "kuncode: 交互模式需要终端。用 `kuncode \"<任务>\"` 传入一次性任务,或在终端中直接运行。"
         );
+        tracing::info!(
+            target: "kuncode::runtime",
+            reason = "interactive_terminal_unavailable",
+            "kuncode stopped",
+        );
         return Ok(());
     }
 
     // Interactive: the TUI wraps the runtime with its own observer + approver
     // before driving the event loop.
     tui::run(runtime).await?;
+    tracing::info!(target: "kuncode::runtime", "kuncode stopped");
     Ok(())
 }
 
@@ -107,6 +132,7 @@ async fn run_turn<M: CompletionModel>(
     session: &mut AgentSession,
     input: String,
 ) -> Result<String, TurnError> {
+    logging::log_prompt_preview(&input);
     let cancel = CancellationToken::new();
     let guard = {
         let cancel = cancel.clone();

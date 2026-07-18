@@ -197,7 +197,15 @@ where
             };
             match NewJournalEntry::message(message) {
                 Ok(entry) => match store.append(&session_id, entry).await {
-                    Ok(seq) => journal_seq = Some(seq),
+                    Ok(seq) => {
+                        tracing::debug!(
+                            target: "kuncode::persistence",
+                            session_id = session_id.as_str(),
+                            journal_seq = seq.get(),
+                            "session message persisted",
+                        );
+                        journal_seq = Some(seq);
+                    }
                     Err(error) => session.mark_persistence_failed(error.to_string()),
                 },
                 Err(error) => session.mark_persistence_failed(error.to_string()),

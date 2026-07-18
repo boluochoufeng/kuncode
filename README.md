@@ -104,6 +104,9 @@ cargo run -p kuncode-cli -- --mode accept-edits "整理代码格式"
     "maxIterations": 50,
     "todoReminderInterval": 3
   },
+  "logging": {
+    "level": "info"
+  },
   "compaction": {
     "mode": "enabled"
   }
@@ -117,6 +120,28 @@ cargo run -p kuncode-cli -- --mode accept-edits "整理代码格式"
 - `compaction.mode` 支持 `disabled`、`shadow` 和 `enabled`，默认是 `disabled`。
 - `shadow` 只计算和报告压缩候选，不替换当前上下文。
 - `enabled` 会在达到预算阈值时执行压缩，并要求会话持久化状态保持健康。
+
+## 运行日志
+
+运行时日志默认写入 `~/.kuncode/logs/`，按天生成文件并保留最近 7 个日志文件。写入使用后台线程；启动时目录或文件不可用会自动降级到 stderr，不会阻止 Agent 启动。为避免磁盘写入阻塞 Agent，队列过载时允许丢弃日志，并在进程退出时报告丢弃数量。
+
+默认级别为 `info`。可以通过项目配置调整：
+
+```json
+{
+  "logging": {
+    "level": "debug"
+  }
+}
+```
+
+也可以用 `RUST_LOG` 临时覆盖配置，例如只查看工具和 Provider 的详细日志：
+
+```bash
+RUST_LOG='kuncode::tool=debug,kuncode::provider=debug' kuncode "检查项目"
+```
+
+`info` 默认只记录运行状态、稳定标识、计数、耗时和 token 用量，包括 Provider 重试与首事件耗时、Hook 结果、权限审批、工具执行、压缩、持久化、panic 和 TUI I/O 故障。显式启用 `debug` 后会额外记录最长 256 字符的提示词、模型文本、工具摘要和错误预览；包含敏感字段名、常见凭证前缀、私钥头或长随机令牌形态的行会整体替换为 `[REDACTED]`。推理正文和完整工具结果在任何级别都不会写入日志。
 
 ## 工具
 

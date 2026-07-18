@@ -118,12 +118,22 @@ impl<M: CompletionModel> CompletionModel for RetryModel<M> {
             match self.inner.completion(request.clone()).await {
                 Ok(response) => return Ok(response),
                 Err(err) if is_retryable(&err) => {
-                    tokio::time::sleep(self.policy.delay_for(attempt + 1)).await;
+                    let retry = attempt + 1;
+                    let delay = self.policy.delay_for(retry);
+                    log_retry(&err, retry, self.policy.max_retries, delay, "completion");
+                    tokio::time::sleep(delay).await;
                 }
-                Err(err) => return Err(err),
+                Err(err) => {
+                    log_final_failure(&err, attempt + 1, "completion");
+                    return Err(err);
+                }
             }
         }
-        self.inner.completion(request).await
+        let result = self.inner.completion(request).await;
+        if let Err(error) = &result {
+            log_final_failure(error, self.policy.max_retries + 1, "completion");
+        }
+        result
     }
 
     async fn stream(
@@ -136,12 +146,68 @@ impl<M: CompletionModel> CompletionModel for RetryModel<M> {
             match self.inner.stream(request.clone()).await {
                 Ok(stream) => return Ok(stream),
                 Err(err) if is_retryable(&err) => {
-                    tokio::time::sleep(self.policy.delay_for(attempt + 1)).await;
+                    let retry = attempt + 1;
+                    let delay = self.policy.delay_for(retry);
+                    log_retry(&err, retry, self.policy.max_retries, delay, "stream");
+                    tokio::time::sleep(delay).await;
                 }
-                Err(err) => return Err(err),
+                Err(err) => {
+                    log_final_failure(&err, attempt + 1, "stream");
+                    return Err(err);
+                }
             }
         }
-        self.inner.stream(request).await
+        let result = self.inner.stream(request).await;
+        if let Err(error) = &result {
+            log_final_failure(error, self.policy.max_retries + 1, "stream");
+        }
+        result
+    }
+}
+
+fn log_retry(
+    error: &CompletionError,
+    retry: u32,
+    max_retries: u32,
+    delay: Duration,
+    operation: &str,
+) {
+    let (error_kind, status, is_timeout, is_connect) = error_metadata(error);
+    tracing::warn!(
+        target: "kuncode::provider",
+        operation,
+        error_kind,
+        status = ?status,
+        is_timeout,
+        is_connect,
+        retry,
+        max_retries,
+        delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+        "transient model request failed; retry scheduled",
+    );
+}
+
+fn log_final_failure(error: &CompletionError, attempts: u32, operation: &str) {
+    let (error_kind, status, is_timeout, is_connect) = error_metadata(error);
+    tracing::warn!(
+        target: "kuncode::provider",
+        operation,
+        error_kind,
+        status = ?status,
+        is_timeout,
+        is_connect,
+        attempts,
+        "model request exhausted retries or failed permanently",
+    );
+}
+
+fn error_metadata(error: &CompletionError) -> (&'static str, Option<u16>, bool, bool) {
+    match error {
+        CompletionError::HttpError(error) => ("http", None, error.is_timeout(), error.is_connect()),
+        CompletionError::ApiError { status, .. } => ("api", Some(*status), false, false),
+        CompletionError::JsonError(_) => ("json", None, false, false),
+        CompletionError::ResponseError(_) => ("response", None, false, false),
+        CompletionError::RequestError(_) => ("request", None, false, false),
     }
 }
 
@@ -368,6 +434,18 @@ mod tests {
         }
         assert!(!is_retryable(&CompletionError::ResponseError("x".into())));
         assert!(!is_retryable(&CompletionError::RequestError("x".into())));
+    }
+
+    #[test]
+    fn error_metadata_never_contains_provider_messages() {
+        let api = CompletionError::ApiError {
+            status: 401,
+            message: "secret response body".to_string(),
+        };
+        let response = CompletionError::ResponseError("secret projection detail".to_string());
+
+        assert_eq!(error_metadata(&api), ("api", Some(401), false, false));
+        assert_eq!(error_metadata(&response), ("response", None, false, false));
     }
 
     #[test]

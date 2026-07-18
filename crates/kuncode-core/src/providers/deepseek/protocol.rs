@@ -545,6 +545,7 @@ impl TryFrom<completion::CompletionRequest> for DeepSeekCompletionRequest {
         let (temperature, top_p) = if matches!(thinking, Some(Thinking::Enabled)) {
             if req.temperature.is_some() || req.top_p.is_some() {
                 tracing::warn!(
+                    target: "kuncode::provider",
                     "dropping temperature/top_p: DeepSeek ignores them when thinking is enabled"
                 );
             }
