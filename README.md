@@ -59,31 +59,6 @@ cargo build --release -p kuncode-cli
 ./target/release/kuncode --help
 ```
 
-## 权限控制
-
-工具执行前会经过权限策略与用户审批。CLI 支持追加 allow、ask 和 deny 规则：
-
-```bash
-cargo run -p kuncode-cli -- \
-  --allow 'Read' \
-  --allow 'Bash(cargo *)' \
-  --ask 'Edit(.env)' \
-  --deny 'Bash(curl *)' \
-  "检查并修复项目"
-```
-
-支持三种权限模式：
-
-- `default`：读取默认放行，写入和命令执行默认询问。
-- `accept-edits`：自动接受普通文件编辑，显式 ask/deny 规则仍然生效。
-- `bypass`：跳过普通审批，但不能绕过 deny 规则。
-
-通过 `--mode <MODE>` 选择模式，例如：
-
-```bash
-cargo run -p kuncode-cli -- --mode accept-edits "整理代码格式"
-```
-
 ## 项目配置
 
 在项目根目录创建 `.kuncode/settings.json`。所有配置段都使用严格 schema，未知字段和无效值会在启动时直接报错。
@@ -121,57 +96,6 @@ cargo run -p kuncode-cli -- --mode accept-edits "整理代码格式"
 - `shadow` 只计算和报告压缩候选，不替换当前上下文。
 - `enabled` 会在达到预算阈值时执行压缩，并要求会话持久化状态保持健康。
 
-## 运行日志
-
-运行时日志默认写入 `~/.kuncode/logs/`，按天生成文件并保留最近 7 个日志文件。写入使用后台线程；启动时目录或文件不可用会自动降级到 stderr，不会阻止 Agent 启动。为避免磁盘写入阻塞 Agent，队列过载时允许丢弃日志，并在进程退出时报告丢弃数量。
-
-默认级别为 `info`。可以通过项目配置调整：
-
-```json
-{
-  "logging": {
-    "level": "debug"
-  }
-}
-```
-
-也可以用 `RUST_LOG` 临时覆盖配置，例如只查看工具和 Provider 的详细日志：
-
-```bash
-RUST_LOG='kuncode::tool=debug,kuncode::provider=debug' kuncode "检查项目"
-```
-
-`info` 默认只记录运行状态、稳定标识、计数、耗时和 token 用量，包括 Provider 重试与首事件耗时、Hook 结果、权限审批、工具执行、压缩、持久化、panic 和 TUI I/O 故障。显式启用 `debug` 后会额外记录最长 256 字符的提示词、模型文本、工具摘要和错误预览；包含敏感字段名、常见凭证前缀、私钥头或长随机令牌形态的行会整体替换为 `[REDACTED]`。推理正文和完整工具结果在任何级别都不会写入日志。
-
-## 工具
-
-CLI 默认向模型注册以下工具：
-
-- `bash`：在 workspace 根目录执行 Shell 命令，并限制输出大小。
-- `read_file`：按行读取文件，支持分页和 UTF-8 安全截断。
-- `write_file`：在 workspace 内写入新内容。
-- `edit_file`：精确替换唯一匹配的文本。
-- `glob`：搜索 workspace 文件，默认遵守 `.gitignore`。
-- `todo_write`：维护当前会话的结构化任务计划。
-
-所有工具都通过同一个注册表、参数校验、权限门和结果封装进入 Agent Loop。
-
-## 会话与上下文压缩
-
-每次运行会尝试创建 SQLite 会话 journal。模型消息和工具结果写入 journal，为未来的恢复、分叉和长期记忆提供权威历史。
-
-启用上下文压缩后，运行时会：
-
-1. 计算完整请求的 token 预算。
-2. 保持工具调用与结果的协议原子性。
-3. 保护最近上下文和当前用户请求。
-4. 将旧的大型工具结果归档为 content-addressed artifact。
-5. 对安全的工具结果做确定性裁剪。
-6. 必要时生成并校验结构化语义摘要。
-7. 原子提交 checkpoint 后再替换内存中的 Active Context。
-
-持久化或一致性校验失败时，系统会拒绝危险的有损压缩，而不是继续使用无法证明来源的上下文。
-
 ## 开发
 
 提交前在 workspace 根目录运行：
@@ -188,29 +112,3 @@ cargo test --workspace
 ```bash
 cargo doc --workspace --no-deps
 ```
-
-## 已实现功能
-
-- 基于流式 Completion 的单 Agent 工具循环，支持文本、推理内容和工具调用增量。
-- DeepSeek Provider、模型能力配置，以及针对连接、408、429 和部分 5xx 的指数退避重试。
-- Bash、文件读写、精确编辑、Glob 和 TodoWrite 工具。
-- workspace 路径约束、参数校验、allow/ask/deny 规则、会话授权和终端审批。
-- UserPromptSubmit、PreToolUse、PostToolUse、Stop 四类 Hook 运行时接缝。
-- 结构化 Todo、计划提醒、Observer 事件和实时 TUI 展示。
-- 一次性 CLI、交互式 TUI、流式预览和 Ctrl-C 取消。
-- SQLite 会话 journal、artifact、checkpoint 与一致性校验基础设施。
-- 多阶段自动上下文压缩，包括 artifact spill、结果裁剪、语义摘要、CAS 和失败关闭。
-- 运行时拼装的 Identity、Environment 和 Tools 系统提示区块。
-
-## 待实现功能
-
-- 将 Hook 注册与外部命令 Hook 接入 CLI 项目配置。
-- 会话 list、resume、fork 和 export 命令及运行时恢复流程。
-- Skill 扫描、索引和按需加载。
-- 独立上下文的 Subagent，以及权限冒泡、取消和结果回传。
-- 从完整 journal 选择、抽取、合并并按需加载的长期 Memory。
-- 带依赖关系、owner 和 claim/complete 生命周期的持久 Task System。
-- 后台任务、完成通知和可选的 Cron 调度。
-- Agent Team、异步 Mailbox、团队协议、自治任务认领和 worktree 隔离。
-- MCP 客户端、动态工具发现以及外部能力的权限治理。
-- `Retry-After`、上下文过长错误后的反应式压缩和更完整的错误恢复策略。
