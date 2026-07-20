@@ -6,8 +6,8 @@ mod iteration;
 mod loop_control;
 mod request;
 mod setup;
+mod tool_authorization;
 mod tool_execution;
-mod tool_gate;
 mod turn;
 
 use std::sync::Arc;
@@ -21,7 +21,7 @@ use crate::{
     },
     hook::Hooks,
     observer::AgentObserver,
-    permission::{Approver, PermissionPolicy},
+    permission::{ApprovalBroker, PolicySet},
     registry::ToolRegistry,
     session::AgentSession,
     session_store::SessionStore,
@@ -30,6 +30,7 @@ use crate::{
 };
 
 use self::request::final_text_at;
+pub use self::setup::AgentRunnerBuildError;
 
 const DEFAULT_MAX_ITERATIONS: usize = 50;
 
@@ -153,8 +154,8 @@ pub struct AgentRunner<M> {
     registry: ToolRegistry,
     config: AgentConfig,
     system_prompt: Arc<SystemPrompt>,
-    policy: Arc<PermissionPolicy>,
-    approver: Arc<dyn Approver>,
+    policy: Arc<PolicySet>,
+    approvals: Arc<ApprovalBroker>,
     observer: Option<Arc<dyn AgentObserver>>,
     hooks: Arc<Hooks>,
     // Lossy compaction requires both enabled policy and durable storage; shadow

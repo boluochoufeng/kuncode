@@ -1,15 +1,24 @@
 //! The `read_file` tool: read a UTF-8 workspace file with line pagination.
 
+use std::path::PathBuf;
+
 use async_trait::async_trait;
 use kuncode_core::completion::ToolDefinition;
+use kuncode_core::non_empty_vec::NonEmptyVec;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
-use super::helpers::{io_error, is_file, non_empty_path, rule_path, workspace_error};
+use super::helpers::{io_error, non_empty_path, workspace_error};
 use crate::{
-    permission::{PermissionAction, PermissionRequest},
-    tool::{ToolContext, ToolOutput, TypedTool, definition_for},
+    permission::{
+        CanonicalPath, CanonicalToolInput, PathSelector, PermissionCheckSpec, PermissionTarget,
+        ToolDisplay,
+    },
+    tool::{
+        PreparationContext, PreparedInvocationState, ToolContext, ToolError, ToolOutput,
+        TypedPreparation, TypedTool, definition_for,
+    },
     workspace::Workspace,
 };
 
@@ -63,8 +72,14 @@ pub struct ReadFileOutput {
     pub truncated_lines: Vec<usize>,
 }
 
+/// Canonical read target paired with validated pagination arguments.
+#[derive(Debug)]
+pub struct PreparedReadFile {
+    args: ReadFileArgs,
+    path: PathBuf,
+}
+
 /// Reads UTF-8 files from the workspace.
-/// TODO: Add line numbers to the content read.
 #[derive(Clone, Debug)]
 pub struct ReadFile {
     definition: ToolDefinition,
@@ -84,54 +99,73 @@ impl ReadFile {
 #[async_trait]
 impl TypedTool for ReadFile {
     type Args = ReadFileArgs;
+    type Prepared = PreparedReadFile;
     type Output = ReadFileOutput;
 
     fn definition(&self) -> &ToolDefinition {
         &self.definition
     }
 
-    fn permission(&self, args: &ReadFileArgs, _ctx: &ToolContext) -> PermissionRequest {
-        let path = rule_path(&self.workspace, &args.path);
-        PermissionRequest::new(
-            "read_file",
-            PermissionAction::Read,
-            Some(path.clone()),
-            format!("Read file: {path}"),
-        )
-    }
-
-    async fn run(&self, args: ReadFileArgs, _ctx: &ToolContext) -> ToolOutput<ReadFileOutput> {
-        let path = match non_empty_path(&args.path) {
-            Ok(path) => path,
-            Err(output) => return output,
-        };
-
-        let resolved = match self.workspace.resolve_existing(path).await {
-            Ok(path) => path,
-            Err(err) => return workspace_error(err),
-        };
-
-        if !is_file(&resolved).await {
-            return ToolOutput::failure(
-                "invalid_path",
-                format!(
-                    "`{}` is not a file",
-                    self.workspace.relative_display(&resolved)
-                ),
-            );
-        }
+    async fn prepare_typed(
+        &self,
+        mut args: ReadFileArgs,
+        _canonical_input: CanonicalToolInput,
+        _ctx: &PreparationContext,
+    ) -> Result<TypedPreparation<Self::Prepared>, ToolOutput> {
+        let path = non_empty_path(&args.path)?;
+        let resolved = self
+            .workspace
+            .resolve_target(path)
+            .await
+            .map_err(workspace_error)?;
 
         let start_line = args.start_line.unwrap_or(1);
         if start_line == 0 {
-            return ToolOutput::failure(
+            return Err(ToolOutput::failure(
                 "invalid_arguments",
                 "`start_line` is 1-based and must be greater than zero",
-            );
+            ));
         }
         if matches!(args.limit, Some(0)) {
-            return ToolOutput::failure("invalid_arguments", "`limit` must be greater than zero");
+            return Err(ToolOutput::failure(
+                "invalid_arguments",
+                "`limit` must be greater than zero",
+            ));
         }
 
+        let canonical_path = CanonicalPath::from_absolute(&resolved)
+            .map_err(|error| ToolOutput::failure("invalid_arguments", error.to_string()))?;
+        let display_path = self.workspace.relative_display(&resolved);
+        args.path = canonical_path.as_str().to_string();
+        args.start_line = Some(start_line);
+        let canonical_input = CanonicalToolInput::new(serde_json::json!({
+            "path": canonical_path.as_str(),
+            "start_line": start_line,
+            "limit": args.limit,
+        }));
+        Ok(TypedPreparation::new(
+            PreparedReadFile {
+                args,
+                path: resolved,
+            },
+            canonical_input,
+            NonEmptyVec::new(PermissionCheckSpec::new(PermissionTarget::Read(
+                PathSelector::exact(canonical_path),
+            ))),
+            ToolDisplay::new(format!("Read file: {display_path}")),
+        ))
+    }
+
+    async fn run_prepared(
+        &self,
+        prepared: PreparedReadFile,
+        _ctx: &ToolContext,
+    ) -> ToolOutput<ReadFileOutput> {
+        let PreparedReadFile {
+            args,
+            path: resolved,
+        } = prepared;
+        let start_line = args.start_line.unwrap_or(1);
         let file = match tokio::fs::File::open(&resolved).await {
             Ok(file) => file,
             Err(err) => return io_error("read", &resolved, err, &self.workspace),
@@ -230,6 +264,27 @@ impl TypedTool for ReadFile {
             output
         }
     }
+
+    async fn revalidate_prepared(
+        &self,
+        prepared: &mut PreparedReadFile,
+        _ctx: &ToolContext,
+    ) -> Result<PreparedInvocationState, ToolError> {
+        Ok(
+            if self
+                .workspace
+                .revalidate_target(&prepared.path)
+                .await
+                .is_ok()
+            {
+                PreparedInvocationState::Current
+            } else {
+                // Re-preparation produces the model-safe path diagnostic against
+                // current metadata without executing the stale payload.
+                PreparedInvocationState::Stale
+            },
+        )
+    }
 }
 
 /// Inline marker appended to a line whose tail was dropped to fit
@@ -268,11 +323,17 @@ fn truncate_utf8(input: &str, max_bytes: usize) -> (String, bool) {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{fs, sync::Arc};
 
     use super::{MAX_LINE_BYTES, ReadFile};
     use crate::test_support::TestDir;
-    use crate::tool::{Tool, ToolContext};
+    use crate::tool::{ToolContext, ToolOutput, execute_for_test};
+
+    async fn call(tool: ReadFile, args: serde_json::Value) -> ToolOutput {
+        execute_for_test(Arc::new(tool), args, &ToolContext::new())
+            .await
+            .expect("no harness-level error")
+    }
 
     #[tokio::test]
     async fn read_file_returns_a_line_window_with_pagination() {
@@ -281,17 +342,15 @@ mod tests {
             .expect("file should be written");
         let tool = ReadFile::new(tmp.workspace().await);
 
-        let output = tool
-            .call(
-                serde_json::json!({
-                    "path": "notes.txt",
-                    "start_line": 2,
-                    "limit": 1
-                }),
-                &ToolContext::new(),
-            )
-            .await
-            .expect("no harness-level error");
+        let output = call(
+            tool,
+            serde_json::json!({
+                "path": "notes.txt",
+                "start_line": 2,
+                "limit": 1
+            }),
+        )
+        .await;
 
         assert!(output.ok);
         // The returned line is complete, so the content itself is not truncated.
@@ -313,13 +372,7 @@ mod tests {
         fs::write(tmp.path().join("notes.txt"), "a\nb").expect("file should be written");
         let tool = ReadFile::new(tmp.workspace().await);
 
-        let output = tool
-            .call(
-                serde_json::json!({ "path": "notes.txt" }),
-                &ToolContext::new(),
-            )
-            .await
-            .expect("no harness-level error");
+        let output = call(tool, serde_json::json!({ "path": "notes.txt" })).await;
 
         assert!(output.ok);
         assert!(!output.truncated);
@@ -338,13 +391,11 @@ mod tests {
         fs::write(tmp.path().join("notes.txt"), "a\nb").expect("file should be written");
         let tool = ReadFile::new(tmp.workspace().await);
 
-        let output = tool
-            .call(
-                serde_json::json!({ "path": "notes.txt", "start_line": 6 }),
-                &ToolContext::new(),
-            )
-            .await
-            .expect("no harness-level error");
+        let output = call(
+            tool,
+            serde_json::json!({ "path": "notes.txt", "start_line": 6 }),
+        )
+        .await;
 
         assert!(output.ok);
         let data = output.data.expect("data present");
@@ -361,10 +412,7 @@ mod tests {
         fs::write(tmp.path().join("min.js"), &long_line).expect("file should be written");
         let tool = ReadFile::new(tmp.workspace().await);
 
-        let output = tool
-            .call(serde_json::json!({ "path": "min.js" }), &ToolContext::new())
-            .await
-            .expect("no harness-level error");
+        let output = call(tool, serde_json::json!({ "path": "min.js" })).await;
 
         assert!(output.ok);
         // The single line is capped: content is truncated horizontally, but
@@ -391,13 +439,7 @@ mod tests {
         fs::write(tmp.path().join("cjk.txt"), &long_line).expect("file should be written");
         let tool = ReadFile::new(tmp.workspace().await);
 
-        let output = tool
-            .call(
-                serde_json::json!({ "path": "cjk.txt" }),
-                &ToolContext::new(),
-            )
-            .await
-            .expect("no harness-level error");
+        let output = call(tool, serde_json::json!({ "path": "cjk.txt" })).await;
 
         assert!(output.ok);
         assert!(output.truncated);
@@ -425,13 +467,7 @@ mod tests {
         fs::write(tmp.path().join("big.txt"), body).expect("file should be written");
         let tool = ReadFile::new(tmp.workspace().await);
 
-        let output = tool
-            .call(
-                serde_json::json!({ "path": "big.txt" }),
-                &ToolContext::new(),
-            )
-            .await
-            .expect("no harness-level error");
+        let output = call(tool, serde_json::json!({ "path": "big.txt" })).await;
 
         assert!(output.ok);
         // Spilling whole lines to the next page is lossless vertical pagination,
@@ -461,13 +497,7 @@ mod tests {
         .expect("file should be written");
         let tool = ReadFile::new(tmp.workspace().await);
 
-        let output = tool
-            .call(
-                serde_json::json!({ "path": "mixed.txt", "limit": 2 }),
-                &ToolContext::new(),
-            )
-            .await
-            .expect("no harness-level error");
+        let output = call(tool, serde_json::json!({ "path": "mixed.txt", "limit": 2 })).await;
 
         assert!(output.ok);
         assert!(output.truncated);
@@ -500,13 +530,7 @@ mod tests {
         .expect("file should be written");
         let tool = ReadFile::new(tmp.workspace().await);
 
-        let output = tool
-            .call(
-                serde_json::json!({ "path": "mixed.bin", "limit": 1 }),
-                &ToolContext::new(),
-            )
-            .await
-            .expect("no harness-level error");
+        let output = call(tool, serde_json::json!({ "path": "mixed.bin", "limit": 1 })).await;
 
         assert!(!output.ok);
         assert_eq!(output.error.expect("error present").kind.as_str(), "read");
@@ -519,13 +543,11 @@ mod tests {
         let tool = ReadFile::new(tmp.workspace().await);
 
         // `start_line` is 1-based; `0` is a contract violation, not "line 0".
-        let output = tool
-            .call(
-                serde_json::json!({ "path": "notes.txt", "start_line": 0 }),
-                &ToolContext::new(),
-            )
-            .await
-            .expect("no harness-level error");
+        let output = call(
+            tool,
+            serde_json::json!({ "path": "notes.txt", "start_line": 0 }),
+        )
+        .await;
 
         assert!(!output.ok);
         assert_eq!(
@@ -549,10 +571,7 @@ mod tests {
         symlink(&outside, tmp.path().join("link")).expect("symlink should be created");
         let tool = ReadFile::new(tmp.workspace().await);
 
-        let output = tool
-            .call(serde_json::json!({ "path": "link" }), &ToolContext::new())
-            .await
-            .expect("no harness-level error");
+        let output = call(tool, serde_json::json!({ "path": "link" })).await;
 
         let _ = fs::remove_file(outside);
         assert!(!output.ok);

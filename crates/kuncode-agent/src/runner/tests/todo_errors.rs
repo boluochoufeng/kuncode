@@ -1,8 +1,8 @@
 use super::support::{
-    AgentConfig, AgentError, AgentRunner, AgentSession, ApprovalOutcome, Arc, AssistantContent,
-    BrokenTool, CollectingObserver, ErrModel, EventKind, FakeModel, ScriptedApprover, TodoWrite,
-    ToolRegistry, bash, event_label, reminder_count, response, response_many, tool_result_ids,
-    tool_result_text,
+    AgentConfig, AgentError, AgentRunner, AgentSession, ApprovalResolution, ApproveAll, Arc,
+    AssistantContent, BrokenTool, CollectingObserver, ErrModel, EventKind, FakeModel,
+    ScriptedApprovalResolver, ToolRegistry, event_label, register_bash, register_todo,
+    reminder_count, response, response_many, tool_result_ids, tool_result_text,
 };
 
 #[tokio::test]
@@ -24,7 +24,7 @@ async fn plan_nag_fires_after_the_idle_interval() {
         response(AssistantContent::text("done")),
     ]);
     let mut registry = ToolRegistry::new();
-    registry.register(bash().await);
+    register_bash(&mut registry).await;
     let runner = AgentRunner::with_config(
         model,
         registry,
@@ -68,8 +68,8 @@ async fn a_todo_write_resets_the_plan_nag() {
         response(AssistantContent::text("done")),
     ]);
     let mut registry = ToolRegistry::new();
-    registry.register(bash().await);
-    registry.register(TodoWrite::new());
+    register_bash(&mut registry).await;
+    register_todo(&mut registry);
     let runner = AgentRunner::with_config(
         model,
         registry,
@@ -97,10 +97,12 @@ async fn abort_mirrors_tool_results_and_ends_with_cancelled_error() {
         AssistantContent::tool_call("call_2", "bash", serde_json::json!({ "cmd": "printf two" })),
     ])]);
     let mut registry = ToolRegistry::new();
-    registry.register(bash().await);
+    register_bash(&mut registry).await;
     let observer = Arc::new(CollectingObserver::default());
     let runner = AgentRunner::new(model, registry)
-        .with_approver(Arc::new(ScriptedApprover::new([ApprovalOutcome::Abort])))
+        .with_approval_resolver(Arc::new(ScriptedApprovalResolver::new([
+            ApprovalResolution::Cancel,
+        ])))
         .with_observer(observer.clone());
     let mut session = AgentSession::new();
 
@@ -168,9 +170,13 @@ async fn harness_tool_error_is_honestly_ended_then_turn_errors() {
         AssistantContent::tool_call("call_2", "broken", serde_json::json!({})),
     ])]);
     let mut registry = ToolRegistry::new();
-    registry.register(BrokenTool::new());
+    registry
+        .register(BrokenTool::new())
+        .expect("broken tool registration");
     let observer = Arc::new(CollectingObserver::default());
-    let runner = AgentRunner::new(model, registry).with_observer(observer.clone());
+    let runner = AgentRunner::new(model, registry)
+        .with_approval_resolver(Arc::new(ApproveAll))
+        .with_observer(observer.clone());
     let mut session = AgentSession::new();
 
     let err = runner

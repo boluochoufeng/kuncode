@@ -1,7 +1,7 @@
 use kuncode_core::completion::{ToolResultContent, UserContent};
 
 use super::support::{
-    SerializedByteCounter, persisted_session, tool_exchange, tool_exchange_with_output,
+    SerializedByteCounter, persisted_session, tool_exchange, tool_exchange_with_text,
 };
 use crate::{
     compaction::{
@@ -10,7 +10,6 @@ use crate::{
     },
     session_store::{NewSession, SessionStore, turso::TursoSessionStore},
     test_support::TestDir,
-    tool::ToolOutput,
 };
 
 #[tokio::test]
@@ -26,9 +25,19 @@ async fn bounds_adversarial_metadata_and_recounts_final_marker() {
         .expect("session should be created");
     let tool_name = "tool".repeat(2_000);
     let error_message = "failure".repeat(2_000);
-    let output = ToolOutput::failure("custom_kind", error_message).truncated();
+    // Construct the wire envelope directly so this boundary still covers
+    // imported or legacy data that predates producer-side diagnostic limits.
+    let output = serde_json::json!({
+        "ok": false,
+        "error": {
+            "kind": "custom_kind",
+            "message": error_message,
+        },
+        "truncated": true,
+    })
+    .to_string();
     let messages = [
-        tool_exchange_with_output("old", &tool_name, output),
+        tool_exchange_with_text("old", &tool_name, &output),
         tool_exchange("recent", "read_file", "recent"),
     ]
     .concat();

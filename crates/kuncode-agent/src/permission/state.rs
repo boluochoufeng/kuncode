@@ -5,20 +5,27 @@
 //! rather than on the shared, `Clone` + `&self` runner — gives per-session
 //! isolation with no lock and no cross-session leak.
 
-use super::rule::Rule;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use super::rule::PermissionRule;
+
+static NEXT_SESSION_OVERLAY_REVISION: AtomicU64 = AtomicU64::new(1);
 
 /// How strict the permission gate is for this session.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PermissionMode {
-    /// Per-action defaults apply (reads free, writes/exec ask). The safe norm.
+    /// Uses explicit contributions first and profile defaults otherwise.
     #[default]
     Default,
-    /// Writes are auto-allowed; reads stay free; execute still asks. Explicit
-    /// `deny`/`ask` rules still win (they are checked first).
+    /// Adds `Allow` for workspace-local edits; explicit Ask and Deny still win.
     AcceptEdits,
-    /// Skip all prompts. Still honors `deny` — an unbypassable security floor by
-    /// design, even here (a deliberate divergence from Claude Code).
+    /// Denies mutation, process, network, remote-tool, and sub-agent checks.
+    /// Read-only checks continue through normal policy resolution.
+    Plan,
+    /// Adds `Allow` so profile-default Ask is skipped; explicit Ask and Deny win.
     BypassPermissions,
+    /// Resolves policy normally but rejects any remaining approval request.
+    DontAsk,
 }
 
 impl PermissionMode {
@@ -28,58 +35,83 @@ impl PermissionMode {
         match input.trim() {
             "default" => Some(Self::Default),
             "acceptEdits" | "accept-edits" => Some(Self::AcceptEdits),
+            "plan" => Some(Self::Plan),
             "bypassPermissions" | "bypass-permissions" | "bypass" => Some(Self::BypassPermissions),
+            "dontAsk" | "dont-ask" => Some(Self::DontAsk),
             _ => None,
         }
     }
 }
 
-/// Session-scoped permission state: the active mode plus grants the user added
-/// mid-session by choosing "Always allow/deny" at a prompt.
-#[derive(Clone, Debug, Default)]
-pub struct PermissionSessionState {
-    mode: PermissionMode,
-    allow_grants: Vec<Rule>,
-    deny_grants: Vec<Rule>,
+/// Monotonic version of the mutable session policy overlay.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SessionOverlayRevision(u64);
+
+impl SessionOverlayRevision {
+    /// Returns the monotonic revision value.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
 }
 
-impl PermissionSessionState {
-    /// Creates session state starting in `mode` with no grants.
+/// Session-isolated mode and typed policy mutations used by authorization.
+#[derive(Clone, Debug)]
+pub struct SessionPolicyOverlay {
+    mode: PermissionMode,
+    rules: Vec<PermissionRule>,
+    revision: SessionOverlayRevision,
+}
+
+impl Default for SessionPolicyOverlay {
+    fn default() -> Self {
+        Self::new(PermissionMode::Default)
+    }
+}
+
+impl SessionPolicyOverlay {
+    /// Creates an empty overlay in the requested mode.
     pub fn new(mode: PermissionMode) -> Self {
         Self {
             mode,
-            allow_grants: Vec::new(),
-            deny_grants: Vec::new(),
+            rules: Vec::new(),
+            revision: next_session_overlay_revision(),
         }
     }
 
-    /// The active mode.
-    pub fn mode(&self) -> PermissionMode {
+    /// Returns the active mode.
+    pub const fn mode(&self) -> PermissionMode {
         self.mode
     }
 
-    /// Switches the active mode (e.g. a future `/accept-edits` toggle).
+    /// Changes mode and invalidates outstanding approvals when needed.
     pub fn set_mode(&mut self, mode: PermissionMode) {
-        self.mode = mode;
+        if self.mode != mode {
+            self.mode = mode;
+            self.bump_revision();
+        }
     }
 
-    /// Session allow-grants, newest last.
-    pub fn allow_grants(&self) -> &[Rule] {
-        &self.allow_grants
+    /// Appends a challenge-validated session rule.
+    pub fn push(&mut self, rule: PermissionRule) {
+        self.rules.push(rule);
+        self.bump_revision();
     }
 
-    /// Session deny-grants, newest last.
-    pub fn deny_grants(&self) -> &[Rule] {
-        &self.deny_grants
+    /// Returns typed session rules in insertion order.
+    pub fn rules(&self) -> &[PermissionRule] {
+        &self.rules
     }
 
-    /// Records an "Always allow" grant for the rest of the session.
-    pub fn grant_allow(&mut self, rule: Rule) {
-        self.allow_grants.push(rule);
+    /// Returns the version included in authorization snapshots.
+    pub const fn revision(&self) -> SessionOverlayRevision {
+        self.revision
     }
 
-    /// Records an "Always deny" grant for the rest of the session.
-    pub fn grant_deny(&mut self, rule: Rule) {
-        self.deny_grants.push(rule);
+    fn bump_revision(&mut self) {
+        self.revision = next_session_overlay_revision();
     }
+}
+
+fn next_session_overlay_revision() -> SessionOverlayRevision {
+    SessionOverlayRevision(NEXT_SESSION_OVERLAY_REVISION.fetch_add(1, Ordering::Relaxed))
 }

@@ -1,31 +1,51 @@
-//! Permission system: rules, policy, session state, and approval.
+//! Authorization pipeline for prepared tool calls.
 //!
-//! Layering:
-//!
-//! - [`PermissionPolicy`] — static rules, owned read-only by the runner.
-//! - [`PermissionSessionState`] — per-session grants + mode, lives in
-//!   [`AgentSession`](crate::session::AgentSession) (already `&mut`).
-//! - [`Approver`] — the side-effecting human prompt, owned by the runner.
-//! - [`evaluate`] — the pure decision function over the three above.
-//!
-//! The runner sets the gate *before* dispatch via [`PermissionGate`]: `prepare`
-//! a [`PermissionRequest`] from the tool, then `decide` it (`evaluate`, and only
-//! on `Ask` consult the [`Approver`]).
+//! Tools prepare and validate a call once, profiles produce typed checks, and
+//! policy, Hooks, modes, and challenge-bound approval resolve those checks before
+//! the retained payload can execute.
 
-pub mod approver;
-pub mod gate;
+pub mod approval;
+pub mod check;
+pub mod contribution;
+pub mod engine;
 pub mod policy;
+pub mod profile;
+pub mod receipt;
 pub mod request;
 pub mod rule;
 pub mod state;
+pub mod target;
 
 #[cfg(test)]
-pub use approver::ScriptedApprover;
-pub use approver::{Approver, AutoApprove, DenyAll};
-pub use gate::{Decision, PermissionGate, Prepared};
-pub use policy::{PermissionPolicy, evaluate};
-pub use request::{ApprovalOutcome, DenyReason, PermissionAction, PermissionRequest, Verdict};
-pub use rule::{
-    Rule, RuleOrigin, RuleParseError, first_match, matches_any, parse_rule, suggest_scope,
+pub(crate) use approval::tests_support::ScriptedApprovalResolver;
+pub use approval::{
+    ApprovalBroker, ApprovalBrokerError, ApprovalChallenge, ApprovalChallengeId, ApprovalError,
+    ApprovalResolution, ApprovalResolver, PendingApprovalCheck, PolicyMutationTemplate,
+    PolicyMutationTemplateId, PolicyScope, PolicyScopeSet, RejectUnavailable, SafeRequestSnapshot,
 };
-pub use state::{PermissionMode, PermissionSessionState};
+pub use check::{PermissionCheck, PermissionCheckId, PermissionCheckSpec, ProfileDefault};
+pub use contribution::{
+    AuthorizationEffect, AuthorizationResolution, CheckResolution, PermissionCauseId,
+    PolicyContribution, PolicyEffect, PolicyOrigin, ResolutionBasis, SafeExplanation,
+    resolve_authorization, resolve_check,
+};
+pub use engine::{
+    AuthorizationEngine, AuthorizationError, AuthorizationOutcome, ExecutedToolCall,
+    ExecutionOutcome, PendingToolCall as PendingAuthorizationCall, RejectedToolCall,
+};
+pub use policy::{PolicySet, PolicySetError, PolicySetRevision, WorkspaceTrust};
+pub use profile::{ToolPermissionProfile, ToolProfileError, ToolProfileRevision};
+pub use receipt::{
+    ApprovalReceipt, AuthorizationContextRevision, AuthorizedToolCall, CheckResolutionReceipt,
+    ExecutionReceipt,
+};
+pub use request::{
+    AuthorizationRequest, AuthorizationRequestError, CanonicalToolInput, InputFingerprint,
+    RequestFingerprint, ToolDisplay, ToolIdentity,
+};
+pub use rule::{PermissionRule, PermissionRuleError, RuleCompileContext, compile_permission_rule};
+pub use state::{PermissionMode, SessionOverlayRevision, SessionPolicyOverlay};
+pub use target::{
+    CanonicalCommand, CanonicalOrigin, CanonicalPath, CommandKind, McpSelector, PathSelector,
+    PermissionNamespace, PermissionTarget, PermissionTargetError,
+};

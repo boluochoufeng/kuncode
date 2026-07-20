@@ -3,6 +3,7 @@
 use kuncode_core::completion::{CompletionError, Message, Usage};
 use thiserror::Error;
 
+use crate::permission::{AuthorizationError, ToolProfileError};
 use crate::tool::ToolError;
 
 /// Failures that stop the agent loop itself.
@@ -21,6 +22,21 @@ pub enum AgentError {
         /// Harness-level tool failure.
         #[source]
         source: ToolError,
+    },
+
+    /// Trusted permission configuration or receipt invariants failed.
+    #[error("tool authorization failed: {0}")]
+    Authorization(#[source] AuthorizationError),
+
+    /// A trusted tool implementation emitted checks outside its registered
+    /// permission profile.
+    #[error("tool `{name}` violated its permission registration: {source}")]
+    ToolRegistration {
+        /// Tool name requested by the model.
+        name: String,
+        /// Registry-profile invariant that failed.
+        #[source]
+        source: ToolProfileError,
     },
 
     /// Runner was asked to continue an empty transcript.

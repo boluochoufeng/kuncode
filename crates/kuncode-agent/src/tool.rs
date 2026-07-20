@@ -1,12 +1,15 @@
 //! Tool interface exposed by the agent runtime.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use kuncode_core::completion::ToolDefinition;
+use kuncode_core::non_empty_vec::NonEmptyVec;
 use schemars::JsonSchema;
 use serde::{Serialize, de::DeserializeOwned};
 use tokio_util::sync::CancellationToken;
 
-use crate::permission::PermissionRequest;
+use crate::permission::{CanonicalToolInput, PermissionCheckSpec, PermissionTarget, ToolDisplay};
 use crate::todo::TodoHandle;
 
 pub mod bash;
@@ -17,10 +20,164 @@ mod output;
 
 pub use output::{ToolError, ToolErrorKind, ToolErrorPayload, ToolOutput, ToolResultRetention};
 
+/// Stable, capability-free context available while preparing a call.
+#[derive(Clone, Debug, Default)]
+pub struct PreparationContext;
+
+impl PreparationContext {
+    /// Creates an empty preparation context.
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+/// Output plus harness-owned retention selected by the executed invocation.
+pub struct ExecutedInvocation {
+    output: ToolOutput,
+    retention: ToolResultRetention,
+}
+
+/// Result of checking whether a retained payload still names the same resource.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreparedInvocationState {
+    /// Security-relevant metadata still matches preparation.
+    Current,
+    /// The caller must discard the receipt and prepare the canonical input again.
+    Stale,
+}
+
+impl ExecutedInvocation {
+    /// Binds one delivered output to its authoritative retention decision.
+    pub fn new(output: ToolOutput, retention: ToolResultRetention) -> Self {
+        Self { output, retention }
+    }
+
+    /// Splits the delivered output from its retention metadata.
+    pub fn into_parts(self) -> (ToolOutput, ToolResultRetention) {
+        (self.output, self.retention)
+    }
+}
+
+/// Parsed executable payload retained across authorization without raw reparse.
+#[async_trait]
+pub trait PreparedInvocation: Send {
+    /// Rechecks metadata that may change while approval is pending.
+    async fn revalidate(
+        &mut self,
+        _ctx: &ToolContext,
+    ) -> Result<PreparedInvocationState, ToolError> {
+        Ok(PreparedInvocationState::Current)
+    }
+
+    /// Consumes the payload exactly once.
+    async fn execute(self: Box<Self>, ctx: &ToolContext) -> Result<ExecutedInvocation, ToolError>;
+}
+
+/// Side-effect-free preparation returned before registry profile validation.
+pub struct ToolPreparation {
+    canonical_input: CanonicalToolInput,
+    invocation: Box<dyn PreparedInvocation>,
+    checks: NonEmptyVec<PermissionCheckSpec>,
+    display: ToolDisplay,
+}
+
+impl ToolPreparation {
+    /// Creates a complete preparation with at least one permission check.
+    pub fn new(
+        canonical_input: CanonicalToolInput,
+        invocation: Box<dyn PreparedInvocation>,
+        checks: NonEmptyVec<PermissionCheckSpec>,
+        display: ToolDisplay,
+    ) -> Self {
+        Self {
+            canonical_input,
+            invocation,
+            checks,
+            display,
+        }
+    }
+
+    /// Returns the normalized JSON exposed to authorization hooks.
+    pub fn canonical_input(&self) -> &CanonicalToolInput {
+        &self.canonical_input
+    }
+
+    /// Returns the unvalidated checks emitted by the tool adapter.
+    pub fn checks(&self) -> &NonEmptyVec<PermissionCheckSpec> {
+        &self.checks
+    }
+
+    /// Returns safe display text that never participates in authorization.
+    pub fn display(&self) -> &ToolDisplay {
+        &self.display
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        CanonicalToolInput,
+        Box<dyn PreparedInvocation>,
+        NonEmptyVec<PermissionCheckSpec>,
+        ToolDisplay,
+    ) {
+        (
+            self.canonical_input,
+            self.invocation,
+            self.checks,
+            self.display,
+        )
+    }
+}
+
+/// Typed preparation metadata paired with a tool-specific parsed payload.
+pub struct TypedPreparation<P> {
+    prepared: P,
+    canonical_input: CanonicalToolInput,
+    checks: NonEmptyVec<PermissionCheckSpec>,
+    display: ToolDisplay,
+}
+
+impl<P> TypedPreparation<P> {
+    /// Builds metadata and the payload that execution will consume.
+    pub fn new(
+        prepared: P,
+        canonical_input: CanonicalToolInput,
+        checks: NonEmptyVec<PermissionCheckSpec>,
+        display: ToolDisplay,
+    ) -> Self {
+        Self {
+            prepared,
+            canonical_input,
+            checks,
+            display,
+        }
+    }
+}
+
+/// Builds the conservative exact-tool preparation used while an adapter has no
+/// narrower trusted namespace implementation.
+///
+/// # Errors
+/// Returns an invalid-arguments output when the registered tool name is blank.
+pub fn exact_typed_preparation<P>(
+    tool: &str,
+    prepared: P,
+    canonical_input: CanonicalToolInput,
+    display: ToolDisplay,
+) -> Result<TypedPreparation<P>, ToolOutput> {
+    let target = PermissionTarget::exact_tool(tool)
+        .map_err(|error| ToolOutput::failure(ToolErrorKind::InvalidArguments, error.to_string()))?;
+    Ok(TypedPreparation::new(
+        prepared,
+        canonical_input,
+        NonEmptyVec::new(PermissionCheckSpec::new(target)),
+        display,
+    ))
+}
+
 /// Per-call execution context threaded into every tool.
 ///
-/// Kept deliberately small. The permission *gate* lives in the runner, not here
-/// (the runner computes the verdict before dispatch), and tools already self-hold
+/// Kept deliberately small. Authorization lives in the runner, not here, and tools already self-hold
 /// their [`Workspace`], so neither is duplicated here. It carries only the
 /// per-session seams a tool genuinely needs at call time: a cancellation token,
 /// and the [`TodoHandle`] for the session plan. Future fields (a
@@ -70,7 +227,7 @@ impl ToolContext {
 /// auto-generated JSON Schema. Implement `Tool` directly only when the
 /// arguments are genuinely dynamic or the schema has to be hand-rolled.
 #[async_trait]
-pub trait Tool: Send + Sync {
+pub trait Tool: Send + Sync + 'static {
     /// Definition (name, description, argument schema) advertised to the model.
     fn definition(&self) -> &ToolDefinition;
 
@@ -80,41 +237,15 @@ pub trait Tool: Send + Sync {
         &self.definition().name
     }
 
-    /// Computes the permission request for a call, *before* it runs.
+    /// Parses and canonicalizes a call without performing its business action.
     ///
-    /// Parses and lexically inspects the arguments only — no filesystem access.
-    /// A parse failure returns `Err(ToolOutput)` (an `invalid_arguments`
-    /// failure) so bad arguments are reported to the model and **never reach the
-    /// approver**.
-    fn permission(
-        &self,
-        args: &serde_json::Value,
-        ctx: &ToolContext,
-    ) -> Result<PermissionRequest, ToolOutput>;
-
-    /// Invoke the tool with the raw JSON arguments produced by the model.
-    ///
-    /// Two error channels: failures the model can react to (bad arguments,
-    /// non-zero exit, …) are reported in [`ToolOutput`] so the loop can feed
-    /// them back for a retry, while [`ToolError`] is for harness-level failures
-    /// (cancellation, internal bugs) the loop handles itself.
-    async fn call(
-        &self,
+    /// The returned invocation is the only payload the authorization engine may
+    /// execute; implementations must not defer raw-input parsing until execution.
+    async fn prepare(
+        self: Arc<Self>,
         args: serde_json::Value,
-        ctx: &ToolContext,
-    ) -> Result<ToolOutput, ToolError>;
-
-    /// Authorizes deterministic compaction for a successfully completed call.
-    ///
-    /// The default is fail-safe because tool names and model-supplied arguments
-    /// alone cannot prove that exact output is no longer required.
-    fn result_retention(
-        &self,
-        _args: &serde_json::Value,
-        _output: &ToolOutput,
-    ) -> ToolResultRetention {
-        ToolResultRetention::Verbatim
-    }
+        ctx: &PreparationContext,
+    ) -> Result<ToolPreparation, ToolOutput>;
 }
 
 /// Ergonomic tool definition with strongly-typed arguments and output.
@@ -133,6 +264,9 @@ pub trait TypedTool: Send + Sync {
     /// Deserializable, schema-describable argument type for this tool.
     type Args: DeserializeOwned + JsonSchema + Send;
 
+    /// Parsed payload retained between preparation and execution.
+    type Prepared: Send;
+
     /// Serializable `data` payload returned to the model — and available to
     /// Rust callers (sub-agents, todo, …) without re-parsing JSON.
     type Output: Serialize + Send;
@@ -141,18 +275,29 @@ pub trait TypedTool: Send + Sync {
     /// [`definition_for`] so schema generation isn't repeated per call.
     fn definition(&self) -> &ToolDefinition;
 
-    /// Declares what this call wants to do, for the permission gate.
-    ///
-    /// Synchronous and **lexical only**: it may normalize a path string for
-    /// rule matching, but must not touch the filesystem (no `canonicalize`).
-    /// The real workspace-boundary check stays in [`run`](Self::run) — rules
-    /// are policy, the boundary is a security invariant, and the two are
-    /// separate layers. Required (no default) so every new tool consciously
-    /// declares its permission surface instead of being silently misclassified.
-    fn permission(&self, args: &Self::Args, ctx: &ToolContext) -> PermissionRequest;
+    /// Produces the canonical input, checks, and executable parsed payload.
+    async fn prepare_typed(
+        &self,
+        args: Self::Args,
+        canonical_input: CanonicalToolInput,
+        ctx: &PreparationContext,
+    ) -> Result<TypedPreparation<Self::Prepared>, ToolOutput>;
 
-    /// Run the tool with already-parsed, validated arguments.
-    async fn run(&self, args: Self::Args, ctx: &ToolContext) -> ToolOutput<Self::Output>;
+    /// Executes the payload retained by [`Self::prepare_typed`].
+    async fn run_prepared(
+        &self,
+        prepared: Self::Prepared,
+        ctx: &ToolContext,
+    ) -> ToolOutput<Self::Output>;
+
+    /// Rechecks mutable metadata without executing the business operation.
+    async fn revalidate_prepared(
+        &self,
+        _prepared: &mut Self::Prepared,
+        _ctx: &ToolContext,
+    ) -> Result<PreparedInvocationState, ToolError> {
+        Ok(PreparedInvocationState::Current)
+    }
 
     /// Authorizes deterministic compaction after the typed output is erased.
     ///
@@ -170,62 +315,98 @@ pub trait TypedTool: Send + Sync {
 #[async_trait]
 impl<T> Tool for T
 where
-    T: TypedTool,
+    T: TypedTool + 'static,
 {
     fn definition(&self) -> &ToolDefinition {
         TypedTool::definition(self)
     }
 
-    fn permission(
-        &self,
-        args: &serde_json::Value,
-        ctx: &ToolContext,
-    ) -> Result<PermissionRequest, ToolOutput> {
-        // Parse here to build the request (and so bad arguments fail as
-        // `invalid_arguments` before reaching the approver); `call` parses again
-        // to run. The two parses are deliberate, not a missed optimization:
-        // `permission` is a standalone `raw → request` projection, so the raw
-        // JSON stays the single currency flowing through gate → (future) hook →
-        // decide. A future `PreToolUse` hook that rewrites arguments can just
-        // re-run this projection on the new raw and re-gate on it. Carrying a
-        // single parsed value across the decision (the abandoned
-        // `PreparedToolCall` direction) would instead go stale on every rewrite
-        // and have to be rebuilt — fighting that grain. Args are tiny, so the
-        // extra parse is nanoseconds.
-        match serde_json::from_value::<T::Args>(args.clone()) {
-            Ok(parsed) => Ok(TypedTool::permission(self, &parsed, ctx)),
-            Err(err) => Err(ToolOutput::failure(
+    async fn prepare(
+        self: Arc<Self>,
+        args: serde_json::Value,
+        ctx: &PreparationContext,
+    ) -> Result<ToolPreparation, ToolOutput> {
+        let parsed = serde_json::from_value::<T::Args>(args.clone()).map_err(|err| {
+            ToolOutput::failure(
                 ToolErrorKind::InvalidArguments,
                 format!("failed to parse arguments: {err}"),
-            )),
-        }
-    }
-
-    async fn call(
-        &self,
-        args: serde_json::Value,
-        ctx: &ToolContext,
-    ) -> Result<ToolOutput, ToolError> {
-        let output = match serde_json::from_value::<T::Args>(args) {
-            Ok(args) => self.run(args, ctx).await,
-            Err(err) => {
-                return Ok(ToolOutput::failure(
-                    "invalid_arguments",
-                    format!("failed to parse arguments: {err}"),
-                ));
-            }
+            )
+        })?;
+        let typed = self
+            .prepare_typed(parsed, CanonicalToolInput::new(args), ctx)
+            .await?;
+        let TypedPreparation {
+            prepared,
+            canonical_input,
+            checks,
+            display,
+        } = typed;
+        let invocation = TypedPreparedInvocation {
+            tool: self,
+            prepared,
+            canonical_input: canonical_input.clone(),
         };
+        Ok(ToolPreparation::new(
+            canonical_input,
+            Box::new(invocation),
+            checks,
+            display,
+        ))
+    }
+}
 
-        output.erase()
+struct TypedPreparedInvocation<T>
+where
+    T: TypedTool,
+{
+    tool: Arc<T>,
+    prepared: T::Prepared,
+    canonical_input: CanonicalToolInput,
+}
+
+#[async_trait]
+impl<T> PreparedInvocation for TypedPreparedInvocation<T>
+where
+    T: TypedTool + 'static,
+{
+    async fn revalidate(
+        &mut self,
+        ctx: &ToolContext,
+    ) -> Result<PreparedInvocationState, ToolError> {
+        self.tool.revalidate_prepared(&mut self.prepared, ctx).await
     }
 
-    fn result_retention(
-        &self,
-        args: &serde_json::Value,
-        output: &ToolOutput,
-    ) -> ToolResultRetention {
-        TypedTool::result_retention(self, args, output)
+    async fn execute(self: Box<Self>, ctx: &ToolContext) -> Result<ExecutedInvocation, ToolError> {
+        let Self {
+            tool,
+            prepared,
+            canonical_input,
+        } = *self;
+        let output = tool.run_prepared(prepared, ctx).await.erase()?;
+        let retention = tool.result_retention(canonical_input.as_value(), &output);
+        Ok(ExecutedInvocation::new(output, retention))
     }
+}
+
+#[cfg(test)]
+pub(crate) async fn execute_for_test<T: Tool>(
+    tool: Arc<T>,
+    args: serde_json::Value,
+    ctx: &ToolContext,
+) -> Result<ToolOutput, ToolError> {
+    let preparation = match tool.prepare(args, &PreparationContext::new()).await {
+        Ok(preparation) => preparation,
+        Err(output) => return Ok(output),
+    };
+    let (_, mut invocation, _, _) = preparation.into_parts();
+    if invocation.revalidate(ctx).await? == PreparedInvocationState::Stale {
+        return Ok(ToolOutput::failure(
+            "stale_preparation",
+            "prepared tool input changed before execution",
+        ));
+    }
+    let executed = invocation.execute(ctx).await?;
+    Ok(executed.into_parts().0)
 }
 
 /// Build a [`ToolDefinition`] whose argument schema is generated from `A` via

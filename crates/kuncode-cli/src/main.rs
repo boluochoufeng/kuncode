@@ -27,7 +27,7 @@ use crate::{approver::TerminalApprover, runtime::CliRuntime};
 #[derive(Parser, Debug)]
 #[command(name = "kuncode", about = "A coding agent in your shell")]
 pub(crate) struct Cli {
-    /// Allow rule, e.g. `Bash(cargo *)` or `Read` (repeatable).
+    /// Allow rule, e.g. `Bash(cargo *)` or `Read(./src/**)` (repeatable).
     #[arg(long = "allow", value_name = "RULE")]
     pub(crate) allow: Vec<String>,
     /// Always-ask rule, e.g. `Edit(.env)` (repeatable).
@@ -36,9 +36,12 @@ pub(crate) struct Cli {
     /// Deny rule, e.g. `Bash(curl *)` (repeatable).
     #[arg(long = "deny", value_name = "RULE")]
     pub(crate) deny: Vec<String>,
-    /// Permission mode: `default`, `accept-edits`, or `bypass`.
+    /// Permission mode: default, accept-edits, plan, bypass-permissions, or dont-ask.
     #[arg(long = "mode", value_name = "MODE")]
     pub(crate) mode: Option<String>,
+    /// Trust this workspace's permission relaxations for the current process.
+    #[arg(long)]
+    pub(crate) trust_project: bool,
     /// Prompt to run. Omit to start an interactive session.
     #[arg(trailing_var_arg = true)]
     prompt: Vec<String>,
@@ -85,7 +88,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     if !initial_prompt.trim().is_empty() {
         let mut session = runtime.session().await;
         let runner =
-            runtime.into_runner(Arc::new(TerminalApprover), Arc::new(observer::CliObserver));
+            runtime.into_runner(Arc::new(TerminalApprover), Arc::new(observer::CliObserver))?;
 
         match run_turn(&runner, &mut session, initial_prompt).await {
             Ok(text) => println!("\n{text}"),

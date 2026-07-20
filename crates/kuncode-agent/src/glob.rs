@@ -40,56 +40,56 @@ pub fn command_match(pattern: &str, command: &str) -> bool {
 }
 
 fn glob_parts_match(pattern: &[&str], path: &[&str]) -> bool {
-    match (pattern.split_first(), path.split_first()) {
-        (None, None) => true,
-        (None, Some(_)) => false,
-        (Some((&"**", rest)), None) => glob_parts_match(rest, path),
-        (Some((&"**", rest)), Some((_, path_rest))) => {
-            glob_parts_match(rest, path) || glob_parts_match(pattern, path_rest)
+    let mut previous = vec![false; path.len() + 1];
+    previous[0] = true;
+    for pattern_segment in pattern {
+        let mut current = vec![false; path.len() + 1];
+        if *pattern_segment == "**" {
+            current[0] = previous[0];
+            for index in 1..=path.len() {
+                current[index] = previous[index] || current[index - 1];
+            }
+        } else {
+            for index in 1..=path.len() {
+                current[index] =
+                    previous[index - 1] && segment_match(pattern_segment, path[index - 1]);
+            }
         }
-        (Some((segment_pattern, pattern_rest)), Some((segment, path_rest))) => {
-            segment_match(segment_pattern, segment) && glob_parts_match(pattern_rest, path_rest)
-        }
-        (Some(_), None) => false,
+        previous = current;
     }
+    previous[path.len()]
 }
 
 fn segment_match(pattern: &str, text: &str) -> bool {
     let pattern = pattern.chars().collect::<Vec<_>>();
     let text = text.chars().collect::<Vec<_>>();
-    let mut dp = vec![vec![false; text.len() + 1]; pattern.len() + 1];
-    dp[0][0] = true;
+    let mut pattern_index = 0usize;
+    let mut text_index = 0usize;
+    let mut last_star = None;
+    let mut star_text_index = 0usize;
 
-    for index in 0..pattern.len() {
-        match pattern[index] {
-            '*' => {
-                for text_index in 0..=text.len() {
-                    if dp[index][text_index] {
-                        dp[index + 1][text_index] = true;
-                    }
-                    if text_index > 0 && dp[index + 1][text_index - 1] {
-                        dp[index + 1][text_index] = true;
-                    }
-                }
-            }
-            '?' => {
-                for text_index in 0..text.len() {
-                    if dp[index][text_index] {
-                        dp[index + 1][text_index + 1] = true;
-                    }
-                }
-            }
-            literal => {
-                for text_index in 0..text.len() {
-                    if dp[index][text_index] && text[text_index] == literal {
-                        dp[index + 1][text_index + 1] = true;
-                    }
-                }
-            }
+    while text_index < text.len() {
+        if pattern_index < pattern.len()
+            && (pattern[pattern_index] == '?' || pattern[pattern_index] == text[text_index])
+        {
+            pattern_index += 1;
+            text_index += 1;
+        } else if pattern_index < pattern.len() && pattern[pattern_index] == '*' {
+            last_star = Some(pattern_index);
+            pattern_index += 1;
+            star_text_index = text_index;
+        } else if let Some(star) = last_star {
+            star_text_index += 1;
+            text_index = star_text_index;
+            pattern_index = star + 1;
+        } else {
+            return false;
         }
     }
-
-    dp[pattern.len()][text.len()]
+    while pattern_index < pattern.len() && pattern[pattern_index] == '*' {
+        pattern_index += 1;
+    }
+    pattern_index == pattern.len()
 }
 
 #[cfg(test)]
@@ -103,6 +103,8 @@ mod tests {
         assert!(glob_match("**/*.rs", "src/main.rs"));
         assert!(glob_match("src/**/main.??", "src/bin/main.rs"));
         assert!(!glob_match("src/**/main.??", "src/bin/main.txt"));
+        assert!(glob_match("**/**/**/main.rs", "src/bin/main.rs"));
+        assert!(glob_match("a/**", "a"));
     }
 
     #[test]

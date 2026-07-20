@@ -1757,6 +1757,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "turso",
+ "url",
 ]
 
 [[package]]

@@ -1,6 +1,7 @@
 use super::support::{
     AgentConfig, AgentRunner, AgentSession, Arc, AssistantContent, FakeModel, NewSession,
-    ScriptedHook, Seq, SessionStore, TestDir, ToolRegistry, TursoSessionStore, bash, response,
+    ScriptedHook, Seq, SessionStore, TestDir, ToolRegistry, TursoSessionStore, register_bash,
+    response,
 };
 
 // Verifies that only direct turn input receives human-authored lineage.
@@ -27,7 +28,7 @@ async fn only_real_prompt_is_human_and_durable_appends_get_exact_coverage() {
         response(AssistantContent::text("done")),
     ]);
     let mut registry = ToolRegistry::new();
-    registry.register(bash().await);
+    register_bash(&mut registry).await;
     let hook = ScriptedHook::default()
         .add_context("HOOK_CONTEXT")
         .add_feedback("POST_TOOL_FEEDBACK")

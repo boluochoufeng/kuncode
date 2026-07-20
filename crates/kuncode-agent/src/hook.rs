@@ -1,22 +1,122 @@
 //! Extensible intervention points around the agent loop.
 //!
-//! A [`Hook`] is the control-plane dual of the read-only
-//! [`AgentObserver`](crate::observer::AgentObserver): same "agent defines the
-//! trait, the frontend implements it" shape as
-//! [`Approver`](crate::permission::Approver), but on the control path — a hook
-//! can veto, inject, or force a continuation. Hooks may only *tighten*: there is
-//! deliberately no variant that lets one grant a tool the
-//! [`PermissionGate`](crate::permission::PermissionGate) did not — `PreToolOutcome`
-//! has no `Allow`, so "a hook cannot bypass the gate" holds at the type level.
+//! A [`Hook`] is the control-plane counterpart of the read-only
+//! [`AgentObserver`](crate::observer::AgentObserver). Authorization Hooks can
+//! contribute policy or replace input only within capabilities fixed by their
+//! trusted registration; policy still resolves Deny over Ask over Allow.
 
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Instant,
+};
 
 use async_trait::async_trait;
 use kuncode_core::completion::Message;
 use serde_json::Value;
 
-use crate::permission::{PermissionAction, PermissionRequest};
+use crate::permission::{
+    ApprovalChallenge, ApprovalResolution, AuthorizationRequest, PolicyScopeSet, SafeExplanation,
+};
 use crate::tool::ToolOutput;
+
+static NEXT_HOOK_REGISTRY_REVISION: AtomicU64 = AtomicU64::new(1);
+const MAX_HOOK_NAME_CHARS: usize = 256;
+
+/// Monotonic identity of the append-only Hook registry snapshot.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct HookRegistryRevision(u64);
+
+impl HookRegistryRevision {
+    /// Returns the snapshot revision value.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Trusted capabilities assigned when a Hook is registered.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct HookCapabilities {
+    /// Allows an `Allow` contribution for the current generation.
+    pub may_allow: bool,
+    /// Allows replacing the complete tool input.
+    pub may_rewrite_input: bool,
+    /// Allows resolving an existing approval challenge.
+    pub may_answer_approval: bool,
+    /// Limits persistence scopes selectable by an approval Hook.
+    pub policy_mutation_scopes: PolicyScopeSet,
+}
+
+/// Call-level policy effect returned by `PreToolUse`.
+#[derive(Clone, Debug)]
+pub enum HookEffect {
+    /// Contributes ordinary Allow to every check in this generation.
+    Allow,
+    /// Contributes RequireApproval to every check in this generation.
+    Ask,
+    /// Contributes unapprovable Deny to every check in this generation.
+    Deny {
+        /// Bounded reason safe for ordinary diagnostics.
+        reason: SafeExplanation,
+    },
+}
+
+/// One Hook's effect and optional full-input replacement.
+#[derive(Clone, Debug, Default)]
+pub struct PreToolOutcome {
+    /// `None` abstains from policy contribution.
+    pub effect: Option<HookEffect>,
+    /// Complete replacement input, never a sequential JSON patch.
+    pub replacement_input: Option<Value>,
+}
+
+/// Bounded failure returned by an authorization Hook.
+#[derive(Clone, Debug)]
+pub struct AuthorizationHookFailure {
+    reason: SafeExplanation,
+}
+
+impl AuthorizationHookFailure {
+    /// Creates a fail-closed Hook diagnostic.
+    pub fn new(reason: impl AsRef<str>) -> Self {
+        Self {
+            reason: SafeExplanation::new(reason),
+        }
+    }
+
+    /// Returns the safe diagnostic text.
+    pub fn reason(&self) -> &SafeExplanation {
+        &self.reason
+    }
+}
+
+/// Stable structured snapshot seen by every Hook in one generation.
+pub struct PreToolCx<'a> {
+    /// Profile-validated request for the current generation.
+    pub request: &'a AuthorizationRequest,
+    /// Transcript before this model tool call.
+    pub messages: &'a [Message],
+    /// Zero-based model-call index within the turn.
+    pub iteration: usize,
+}
+
+impl PreToolCx<'_> {
+    /// Owned serializable snapshot for an out-of-process Hook.
+    pub fn payload(&self) -> Value {
+        serde_json::json!({
+            "event": "PreToolUse",
+            "call_id": self.request.call_id(),
+            "generation": self.request.generation(),
+            "tool": self.request.tool(),
+            "canonical_input": self.request.canonical_input(),
+            "checks": self.request.checks(),
+            "display": self.request.display(),
+            "iteration": self.iteration,
+        })
+    }
+}
 
 /// The four loop seams a hook can act on.
 ///
@@ -32,11 +132,22 @@ pub trait Hook: Send + Sync {
         PromptOutcome::Proceed
     }
 
-    /// A tool call once its [`PermissionRequest`] is computed, before the gate
-    /// decides. Tighten-only: it can `Deny`, never grant.
-    async fn pre_tool_use(&self, cx: &PreToolCx<'_>) -> PreToolOutcome {
+    /// Contributes policy or replaces input for a prepared authorization request.
+    async fn pre_tool_use(
+        &self,
+        cx: &PreToolCx<'_>,
+    ) -> Result<PreToolOutcome, AuthorizationHookFailure> {
         let _ = cx;
-        PreToolOutcome::Proceed
+        Ok(PreToolOutcome::default())
+    }
+
+    /// Optionally resolves an already-created approval challenge.
+    async fn approval_request(
+        &self,
+        challenge: &ApprovalChallenge,
+    ) -> Result<ApprovalResolution, AuthorizationHookFailure> {
+        let _ = challenge;
+        Ok(ApprovalResolution::Abstain)
     }
 
     /// A tool that produced a deliverable [`ToolOutput`], after its result is
@@ -69,20 +180,35 @@ pub enum PromptOutcome {
     },
 }
 
-/// What a `PreToolUse` hook decided.
-///
-/// No `Allow` variant by design: a hook can only tighten, never override the
-/// gate (see the module docs).
+/// Capability-validated output from one registered authorization Hook.
 #[derive(Clone, Debug)]
-pub enum PreToolOutcome {
-    /// No objection; the gate still decides.
-    Proceed,
-    /// Block the call; fed back to the model as a recoverable
-    /// `blocked_by_hook` failure.
-    Deny {
-        /// Message reported to the model.
-        message: String,
-    },
+pub(crate) struct AuthorizationHookResult {
+    name: String,
+    outcome: PreToolOutcome,
+}
+
+impl AuthorizationHookResult {
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub(crate) fn outcome(&self) -> &PreToolOutcome {
+        &self.outcome
+    }
+}
+
+/// Invalid trusted Hook registration metadata.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum HookRegistrationError {
+    /// Audit and cause identities require a concrete name.
+    #[error("hook registration name must not be blank")]
+    BlankName,
+    /// Stable names must identify at most one Hook.
+    #[error("hook registration name `{0}` is already in use")]
+    DuplicateName(String),
+    /// Stable names remain bounded for logs and cause identities.
+    #[error("hook registration name exceeds the maximum of 256 characters")]
+    NameTooLong,
 }
 
 /// What a `PostToolUse` hook decided. No veto — the tool already ran.
@@ -118,33 +244,6 @@ impl PromptCx<'_> {
     /// Owned, serializable snapshot for an out-of-process hook.
     pub fn payload(&self) -> Value {
         serde_json::json!({ "event": "UserPromptSubmit", "prompt": self.prompt })
-    }
-}
-
-/// Borrowed view for [`Hook::pre_tool_use`].
-pub struct PreToolCx<'a> {
-    /// The structured request the gate will rule on (the permission gate's own type).
-    pub request: &'a PermissionRequest,
-    /// Raw arguments (read-only; argument rewrite is deferred).
-    pub args: &'a Value,
-    /// Transcript so far.
-    pub messages: &'a [Message],
-    /// Zero-based model-call index within the turn.
-    pub iteration: usize,
-}
-
-impl PreToolCx<'_> {
-    /// Owned, serializable snapshot for an out-of-process hook.
-    pub fn payload(&self) -> Value {
-        serde_json::json!({
-            "event": "PreToolUse",
-            "tool": self.request.tool,
-            "action": action_str(self.request.action),
-            "resource": self.request.resource,
-            "summary": self.request.summary,
-            "args": self.args,
-            "iteration": self.iteration,
-        })
     }
 }
 
@@ -187,23 +286,33 @@ impl StopCx<'_> {
     }
 }
 
-/// Wire name for a [`PermissionAction`] in a hook payload.
-fn action_str(action: PermissionAction) -> &'static str {
-    match action {
-        PermissionAction::Read => "read",
-        PermissionAction::Write => "write",
-        PermissionAction::Execute => "execute",
-        PermissionAction::Meta => "meta",
-    }
-}
-
 /// Ordered collection of hooks with the folding rules documented on each method
 /// (veto-first short-circuit, additive accumulation, any-`Continue` continues).
 ///
 /// Empty by default; the runner checks [`is_empty`](Self::is_empty) and skips
 /// the whole machinery (and its cancellation race) when there are no hooks.
-#[derive(Default, Clone)]
-pub struct Hooks(Vec<Arc<dyn Hook>>);
+#[derive(Clone)]
+struct HookRegistration {
+    name: String,
+    hook: Arc<dyn Hook>,
+    capabilities: HookCapabilities,
+}
+
+/// Ordered Hook registry with capabilities fixed at registration time.
+#[derive(Clone)]
+pub struct Hooks {
+    registrations: Vec<HookRegistration>,
+    revision: HookRegistryRevision,
+}
+
+impl Default for Hooks {
+    fn default() -> Self {
+        Self {
+            registrations: Vec::new(),
+            revision: next_hook_registry_revision(),
+        }
+    }
+}
 
 impl Hooks {
     /// An empty set.
@@ -213,12 +322,94 @@ impl Hooks {
 
     /// Appends a hook; later hooks fold after earlier ones (registration order).
     pub fn push(&mut self, hook: Arc<dyn Hook>) {
-        self.0.push(hook);
+        let mut suffix = self.registrations.len();
+        let name = loop {
+            let candidate = format!("hook-{suffix}");
+            if !self
+                .registrations
+                .iter()
+                .any(|registration| registration.name == candidate)
+            {
+                break candidate;
+            }
+            suffix = suffix.saturating_add(1);
+        };
+        let hook_name = name.clone();
+        self.registrations.push(HookRegistration {
+            name,
+            hook,
+            capabilities: HookCapabilities::default(),
+        });
+        self.revision = next_hook_registry_revision();
+        tracing::info!(
+            target: "kuncode::hook",
+            hook_name,
+            may_allow = false,
+            may_rewrite_input = false,
+            may_answer_approval = false,
+            policy_mutation_scopes = ?PolicyScopeSet::NONE,
+            hook_revision = self.revision.get(),
+            "authorization hook registered",
+        );
+    }
+
+    /// Appends a named Hook with trusted capabilities.
+    ///
+    /// # Errors
+    /// Returns an error for a blank or duplicate registration name.
+    pub fn push_with_capabilities(
+        &mut self,
+        name: impl Into<String>,
+        hook: Arc<dyn Hook>,
+        capabilities: HookCapabilities,
+    ) -> Result<(), HookRegistrationError> {
+        let name = name.into();
+        if name.trim().is_empty() {
+            return Err(HookRegistrationError::BlankName);
+        }
+        if name
+            .chars()
+            .take(MAX_HOOK_NAME_CHARS.saturating_add(1))
+            .count()
+            > MAX_HOOK_NAME_CHARS
+        {
+            return Err(HookRegistrationError::NameTooLong);
+        }
+        if self
+            .registrations
+            .iter()
+            .any(|registration| registration.name == name)
+        {
+            return Err(HookRegistrationError::DuplicateName(name));
+        }
+        let hook_name = name.clone();
+        self.registrations.push(HookRegistration {
+            name,
+            hook,
+            capabilities,
+        });
+        self.revision = next_hook_registry_revision();
+        tracing::info!(
+            target: "kuncode::hook",
+            hook_name,
+            may_allow = capabilities.may_allow,
+            may_rewrite_input = capabilities.may_rewrite_input,
+            may_answer_approval = capabilities.may_answer_approval,
+            policy_mutation_scopes = ?capabilities.policy_mutation_scopes,
+            hook_revision = self.revision.get(),
+            "authorization hook registered",
+        );
+        Ok(())
     }
 
     /// Whether there are no hooks — the runner's fast-path guard.
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.registrations.is_empty()
+    }
+
+    /// Returns the append-only registration revision.
+    pub fn revision(&self) -> HookRegistryRevision {
+        self.revision
     }
 
     /// Veto-first: the first `Block` wins and discards any context accumulated
@@ -226,9 +417,9 @@ impl Hooks {
     /// concatenated in registration order.
     pub async fn user_prompt_submit(&self, cx: &PromptCx<'_>) -> PromptOutcome {
         let mut contexts = Vec::new();
-        for (hook_index, hook) in self.0.iter().enumerate() {
+        for (hook_index, registration) in self.registrations.iter().enumerate() {
             let started = Instant::now();
-            match hook.user_prompt_submit(cx).await {
+            match registration.hook.user_prompt_submit(cx).await {
                 PromptOutcome::Proceed => {
                     log_hook("user_prompt_submit", hook_index, "proceed", 0, started)
                 }
@@ -257,43 +448,124 @@ impl Hooks {
         fold_additive(contexts).map_or(PromptOutcome::Proceed, PromptOutcome::AddContext)
     }
 
-    /// Veto-first: the first `Deny` short-circuits the rest.
-    pub async fn pre_tool_use(&self, cx: &PreToolCx<'_>) -> PreToolOutcome {
-        for (hook_index, hook) in self.0.iter().enumerate() {
+    /// Runs every Hook against one immutable generation and validates outputs
+    /// against registration-time capabilities.
+    pub(crate) async fn pre_tool_use(&self, cx: &PreToolCx<'_>) -> Vec<AuthorizationHookResult> {
+        let mut results = Vec::with_capacity(self.registrations.len());
+        for (hook_index, registration) in self.registrations.iter().enumerate() {
             let started = Instant::now();
-            match hook.pre_tool_use(cx).await {
-                PreToolOutcome::Proceed => log_hook_with_tool(
-                    "pre_tool_use",
-                    hook_index,
-                    "proceed",
-                    &cx.request.tool,
-                    cx.iteration,
-                    0,
-                    started,
-                ),
-                PreToolOutcome::Deny { message } => {
-                    log_hook_with_tool(
-                        "pre_tool_use",
+            let outcome = match registration.hook.pre_tool_use(cx).await {
+                Ok(outcome) => validate_authorization_outcome(outcome, registration.capabilities),
+                Err(error) => fail_closed_hook_outcome(error.reason().clone()),
+            };
+            let outcome_name = match &outcome.effect {
+                Some(HookEffect::Allow) => "allow",
+                Some(HookEffect::Ask) => "ask",
+                Some(HookEffect::Deny { .. }) => "deny",
+                None if outcome.replacement_input.is_some() => "rewrite",
+                None => "abstain",
+            };
+            log_hook_with_tool(
+                "pre_tool_use",
+                hook_index,
+                outcome_name,
+                cx.request.tool().as_str(),
+                cx.iteration,
+                usize::from(outcome.replacement_input.is_some()),
+                started,
+            );
+            results.push(AuthorizationHookResult {
+                name: registration.name.clone(),
+                outcome,
+            });
+        }
+        results
+    }
+
+    /// Runs capable approval Hooks as the first resolver stage.
+    pub(crate) async fn approval_request(
+        &self,
+        challenge: &ApprovalChallenge,
+    ) -> ApprovalResolution {
+        for (hook_index, registration) in self.registrations.iter().enumerate() {
+            let started = Instant::now();
+            let resolution = match registration.hook.approval_request(challenge).await {
+                Ok(resolution) => resolution,
+                Err(_) => {
+                    log_approval_hook(
                         hook_index,
-                        "deny",
-                        &cx.request.tool,
-                        cx.iteration,
-                        message.chars().count(),
+                        &registration.name,
+                        "failure_deny",
+                        challenge,
                         started,
                     );
-                    return PreToolOutcome::Deny { message };
+                    return ApprovalResolution::Deny { persistence: None };
                 }
+            };
+            if matches!(resolution, ApprovalResolution::Abstain) {
+                log_approval_hook(
+                    hook_index,
+                    &registration.name,
+                    "abstain",
+                    challenge,
+                    started,
+                );
+                continue;
             }
+            if !registration.capabilities.may_answer_approval {
+                log_approval_hook(
+                    hook_index,
+                    &registration.name,
+                    "unauthorized_answer_deny",
+                    challenge,
+                    started,
+                );
+                return ApprovalResolution::Deny { persistence: None };
+            }
+            if matches!(resolution, ApprovalResolution::ReplaceInput(_))
+                && !registration.capabilities.may_rewrite_input
+            {
+                log_approval_hook(
+                    hook_index,
+                    &registration.name,
+                    "unauthorized_rewrite_deny",
+                    challenge,
+                    started,
+                );
+                return ApprovalResolution::Deny { persistence: None };
+            }
+            if !approval_persistence_is_authorized(
+                &resolution,
+                challenge,
+                registration.capabilities,
+            ) {
+                log_approval_hook(
+                    hook_index,
+                    &registration.name,
+                    "unauthorized_persistence_deny",
+                    challenge,
+                    started,
+                );
+                return ApprovalResolution::Deny { persistence: None };
+            }
+            log_approval_hook(
+                hook_index,
+                &registration.name,
+                approval_resolution_name(&resolution),
+                challenge,
+                started,
+            );
+            return resolution;
         }
-        PreToolOutcome::Proceed
+        ApprovalResolution::Abstain
     }
 
     /// Additive: every hook runs; all feedback is concatenated in order.
     pub async fn post_tool_use(&self, cx: &PostToolCx<'_>) -> PostToolOutcome {
         let mut feedback = Vec::new();
-        for (hook_index, hook) in self.0.iter().enumerate() {
+        for (hook_index, registration) in self.registrations.iter().enumerate() {
             let started = Instant::now();
-            match hook.post_tool_use(cx).await {
+            match registration.hook.post_tool_use(cx).await {
                 PostToolOutcome::Proceed => log_hook_with_tool(
                     "post_tool_use",
                     hook_index,
@@ -324,9 +596,9 @@ impl Hooks {
     /// (all continuation messages joined into one injection).
     pub async fn stop(&self, cx: &StopCx<'_>) -> StopOutcome {
         let mut messages = Vec::new();
-        for (hook_index, hook) in self.0.iter().enumerate() {
+        for (hook_index, registration) in self.registrations.iter().enumerate() {
             let started = Instant::now();
-            match hook.stop(cx).await {
+            match registration.hook.stop(cx).await {
                 StopOutcome::Allow => {
                     log_hook_with_iteration("stop", hook_index, "allow", cx.iteration, 0, started)
                 }
@@ -347,6 +619,56 @@ impl Hooks {
             message,
         })
     }
+}
+
+fn next_hook_registry_revision() -> HookRegistryRevision {
+    HookRegistryRevision(NEXT_HOOK_REGISTRY_REVISION.fetch_add(1, Ordering::Relaxed))
+}
+
+fn validate_authorization_outcome(
+    outcome: PreToolOutcome,
+    capabilities: HookCapabilities,
+) -> PreToolOutcome {
+    if matches!(outcome.effect.as_ref(), Some(HookEffect::Allow)) && !capabilities.may_allow {
+        return fail_closed_hook_outcome(SafeExplanation::new(
+            "hook returned Allow without may_allow capability",
+        ));
+    }
+    if outcome.replacement_input.is_some() && !capabilities.may_rewrite_input {
+        return fail_closed_hook_outcome(SafeExplanation::new(
+            "hook replaced input without may_rewrite_input capability",
+        ));
+    }
+    outcome
+}
+
+fn fail_closed_hook_outcome(reason: SafeExplanation) -> PreToolOutcome {
+    PreToolOutcome {
+        effect: Some(HookEffect::Deny { reason }),
+        replacement_input: None,
+    }
+}
+
+fn approval_persistence_is_authorized(
+    resolution: &ApprovalResolution,
+    challenge: &ApprovalChallenge,
+    capabilities: HookCapabilities,
+) -> bool {
+    let (id, expected_effect) = match resolution {
+        ApprovalResolution::Approve {
+            persistence: Some(id),
+        } => (id, crate::permission::PolicyEffect::Allow),
+        ApprovalResolution::Deny {
+            persistence: Some(id),
+        } => (id, crate::permission::PolicyEffect::Deny),
+        _ => return true,
+    };
+    challenge.mutation(id).is_some_and(|template| {
+        template.effect() == expected_effect
+            && capabilities
+                .policy_mutation_scopes
+                .contains(template.scope())
+    })
 }
 
 fn log_hook(
@@ -409,6 +731,35 @@ fn log_hook_with_iteration(
     );
 }
 
+fn log_approval_hook(
+    hook_index: usize,
+    name: &str,
+    outcome: &str,
+    challenge: &ApprovalChallenge,
+    started: Instant,
+) {
+    tracing::info!(
+        target: "kuncode::hook",
+        hook = "approval_request",
+        hook_index,
+        hook_name = name,
+        outcome,
+        challenge_id = challenge.id().as_str(),
+        latency_ms = elapsed_ms(started),
+        "hook completed",
+    );
+}
+
+fn approval_resolution_name(resolution: &ApprovalResolution) -> &'static str {
+    match resolution {
+        ApprovalResolution::Abstain => "abstain",
+        ApprovalResolution::Approve { .. } => "approve",
+        ApprovalResolution::Deny { .. } => "deny",
+        ApprovalResolution::ReplaceInput(_) => "replace_input",
+        ApprovalResolution::Cancel => "cancel",
+    }
+}
+
 fn elapsed_ms(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
@@ -424,9 +775,8 @@ fn fold_additive(parts: Vec<String>) -> Option<String> {
 
 /// A declarative test hook: each builder enables one behavior at one point.
 ///
-/// `expect`-free, but gated to `#[cfg(test)]` anyway to keep the test scaffold
-/// out of the shipped library (same stance as
-/// [`ScriptedApprover`](crate::permission::ScriptedApprover)).
+/// `expect`-free, but gated to `#[cfg(test)]` to keep the scaffold out of the
+/// shipped library.
 #[cfg(test)]
 #[derive(Default)]
 pub struct ScriptedHook {
@@ -486,13 +836,22 @@ impl Hook for ScriptedHook {
         PromptOutcome::Proceed
     }
 
-    async fn pre_tool_use(&self, cx: &PreToolCx<'_>) -> PreToolOutcome {
-        if self.deny_tool.as_deref() == Some(cx.request.tool.as_str()) {
-            return PreToolOutcome::Deny {
-                message: format!("blocked {} in test", cx.request.tool),
-            };
+    async fn pre_tool_use(
+        &self,
+        cx: &PreToolCx<'_>,
+    ) -> Result<PreToolOutcome, AuthorizationHookFailure> {
+        if self.deny_tool.as_deref() == Some(cx.request.tool().as_str()) {
+            return Ok(PreToolOutcome {
+                effect: Some(HookEffect::Deny {
+                    reason: SafeExplanation::new(format!(
+                        "blocked {} in test",
+                        cx.request.tool().as_str()
+                    )),
+                }),
+                replacement_input: None,
+            });
         }
-        PreToolOutcome::Proceed
+        Ok(PreToolOutcome::default())
     }
 
     async fn post_tool_use(&self, _cx: &PostToolCx<'_>) -> PostToolOutcome {

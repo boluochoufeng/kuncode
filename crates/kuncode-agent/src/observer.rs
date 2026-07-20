@@ -1,11 +1,11 @@
 //! Read-only observation of the agent loop.
 //!
 //! The runner emits structured [`AgentEvent`]s at key points so a frontend can
-//! render live progress. This mirrors the [`Approver`] seam — the agent defines
-//! the trait and emits, the frontend implements rendering — so `kuncode-agent`
-//! never touches the terminal.
+//! render live progress. This mirrors the [`ApprovalResolver`] seam — the agent
+//! defines the trait and emits, the frontend implements rendering — so
+//! `kuncode-agent` never touches the terminal.
 //!
-//! [`Approver`]: crate::permission::Approver
+//! [`ApprovalResolver`]: crate::permission::ApprovalResolver
 
 use std::{panic::AssertUnwindSafe, sync::Arc};
 
@@ -75,12 +75,11 @@ pub enum EventKind {
         /// Ids of the tool calls in this message, in order.
         tool_calls: Vec<String>,
     },
-    /// A tool call is about to be gated/executed. Emitted only once a
-    /// [`PermissionRequest`] was computed (tool resolved, arguments parsed), so
-    /// unknown-tool / bad-arguments produce only a [`ToolEnd`](Self::ToolEnd)
-    /// with no preceding `ToolStart`.
+    /// A tool call has a stable [`AuthorizationRequest`] and is about to be
+    /// approved or executed. Unknown-tool and bad-arguments failures therefore
+    /// produce only a [`ToolEnd`](Self::ToolEnd), without a preceding start.
     ///
-    /// [`PermissionRequest`]: crate::permission::PermissionRequest
+    /// [`AuthorizationRequest`]: crate::permission::AuthorizationRequest
     ToolStart {
         tool_call_id: String,
         tool: String,

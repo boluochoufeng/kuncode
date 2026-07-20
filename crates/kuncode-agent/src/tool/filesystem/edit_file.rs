@@ -1,14 +1,23 @@
 //! The `edit_file` tool: replace one unique occurrence of text in a file.
 
+use std::path::PathBuf;
+
 use async_trait::async_trait;
 use kuncode_core::completion::ToolDefinition;
+use kuncode_core::non_empty_vec::NonEmptyVec;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::helpers::{io_error, is_file, non_empty_path, rule_path, workspace_error};
+use super::helpers::{io_error, non_empty_path, workspace_error};
 use crate::{
-    permission::{PermissionAction, PermissionRequest},
-    tool::{ToolContext, ToolOutput, TypedTool, definition_for},
+    permission::{
+        CanonicalPath, CanonicalToolInput, PathSelector, PermissionCheckSpec, PermissionTarget,
+        ToolDisplay,
+    },
+    tool::{
+        PreparationContext, PreparedInvocationState, ToolContext, ToolError, ToolOutput,
+        TypedPreparation, TypedTool, definition_for,
+    },
     workspace::Workspace,
 };
 
@@ -34,6 +43,13 @@ pub struct EditFileOutput {
     pub bytes: usize,
 }
 
+/// Canonical edit target paired with the exact replacement retained for execution.
+#[derive(Debug)]
+pub struct PreparedEditFile {
+    args: EditFileArgs,
+    path: PathBuf,
+}
+
 /// Replaces text in UTF-8 files inside the workspace.
 #[derive(Clone, Debug)]
 pub struct EditFile {
@@ -57,50 +73,63 @@ impl EditFile {
 #[async_trait]
 impl TypedTool for EditFile {
     type Args = EditFileArgs;
+    type Prepared = PreparedEditFile;
     type Output = EditFileOutput;
 
     fn definition(&self) -> &ToolDefinition {
         &self.definition
     }
 
-    fn permission(&self, args: &EditFileArgs, _ctx: &ToolContext) -> PermissionRequest {
-        let path = rule_path(&self.workspace, &args.path);
-        PermissionRequest::new(
-            "edit_file",
-            PermissionAction::Write,
-            Some(path.clone()),
-            format!("Edit file: {path}"),
-        )
+    async fn prepare_typed(
+        &self,
+        mut args: EditFileArgs,
+        _canonical_input: CanonicalToolInput,
+        _ctx: &PreparationContext,
+    ) -> Result<TypedPreparation<Self::Prepared>, ToolOutput> {
+        let path = non_empty_path(&args.path)?;
+        if args.old_text.is_empty() {
+            return Err(ToolOutput::failure(
+                "invalid_arguments",
+                "`old_text` must not be empty",
+            ));
+        }
+        let resolved = self
+            .workspace
+            .resolve_target(path)
+            .await
+            .map_err(workspace_error)?;
+
+        let canonical_path = CanonicalPath::from_absolute(&resolved)
+            .map_err(|error| ToolOutput::failure("invalid_arguments", error.to_string()))?;
+        let display_path = self.workspace.relative_display(&resolved);
+        args.path = canonical_path.as_str().to_string();
+        let canonical_input = CanonicalToolInput::new(serde_json::json!({
+            "path": canonical_path.as_str(),
+            "old_text": args.old_text,
+            "new_text": args.new_text,
+        }));
+        Ok(TypedPreparation::new(
+            PreparedEditFile {
+                args,
+                path: resolved,
+            },
+            canonical_input,
+            NonEmptyVec::new(PermissionCheckSpec::new(PermissionTarget::Edit(
+                PathSelector::exact(canonical_path),
+            ))),
+            ToolDisplay::new(format!("Edit file: {display_path}")),
+        ))
     }
 
-    async fn run(&self, args: EditFileArgs, _ctx: &ToolContext) -> ToolOutput<EditFileOutput> {
-        let path = match non_empty_path(&args.path) {
-            Ok(path) => path,
-            Err(output) => return output,
-        };
-
-        if args.old_text.is_empty() {
-            return ToolOutput::failure("invalid_arguments", "`old_text` must not be empty");
-        }
-
-        let resolved = match self.workspace.resolve_existing(path).await {
-            Ok(path) => path,
-            Err(err) => return workspace_error(err),
-        };
-
-        if !is_file(&resolved).await {
-            return ToolOutput::failure(
-                "invalid_path",
-                format!(
-                    "`{}` is not a file",
-                    self.workspace.relative_display(&resolved)
-                ),
-            );
-        }
-
-        let content = match tokio::fs::read_to_string(&resolved).await {
+    async fn run_prepared(
+        &self,
+        prepared: PreparedEditFile,
+        _ctx: &ToolContext,
+    ) -> ToolOutput<EditFileOutput> {
+        let PreparedEditFile { args, path } = prepared;
+        let content = match tokio::fs::read_to_string(&path).await {
             Ok(content) => content,
-            Err(err) => return io_error("read", &resolved, err, &self.workspace),
+            Err(err) => return io_error("read", &path, err, &self.workspace),
         };
 
         // `old_text` must be unambiguous: zero matches gives the model nothing
@@ -112,7 +141,7 @@ impl TypedTool for EditFile {
                     "text_not_found",
                     format!(
                         "`old_text` was not found in `{}`",
-                        self.workspace.relative_display(&resolved)
+                        self.workspace.relative_display(&path)
                     ),
                 );
             }
@@ -123,32 +152,51 @@ impl TypedTool for EditFile {
                     format!(
                         "`old_text` matches {count} times in `{}`; \
                          include surrounding context so it is unique",
-                        self.workspace.relative_display(&resolved)
+                        self.workspace.relative_display(&path)
                     ),
                 );
             }
         }
 
         let edited = content.replacen(&args.old_text, &args.new_text, 1);
-        if let Err(err) = tokio::fs::write(&resolved, edited.as_bytes()).await {
-            return io_error("write", &resolved, err, &self.workspace);
+        if let Err(err) = tokio::fs::write(&path, edited.as_bytes()).await {
+            return io_error("write", &path, err, &self.workspace);
         }
 
         ToolOutput::success(EditFileOutput {
-            path: self.workspace.relative_display(&resolved),
+            path: self.workspace.relative_display(&path),
             replacements: 1,
             bytes: edited.len(),
         })
+    }
+
+    async fn revalidate_prepared(
+        &self,
+        prepared: &mut PreparedEditFile,
+        _ctx: &ToolContext,
+    ) -> Result<PreparedInvocationState, ToolError> {
+        Ok(
+            if self
+                .workspace
+                .revalidate_target(&prepared.path)
+                .await
+                .is_ok()
+            {
+                PreparedInvocationState::Current
+            } else {
+                PreparedInvocationState::Stale
+            },
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{fs, sync::Arc};
 
     use super::EditFile;
     use crate::test_support::TestDir;
-    use crate::tool::{Tool, ToolContext};
+    use crate::tool::{ToolContext, execute_for_test};
 
     #[tokio::test]
     async fn edit_file_replaces_once() {
@@ -156,17 +204,17 @@ mod tests {
         fs::write(tmp.path().join("notes.txt"), "target rest").expect("file should be written");
         let tool = EditFile::new(tmp.workspace().await);
 
-        let output = tool
-            .call(
-                serde_json::json!({
-                    "path": "notes.txt",
-                    "old_text": "target",
-                    "new_text": "done"
-                }),
-                &ToolContext::new(),
-            )
-            .await
-            .expect("no harness-level error");
+        let output = execute_for_test(
+            Arc::new(tool),
+            serde_json::json!({
+                "path": "notes.txt",
+                "old_text": "target",
+                "new_text": "done"
+            }),
+            &ToolContext::new(),
+        )
+        .await
+        .expect("no harness-level error");
 
         assert!(output.ok);
         assert_eq!(
@@ -182,17 +230,17 @@ mod tests {
         fs::write(tmp.path().join("notes.txt"), "same same").expect("file should be written");
         let tool = EditFile::new(tmp.workspace().await);
 
-        let output = tool
-            .call(
-                serde_json::json!({
-                    "path": "notes.txt",
-                    "old_text": "same",
-                    "new_text": "done"
-                }),
-                &ToolContext::new(),
-            )
-            .await
-            .expect("no harness-level error");
+        let output = execute_for_test(
+            Arc::new(tool),
+            serde_json::json!({
+                "path": "notes.txt",
+                "old_text": "same",
+                "new_text": "done"
+            }),
+            &ToolContext::new(),
+        )
+        .await
+        .expect("no harness-level error");
 
         assert!(!output.ok);
         assert_eq!(
@@ -212,17 +260,17 @@ mod tests {
         fs::write(tmp.path().join("notes.txt"), "hello").expect("file should be written");
         let tool = EditFile::new(tmp.workspace().await);
 
-        let output = tool
-            .call(
-                serde_json::json!({
-                    "path": "notes.txt",
-                    "old_text": "missing",
-                    "new_text": "done"
-                }),
-                &ToolContext::new(),
-            )
-            .await
-            .expect("no harness-level error");
+        let output = execute_for_test(
+            Arc::new(tool),
+            serde_json::json!({
+                "path": "notes.txt",
+                "old_text": "missing",
+                "new_text": "done"
+            }),
+            &ToolContext::new(),
+        )
+        .await
+        .expect("no harness-level error");
 
         assert!(!output.ok);
         assert_eq!(

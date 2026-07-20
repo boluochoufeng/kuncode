@@ -4,10 +4,11 @@
 //! lineage. Roles alone never establish human authorship or durable provenance.
 
 use kuncode_core::completion::Message;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(test)]
 use crate::compaction::summary::ContinuitySummary;
-use crate::permission::{PermissionMode, PermissionSessionState};
+use crate::permission::{PermissionMode, SessionPolicyOverlay};
 use crate::session_store::{Seq, SessionId};
 use crate::todo::{TodoHandle, TodoItem};
 use crate::tool::ToolResultRetention;
@@ -27,7 +28,7 @@ pub use persistence::{SessionAppendError, SessionAttachError, SessionStartError}
 /// Active conversation context owned by the caller between agent turns.
 ///
 /// Besides the message history it carries the mutable
-/// [`PermissionSessionState`]: keeping per-session grants and mode here — rather
+/// [`SessionPolicyOverlay`]: keeping per-session rules and mode here — rather
 /// than on the shared, `&self` runner — gives per-session isolation with no lock.
 ///
 /// `messages` and `message_lineage` always have equal length. A persistence
@@ -38,12 +39,12 @@ pub struct AgentSession {
     messages: Vec<Message>,
     message_lineage: Vec<MessageLineage>,
     active_summary: Option<ActiveSummary>,
-    permissions: PermissionSessionState,
+    permissions: SessionPolicyOverlay,
     /// Monotonic counter handing out [`AgentEvent`](crate::observer::AgentEvent)
     /// sequence numbers. Lives on the session, not the `&self`/`Clone` runner,
     /// because ordering is per-session — same reasoning as the per-session
     /// permission grants above.
-    seq: u64,
+    seq: AtomicU64,
     /// The session task plan. Same per-session rationale as the permission
     /// state. The runner clones this handle into each
     /// [`ToolContext`](crate::tool::ToolContext) so `todo_write` writes here.
@@ -71,7 +72,7 @@ impl Clone for AgentSession {
             active_summary: None,
             messages,
             permissions: self.permissions.clone(),
-            seq: self.seq,
+            seq: AtomicU64::new(self.seq.load(Ordering::Relaxed)),
             todos: self.todos.deep_clone(),
             session_id: None,
             last_durable_seq: None,
@@ -90,7 +91,7 @@ impl AgentSession {
     /// Creates an empty session starting in `mode`.
     pub fn with_mode(mode: PermissionMode) -> Self {
         Self {
-            permissions: PermissionSessionState::new(mode),
+            permissions: SessionPolicyOverlay::new(mode),
             ..Self::default()
         }
     }
@@ -111,13 +112,13 @@ impl AgentSession {
     }
 
     /// The session's permission state (mode + grants).
-    pub fn permissions(&self) -> &PermissionSessionState {
+    pub fn permissions(&self) -> &SessionPolicyOverlay {
         &self.permissions
     }
 
     /// Mutable access to the permission state, for recording grants and mode
     /// changes during a turn.
-    pub fn permissions_mut(&mut self) -> &mut PermissionSessionState {
+    pub fn permissions_mut(&mut self) -> &mut SessionPolicyOverlay {
         &mut self.permissions
     }
 
@@ -244,10 +245,8 @@ impl AgentSession {
     }
 
     /// Hands out the next event sequence number, then advances. Starts at `0`.
-    pub(crate) fn next_seq(&mut self) -> u64 {
-        let seq = self.seq;
-        self.seq += 1;
-        seq
+    pub(crate) fn next_seq(&self) -> u64 {
+        self.seq.fetch_add(1, Ordering::Relaxed)
     }
 
     pub(crate) fn is_empty(&self) -> bool {

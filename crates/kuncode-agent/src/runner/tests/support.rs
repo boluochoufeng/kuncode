@@ -31,13 +31,15 @@ pub(super) use crate::{
     },
     error::AgentError,
     hook::{
-        Hook, PostToolCx, PostToolOutcome, PreToolCx, PreToolOutcome, ScriptedHook, StopCx,
-        StopOutcome,
+        AuthorizationHookFailure, Hook, PostToolCx, PostToolOutcome, PreToolCx, PreToolOutcome,
+        ScriptedHook, StopCx, StopOutcome,
     },
     observer::{AgentEvent, AgentObserver, CompositeObserver, EventKind},
     permission::{
-        ApprovalOutcome, PermissionAction, PermissionPolicy, PermissionRequest, RuleOrigin,
-        ScriptedApprover, parse_rule,
+        ApprovalChallenge, ApprovalResolution, ApprovalResolver, CanonicalPath, CanonicalToolInput,
+        PermissionCheckSpec, PermissionNamespace, PermissionTarget, PolicyEffect, PolicyOrigin,
+        PolicyScope, PolicySet, ProfileDefault, ScriptedApprovalResolver, ToolDisplay,
+        ToolPermissionProfile,
     },
     registry::ToolRegistry,
     session::AgentSession,
@@ -45,8 +47,9 @@ pub(super) use crate::{
     system_prompt::{IdentitySection, SystemPrompt},
     test_support::TestDir,
     tool::{
-        Tool, ToolContext, ToolError, ToolOutput, TypedTool, bash::Bash, definition_for,
-        todo_write::TodoWrite,
+        ExecutedInvocation, PreparationContext, PreparedInvocation, Tool, ToolContext, ToolError,
+        ToolOutput, ToolPreparation, TypedPreparation, TypedTool, bash::Bash, definition_for,
+        exact_typed_preparation, todo_write::TodoWrite,
     },
 };
 
@@ -71,17 +74,28 @@ impl HangTool {
 #[async_trait]
 impl TypedTool for HangTool {
     type Args = HangArgs;
+    type Prepared = HangArgs;
     type Output = Value;
 
     fn definition(&self) -> &ToolDefinition {
         &self.definition
     }
 
-    fn permission(&self, _args: &HangArgs, _ctx: &ToolContext) -> PermissionRequest {
-        PermissionRequest::new("hang", PermissionAction::Read, None, "hang")
+    async fn prepare_typed(
+        &self,
+        args: HangArgs,
+        canonical_input: CanonicalToolInput,
+        _ctx: &PreparationContext,
+    ) -> Result<TypedPreparation<Self::Prepared>, ToolOutput> {
+        exact_typed_preparation(
+            "hang",
+            args,
+            canonical_input,
+            ToolDisplay::new("Run hanging test tool"),
+        )
     }
 
-    async fn run(&self, _args: HangArgs, ctx: &ToolContext) -> ToolOutput<Value> {
+    async fn run_prepared(&self, _prepared: HangArgs, ctx: &ToolContext) -> ToolOutput<Value> {
         // Cancel from inside the running tool, then never return: this
         // deterministically drives the runner's execute-stage `select!` to
         // the cancellation branch without pre-cancelling the token (which
@@ -153,6 +167,88 @@ pub(super) async fn bash() -> Bash {
     Bash::from_current_dir()
         .await
         .expect("current directory should be a valid workspace")
+}
+
+/// Registers the built-in shell adapter with its trusted namespace profile.
+pub(super) async fn register_bash(registry: &mut ToolRegistry) {
+    registry
+        .register_with_profile(
+            bash().await,
+            ToolPermissionProfile::new(
+                "bash",
+                [(PermissionNamespace::Bash, ProfileDefault::RequireApproval)],
+                true,
+            )
+            .expect("valid bash profile"),
+        )
+        .expect("bash registration succeeds");
+}
+
+/// Registers the task-plan tool with its trusted allow-by-default profile.
+pub(super) fn register_todo(registry: &mut ToolRegistry) {
+    registry
+        .register_with_profile(
+            TodoWrite::new(),
+            ToolPermissionProfile::new(
+                "todo_write",
+                [(PermissionNamespace::TodoWrite, ProfileDefault::Allow)],
+                false,
+            )
+            .expect("valid todo profile"),
+        )
+        .expect("todo registration succeeds");
+}
+
+/// Approval resolver used only by tests that are about non-permission behavior.
+pub(super) struct ApproveAll;
+
+#[async_trait]
+impl ApprovalResolver for ApproveAll {
+    async fn resolve(&self, _challenge: &ApprovalChallenge) -> ApprovalResolution {
+        ApprovalResolution::Approve { persistence: None }
+    }
+}
+
+/// Persists the engine's first exact session-Allow template, then denies any
+/// unexpected later prompt so tests can prove the mutation was sufficiently narrow.
+#[derive(Default)]
+pub(super) struct RememberExactOnce {
+    calls: AtomicUsize,
+}
+
+impl RememberExactOnce {
+    pub(super) fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl ApprovalResolver for RememberExactOnce {
+    async fn resolve(&self, challenge: &ApprovalChallenge) -> ApprovalResolution {
+        if self.calls.fetch_add(1, Ordering::SeqCst) != 0 {
+            return ApprovalResolution::Deny { persistence: None };
+        }
+        let persistence = challenge
+            .mutation_options()
+            .iter()
+            .find(|option| {
+                option.effect() == PolicyEffect::Allow && option.scope() == PolicyScope::Session
+            })
+            .map(|option| option.id().clone());
+        ApprovalResolution::Approve { persistence }
+    }
+}
+
+/// Canonical workspace anchor shared by typed-policy runner tests.
+pub(super) fn workspace_root() -> CanonicalPath {
+    let current = std::env::current_dir().expect("test current directory");
+    let canonical = std::fs::canonicalize(current).expect("canonical test current directory");
+    CanonicalPath::from_absolute(&canonical).expect("UTF-8 absolute test root")
+}
+
+/// Empty typed policy anchored to the active test workspace.
+pub(super) fn empty_policy() -> PolicySet {
+    PolicySet::new(workspace_root())
 }
 
 #[derive(Clone, Default)]
@@ -326,20 +422,27 @@ impl Tool for BrokenTool {
         &self.definition
     }
 
-    fn permission(
-        &self,
-        _args: &Value,
-        _ctx: &ToolContext,
-    ) -> Result<PermissionRequest, ToolOutput> {
-        Ok(PermissionRequest::new(
-            "broken",
-            PermissionAction::Read,
-            None,
-            "broken",
+    async fn prepare(
+        self: Arc<Self>,
+        args: Value,
+        _ctx: &PreparationContext,
+    ) -> Result<ToolPreparation, ToolOutput> {
+        let target = PermissionTarget::exact_tool("broken")
+            .map_err(|error| ToolOutput::failure("invalid_arguments", error.to_string()))?;
+        Ok(ToolPreparation::new(
+            CanonicalToolInput::new(args),
+            Box::new(BrokenInvocation),
+            NonEmptyVec::new(PermissionCheckSpec::new(target)),
+            ToolDisplay::new("Run broken test tool"),
         ))
     }
+}
 
-    async fn call(&self, _args: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+struct BrokenInvocation;
+
+#[async_trait]
+impl PreparedInvocation for BrokenInvocation {
+    async fn execute(self: Box<Self>, _ctx: &ToolContext) -> Result<ExecutedInvocation, ToolError> {
         Err(ToolError::Internal("kaboom".to_string()))
     }
 }
@@ -493,7 +596,10 @@ pub(super) struct CancelInPreHook(pub(super) CancellationToken);
 
 #[async_trait]
 impl Hook for CancelInPreHook {
-    async fn pre_tool_use(&self, _cx: &PreToolCx<'_>) -> PreToolOutcome {
+    async fn pre_tool_use(
+        &self,
+        _cx: &PreToolCx<'_>,
+    ) -> Result<PreToolOutcome, AuthorizationHookFailure> {
         self.0.cancel();
         std::future::pending().await
     }

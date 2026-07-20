@@ -8,13 +8,17 @@
 
 use async_trait::async_trait;
 use kuncode_core::completion::ToolDefinition;
+use kuncode_core::non_empty_vec::NonEmptyVec;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    permission::{PermissionAction, PermissionRequest},
+    permission::{CanonicalToolInput, PermissionCheckSpec, PermissionTarget, ToolDisplay},
     todo::TodoItem,
-    tool::{ToolContext, ToolOutput, ToolResultRetention, TypedTool, definition_for},
+    tool::{
+        PreparationContext, ToolContext, ToolOutput, ToolResultRetention, TypedPreparation,
+        TypedTool, definition_for,
+    },
 };
 
 const DESCRIPTION: &str = "\
@@ -74,25 +78,34 @@ impl Default for TodoWrite {
 #[async_trait]
 impl TypedTool for TodoWrite {
     type Args = TodoWriteArgs;
+    type Prepared = TodoWriteArgs;
     type Output = TodoWriteOutput;
 
     fn definition(&self) -> &ToolDefinition {
         &self.definition
     }
 
-    fn permission(&self, args: &TodoWriteArgs, _ctx: &ToolContext) -> PermissionRequest {
-        // `Meta`: writes only the in-memory session plan, no external side
-        // effect, so it is allow-by-default with nothing to scope a rule to.
-        PermissionRequest::new(
-            "todo_write",
-            PermissionAction::Meta,
-            None,
-            format!("Update task plan ({} tasks)", args.todos.len()),
-        )
+    async fn prepare_typed(
+        &self,
+        args: TodoWriteArgs,
+        canonical_input: CanonicalToolInput,
+        _ctx: &PreparationContext,
+    ) -> Result<TypedPreparation<Self::Prepared>, ToolOutput> {
+        let count = args.todos.len();
+        Ok(TypedPreparation::new(
+            args,
+            canonical_input,
+            NonEmptyVec::new(PermissionCheckSpec::new(PermissionTarget::TodoWrite)),
+            ToolDisplay::new(format!("Update task plan ({count} tasks)")),
+        ))
     }
 
-    async fn run(&self, args: TodoWriteArgs, ctx: &ToolContext) -> ToolOutput<TodoWriteOutput> {
-        match ctx.todos.replace(args.todos) {
+    async fn run_prepared(
+        &self,
+        prepared: TodoWriteArgs,
+        ctx: &ToolContext,
+    ) -> ToolOutput<TodoWriteOutput> {
+        match ctx.todos.replace(prepared.todos) {
             // Echo the stored plan so the model gets an explicit confirmation of
             // the current state it can reason about next.
             Ok(()) => ToolOutput::success(TodoWriteOutput {
@@ -124,9 +137,11 @@ impl TypedTool for TodoWrite {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::todo::{TodoHandle, TodoStatus};
-    use crate::tool::Tool;
+    use crate::tool::{Tool, execute_for_test};
 
     fn ctx_with_plan() -> (ToolContext, TodoHandle) {
         let handle = TodoHandle::default();
@@ -139,8 +154,8 @@ mod tests {
         let (ctx, handle) = ctx_with_plan();
         let tool = TodoWrite::new();
 
-        let output = tool
-            .call(
+        let output = execute_for_test(
+            Arc::new(tool),
                 serde_json::json!({
                     "todos": [
                         { "content": "Step one", "active_form": "Doing step one", "status": "completed" },
@@ -168,18 +183,18 @@ mod tests {
         let (ctx, handle) = ctx_with_plan();
         let tool = TodoWrite::new();
 
-        let output = tool
-            .call(
-                serde_json::json!({
-                    "todos": [
-                        { "content": "a", "active_form": "a…", "status": "in_progress" },
-                        { "content": "b", "active_form": "b…", "status": "in_progress" }
-                    ]
-                }),
-                &ctx,
-            )
-            .await
-            .expect("no harness error");
+        let output = execute_for_test(
+            Arc::new(tool),
+            serde_json::json!({
+                "todos": [
+                    { "content": "a", "active_form": "a…", "status": "in_progress" },
+                    { "content": "b", "active_form": "b…", "status": "in_progress" }
+                ]
+            }),
+            &ctx,
+        )
+        .await
+        .expect("no harness error");
 
         assert!(!output.ok);
         assert_eq!(
@@ -203,8 +218,7 @@ mod tests {
             }])
             .expect("seed plan");
 
-        let output = tool
-            .call(serde_json::json!({ "todos": [] }), &ctx)
+        let output = execute_for_test(Arc::new(tool), serde_json::json!({ "todos": [] }), &ctx)
             .await
             .expect("no harness error");
 
@@ -212,17 +226,19 @@ mod tests {
         assert!(handle.snapshot().is_empty());
     }
 
-    #[test]
-    fn permission_is_meta_and_unscoped() {
-        let tool = TodoWrite::new();
-        let request = Tool::permission(
-            &tool,
-            &serde_json::json!({ "todos": [] }),
-            &ToolContext::new(),
-        )
-        .expect("valid args");
-        assert_eq!(request.action, PermissionAction::Meta);
-        assert!(request.resource.is_none());
+    #[tokio::test]
+    async fn preparation_emits_the_todo_namespace() {
+        let preparation = Arc::new(TodoWrite::new())
+            .prepare(
+                serde_json::json!({ "todos": [] }),
+                &PreparationContext::new(),
+            )
+            .await
+            .expect("valid preparation");
+        assert!(matches!(
+            preparation.checks().first().target(),
+            PermissionTarget::TodoWrite
+        ));
     }
 
     #[test]

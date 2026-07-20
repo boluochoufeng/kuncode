@@ -1,8 +1,8 @@
 use super::support::{
-    AgentRunner, AgentSession, Arc, AssistantContent, CollectingObserver, CompletionError,
-    CompletionRequest, CompletionResponse, CompletionStream, EventKind, FakeModel, FinishReason,
-    Message, NonEmptyVec, StreamEvent, ToolRegistry, ToolResultContent, Usage, UserContent, Value,
-    bash, event_label, response,
+    AgentRunner, AgentSession, ApproveAll, Arc, AssistantContent, CollectingObserver,
+    CompletionError, CompletionRequest, CompletionResponse, CompletionStream, EventKind, FakeModel,
+    FinishReason, Message, NonEmptyVec, StreamEvent, ToolRegistry, ToolResultContent, Usage,
+    UserContent, Value, event_label, register_bash, response,
 };
 
 /// A model that streams reasoning + text deltas before the final answer, for
@@ -95,8 +95,9 @@ async fn runs_tool_call_then_final_answer() {
         response(AssistantContent::text("done")),
     ]);
     let mut registry = ToolRegistry::new();
-    registry.register(bash().await);
-    let runner = AgentRunner::new(model.clone(), registry);
+    register_bash(&mut registry).await;
+    let runner =
+        AgentRunner::new(model.clone(), registry).with_approval_resolver(Arc::new(ApproveAll));
     let mut session = AgentSession::new();
 
     let turn = runner

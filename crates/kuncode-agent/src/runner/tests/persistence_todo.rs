@@ -1,7 +1,7 @@
 use super::support::{
-    AgentRunner, AgentSession, Arc, AssistantContent, CollectingObserver, EventKind, FakeModel,
-    Message, NewSession, Seq, SessionId, SessionStore, TestDir, TodoWrite, ToolRegistry,
-    TursoSessionStore, bash, event_label, response,
+    AgentRunner, AgentSession, ApproveAll, Arc, AssistantContent, CollectingObserver, EventKind,
+    FakeModel, Message, NewSession, Seq, SessionId, SessionStore, TestDir, ToolRegistry,
+    TursoSessionStore, event_label, register_bash, register_todo, response,
 };
 
 #[tokio::test]
@@ -78,9 +78,11 @@ async fn emits_full_event_sequence_on_success() {
         response(AssistantContent::text("done")),
     ]);
     let mut registry = ToolRegistry::new();
-    registry.register(bash().await);
+    register_bash(&mut registry).await;
     let observer = Arc::new(CollectingObserver::default());
-    let runner = AgentRunner::new(model, registry).with_observer(observer.clone());
+    let runner = AgentRunner::new(model, registry)
+        .with_approval_resolver(Arc::new(ApproveAll))
+        .with_observer(observer.clone());
     let mut session = AgentSession::new();
 
     runner
@@ -145,7 +147,7 @@ async fn todo_write_emits_a_todo_update_after_tool_end() {
         response(AssistantContent::text("done")),
     ]);
     let mut registry = ToolRegistry::new();
-    registry.register(TodoWrite::new());
+    register_todo(&mut registry);
     let observer = Arc::new(CollectingObserver::default());
     let runner = AgentRunner::new(model, registry).with_observer(observer.clone());
     let mut session = AgentSession::new();
@@ -201,7 +203,7 @@ async fn rejected_todo_write_emits_no_todo_update() {
         response(AssistantContent::text("understood")),
     ]);
     let mut registry = ToolRegistry::new();
-    registry.register(TodoWrite::new());
+    register_todo(&mut registry);
     let observer = Arc::new(CollectingObserver::default());
     let runner = AgentRunner::new(model, registry).with_observer(observer.clone());
     let mut session = AgentSession::new();

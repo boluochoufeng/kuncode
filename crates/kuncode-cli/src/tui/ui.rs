@@ -172,7 +172,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_approval(frame: &mut Frame, approval: &ApprovalRequest, area: Rect) {
     let lines = vec![
         Line::from(format!("⚠ 需要授权: {}", approval.summary)).yellow(),
-        Line::from(format!("记住规则: {}", approval.scope_rule())).dim(),
+        Line::from(format!("精确范围: {}", approval.persistence_label())).dim(),
         Line::from("[y] 允许一次  [a] 总是  [n] 否  [d] 永久拒绝  [c] 取消"),
     ];
     let panel = Paragraph::new(Text::from(lines))

@@ -49,7 +49,7 @@ where
             let started = Instant::now();
 
             match self
-                .gated_call(session, iteration, &id, &name, arguments, &ctx)
+                .authorized_call(session, iteration, &id, &name, arguments, &ctx)
                 .await
             {
                 Ok(outcome) => {
@@ -134,6 +134,14 @@ where
                         AgentError::Tool { source, .. } => {
                             ToolOutput::failure(ToolErrorKind::ToolError, source.to_string())
                         }
+                        AgentError::ToolRegistration { .. } => ToolOutput::failure(
+                            "tool_registration",
+                            "Tool call not executed: its permission profile rejected the prepared operation.",
+                        ),
+                        AgentError::Authorization(_) => ToolOutput::failure(
+                            "authorization_error",
+                            "Tool call not executed: authorization failed closed.",
+                        ),
                         _ => interrupted_tool_output(),
                     };
                     self.record_result(
@@ -246,6 +254,8 @@ fn agent_error_kind(error: &AgentError) -> &'static str {
     match error {
         AgentError::Completion(_) => "completion",
         AgentError::Tool { .. } => "tool",
+        AgentError::Authorization(_) => "authorization",
+        AgentError::ToolRegistration { .. } => "tool_registration",
         AgentError::EmptyTranscript => "empty_transcript",
         AgentError::RequestEncoding(_) => "request_encoding",
         AgentError::Compaction { .. } => "compaction",

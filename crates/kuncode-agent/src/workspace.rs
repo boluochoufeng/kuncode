@@ -6,10 +6,12 @@
 
 use std::{
     env, io,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
 use thiserror::Error;
+
+const MAX_DANGLING_SYMLINK_EXPANSIONS: usize = 40;
 
 /// Filesystem root used by local tools.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -77,46 +79,136 @@ impl Workspace {
         self.ensure_inside(resolved)
     }
 
-    /// Resolves a path intended for writing.
+    /// Resolves the longest existing path prefix without requiring the final
+    /// target to exist yet.
     ///
-    /// Existing targets are resolved like [`Self::resolve_existing`]. For new
-    /// files, the parent directory must already exist and remain inside the
-    /// workspace after canonicalization.
-    pub async fn resolve_for_write(
-        &self,
-        path: impl AsRef<Path>,
-    ) -> Result<PathBuf, WorkspaceError> {
+    /// This lets authorization happen before existence/type diagnostics, so a
+    /// protected path does not reveal metadata merely by failing preparation.
+    /// Existing symlinks are still resolved and checked against the workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an existing prefix escapes the workspace, a
+    /// symbolic-link chain cannot be resolved safely, or a missing path
+    /// contains parent traversal whose semantics would be ambiguous.
+    pub async fn resolve_target(&self, path: impl AsRef<Path>) -> Result<PathBuf, WorkspaceError> {
         let input = path.as_ref();
-        let candidate = self.candidate(input);
+        let mut candidate = self.candidate(input);
+        let mut symlink_expansions = 0usize;
 
-        let file_name = candidate
-            .file_name()
-            .ok_or_else(|| WorkspaceError::MissingFileName {
-                path: candidate.clone(),
-            })?;
-
-        match tokio::fs::symlink_metadata(&candidate).await {
-            Ok(_) => self.resolve_existing(input).await,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                let parent = candidate
-                    .parent()
-                    .ok_or_else(|| WorkspaceError::MissingParent {
-                        path: candidate.clone(),
-                    })?;
-                let parent = tokio::fs::canonicalize(parent).await.map_err(|source| {
-                    WorkspaceError::CanonicalizePath {
-                        path: parent.to_path_buf(),
+        'resolve: loop {
+            match tokio::fs::canonicalize(&candidate).await {
+                Ok(resolved) => return self.ensure_inside(resolved),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(source) => {
+                    return Err(WorkspaceError::CanonicalizePath {
+                        path: candidate,
                         source,
-                    }
-                })?;
-
-                let parent = self.ensure_inside(parent)?;
-                Ok(parent.join(file_name))
+                    });
+                }
             }
-            Err(source) => Err(WorkspaceError::CanonicalizePath {
-                path: candidate,
-                source,
-            }),
+            if candidate
+                .components()
+                .any(|component| component == Component::ParentDir)
+            {
+                return Err(WorkspaceError::AmbiguousMissingTraversal { path: candidate });
+            }
+
+            let mut existing = candidate.clone();
+            let mut suffix = Vec::new();
+            loop {
+                match tokio::fs::canonicalize(&existing).await {
+                    Ok(resolved) => {
+                        let mut resolved = self.ensure_inside(resolved)?;
+                        for component in suffix.iter().rev() {
+                            resolved.push(component);
+                        }
+                        return Ok(resolved);
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        match tokio::fs::symlink_metadata(&existing).await {
+                            Ok(metadata) if metadata.file_type().is_symlink() => {
+                                if symlink_expansions >= MAX_DANGLING_SYMLINK_EXPANSIONS {
+                                    return Err(WorkspaceError::SymbolicLinkLimit {
+                                        path: candidate,
+                                    });
+                                }
+                                let target =
+                                    tokio::fs::read_link(&existing).await.map_err(|source| {
+                                        WorkspaceError::ReadSymbolicLink {
+                                            path: existing.clone(),
+                                            source,
+                                        }
+                                    })?;
+                                let mut expanded = if target.is_absolute() {
+                                    target
+                                } else {
+                                    existing
+                                        .parent()
+                                        .ok_or_else(|| WorkspaceError::MissingParent {
+                                            path: existing.clone(),
+                                        })?
+                                        .join(target)
+                                };
+                                for component in suffix.iter().rev() {
+                                    expanded.push(component);
+                                }
+                                candidate = expanded;
+                                symlink_expansions = symlink_expansions.saturating_add(1);
+                                continue 'resolve;
+                            }
+                            Ok(_) => {
+                                return Err(WorkspaceError::CanonicalizePath {
+                                    path: existing,
+                                    source: error,
+                                });
+                            }
+                            Err(metadata_error)
+                                if metadata_error.kind() == io::ErrorKind::NotFound => {}
+                            Err(source) => {
+                                return Err(WorkspaceError::CanonicalizePath {
+                                    path: existing,
+                                    source,
+                                });
+                            }
+                        }
+                        let Some(name) = existing.file_name().map(ToOwned::to_owned) else {
+                            return Err(WorkspaceError::MissingFileName { path: candidate });
+                        };
+                        suffix.push(name);
+                        if !existing.pop() {
+                            return Err(WorkspaceError::MissingParent { path: candidate });
+                        }
+                    }
+                    Err(source) => {
+                        return Err(WorkspaceError::CanonicalizePath {
+                            path: existing,
+                            source,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    /// Re-resolves a possibly missing prepared target before resource access.
+    ///
+    /// # Errors
+    /// Returns [`WorkspaceError::PathChanged`] when the current path resolves to
+    /// a different target, or the normal resolution error when it is unsafe.
+    pub async fn revalidate_target(
+        &self,
+        prepared: impl AsRef<Path>,
+    ) -> Result<(), WorkspaceError> {
+        let prepared = prepared.as_ref();
+        let current = self.resolve_target(prepared).await?;
+        if current == prepared {
+            Ok(())
+        } else {
+            Err(WorkspaceError::PathChanged {
+                prepared: prepared.to_path_buf(),
+                current,
+            })
         }
     }
 
@@ -206,6 +298,40 @@ pub enum WorkspaceError {
         /// Write target path.
         path: PathBuf,
     },
+
+    /// A path changed after permission preparation.
+    #[error("prepared path `{prepared}` now resolves to `{current}`")]
+    PathChanged {
+        /// Path covered by the authorization request.
+        prepared: PathBuf,
+        /// Target observed immediately before execution.
+        current: PathBuf,
+    },
+
+    /// A symbolic link could not be read during canonicalization.
+    #[error("failed to read symbolic link `{path}`: {source}")]
+    ReadSymbolicLink {
+        /// Link whose target was unavailable.
+        path: PathBuf,
+        /// Filesystem error returned by `read_link`.
+        #[source]
+        source: io::Error,
+    },
+
+    /// A dangling-link chain exceeded the platform-style expansion limit.
+    #[error("symbolic-link chain for `{path}` exceeds the safe expansion limit")]
+    SymbolicLinkLimit {
+        /// Original unresolved target.
+        path: PathBuf,
+    },
+
+    /// Parent traversal after a missing component has platform-dependent
+    /// symlink semantics and cannot be normalized safely.
+    #[error("missing path `{path}` contains ambiguous parent traversal")]
+    AmbiguousMissingTraversal {
+        /// Rejected candidate path.
+        path: PathBuf,
+    },
 }
 
 #[cfg(test)]
@@ -291,7 +417,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolves_new_write_target_under_existing_parent() {
+    async fn resolves_missing_target_through_longest_existing_prefix() {
         let tmp = TestDir::new();
         let root = tmp.path().join("root");
         fs::create_dir_all(root.join("src")).expect("root should be created");
@@ -300,31 +426,103 @@ mod tests {
             .expect("workspace should be valid");
 
         let resolved = workspace
-            .resolve_for_write("src/new.rs")
+            .resolve_target("src/generated/nested.rs")
             .await
-            .expect("write target should resolve");
+            .expect("missing target should retain a canonical workspace prefix");
 
         assert_eq!(
             resolved,
-            root.canonicalize().expect("root exists").join("src/new.rs")
+            root.canonicalize()
+                .expect("root exists")
+                .join("src/generated/nested.rs")
         );
     }
 
     #[tokio::test]
-    async fn rejects_new_write_target_with_missing_parent() {
+    async fn rejects_missing_absolute_target_outside_root() {
         let tmp = TestDir::new();
         let root = tmp.path().join("root");
+        let outside = tmp.path().join("outside");
         fs::create_dir_all(&root).expect("root should be created");
+        fs::create_dir_all(&outside).expect("outside should be created");
         let workspace = Workspace::new(&root)
             .await
             .expect("workspace should be valid");
 
         let err = workspace
-            .resolve_for_write("missing/new.rs")
+            .resolve_target(outside.join("missing.txt"))
             .await
-            .expect_err("missing parent should fail");
+            .expect_err("outside target should be rejected");
 
-        assert!(matches!(err, WorkspaceError::CanonicalizePath { .. }));
+        assert!(matches!(err, WorkspaceError::EscapesRoot { .. }));
+    }
+
+    #[tokio::test]
+    async fn rejects_parent_traversal_when_target_is_missing() {
+        let tmp = TestDir::new();
+        let root = tmp.path().join("root");
+        fs::create_dir_all(root.join("src")).expect("root should be created");
+        let workspace = Workspace::new(&root)
+            .await
+            .expect("workspace should be valid");
+
+        let err = workspace
+            .resolve_target("src/missing/../file.rs")
+            .await
+            .expect_err("ambiguous missing traversal should be rejected");
+
+        assert!(matches!(
+            err,
+            WorkspaceError::AmbiguousMissingTraversal { .. }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejects_dangling_symlink_that_targets_outside_workspace() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TestDir::new();
+        let root = tmp.path().join("root");
+        fs::create_dir_all(&root).expect("root should be created");
+        symlink(tmp.path().join("absent"), root.join("link"))
+            .expect("dangling symlink should be created");
+        let workspace = Workspace::new(&root)
+            .await
+            .expect("workspace should be valid");
+
+        let err = workspace
+            .resolve_target("link/file.txt")
+            .await
+            .expect_err("outside dangling prefix should be rejected");
+
+        assert!(matches!(err, WorkspaceError::EscapesRoot { .. }));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resolves_dangling_symlink_to_a_missing_target_inside_workspace() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TestDir::new();
+        let root = tmp.path().join("root");
+        fs::create_dir_all(&root).expect("root should be created");
+        symlink("generated", root.join("link")).expect("dangling symlink should be created");
+        let workspace = Workspace::new(&root)
+            .await
+            .expect("workspace should be valid");
+
+        let resolved = workspace
+            .resolve_target("link/file.txt")
+            .await
+            .expect("inside dangling prefix should resolve to its intended target");
+
+        assert_eq!(
+            resolved,
+            root.canonicalize()
+                .expect("root exists")
+                .join("generated/file.txt")
+        );
     }
 
     #[tokio::test]

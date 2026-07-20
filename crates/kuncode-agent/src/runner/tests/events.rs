@@ -1,8 +1,28 @@
 use super::support::{
-    AgentConfig, AgentError, AgentObserver, AgentRunner, AgentSession, Arc, AssistantContent,
-    CollectingObserver, CompositeObserver, EventKind, FakeModel, PanicObserver, PermissionPolicy,
-    RuleOrigin, ToolRegistry, bash, event_label, parse_rule, response,
+    AgentConfig, AgentError, AgentObserver, AgentRunner, AgentSession, ApprovalChallenge,
+    ApprovalResolution, ApprovalResolver, Arc, AssistantContent, CollectingObserver,
+    CompositeObserver, EventKind, FakeModel, Mutex, PanicObserver, PolicyEffect, PolicyOrigin,
+    ToolRegistry, async_trait, empty_policy, event_label, register_bash, response,
 };
+
+struct BlockingApproval {
+    entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+#[async_trait]
+impl ApprovalResolver for BlockingApproval {
+    async fn resolve(&self, _challenge: &ApprovalChallenge) -> ApprovalResolution {
+        if let Some(entered) = self.entered.lock().expect("entered lock").take() {
+            let _ = entered.send(());
+        }
+        let release = self.release.lock().expect("release lock").take();
+        if let Some(release) = release {
+            let _ = release.await;
+        }
+        ApprovalResolution::Approve { persistence: None }
+    }
+}
 
 #[tokio::test]
 async fn unknown_tool_emits_tool_end_without_tool_start() {
@@ -37,7 +57,7 @@ async fn unknown_tool_emits_tool_end_without_tool_start() {
     assert_eq!(tool_ends.len(), 1);
     assert!(matches!(
         &tool_ends[0].kind,
-        EventKind::ToolEnd { ok: false, error: Some(f), .. } if f.kind.as_str() == "unknown_tool"
+        EventKind::ToolEnd { ok: false, error: Some(f), .. } if f.kind.as_str() == "tool_not_found"
     ));
 }
 
@@ -52,14 +72,15 @@ async fn permission_denied_emits_failed_tool_end_after_start() {
         response(AssistantContent::text("understood")),
     ]);
     let mut registry = ToolRegistry::new();
-    registry.register(bash().await);
-    let mut policy = PermissionPolicy::new();
+    register_bash(&mut registry).await;
+    let mut policy = empty_policy();
     policy
-        .deny
-        .extend(parse_rule("Bash(curl*)", RuleOrigin::ProjectSettings).unwrap());
+        .compile_and_push("Bash(curl*)", PolicyEffect::Deny, PolicyOrigin::Project)
+        .expect("valid deny rule");
     let observer = Arc::new(CollectingObserver::default());
     let runner = AgentRunner::new(model, registry)
         .with_policy(policy)
+        .expect("policy root matches registry")
         .with_observer(observer.clone());
     let mut session = AgentSession::new();
 
@@ -83,6 +104,53 @@ async fn permission_denied_emits_failed_tool_end_after_start() {
         .collect();
     assert_eq!(tool_ends.len(), 1);
     assert!(matches!(&tool_ends[0], Some(f) if f.kind.as_str() == "permission_denied"));
+}
+
+#[tokio::test]
+async fn tool_start_is_visible_while_approval_is_still_pending() {
+    let model = FakeModel::new([
+        response(AssistantContent::tool_call(
+            "call_1",
+            "bash",
+            serde_json::json!({ "cmd": "printf approved" }),
+        )),
+        response(AssistantContent::text("done")),
+    ]);
+    let mut registry = ToolRegistry::new();
+    register_bash(&mut registry).await;
+    let observer = Arc::new(CollectingObserver::default());
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let resolver = Arc::new(BlockingApproval {
+        entered: Mutex::new(Some(entered_tx)),
+        release: Mutex::new(Some(release_rx)),
+    });
+    let runner = AgentRunner::new(model, registry)
+        .with_observer(observer.clone())
+        .with_approval_resolver(resolver);
+    let task = tokio::spawn(async move {
+        let mut session = AgentSession::new();
+        let result = runner.run_turn(&mut session, "run it").await;
+        (result, session)
+    });
+
+    entered_rx
+        .await
+        .expect("resolver should receive the approval challenge");
+    let waiting_events = observer.events();
+    assert!(waiting_events.iter().any(|event| matches!(
+        &event.kind,
+        EventKind::ToolStart { tool_call_id, .. } if tool_call_id == "call_1"
+    )));
+    assert!(
+        !waiting_events
+            .iter()
+            .any(|event| matches!(event.kind, EventKind::ToolEnd { .. }))
+    );
+
+    release_tx.send(()).expect("approval task is waiting");
+    let (result, _session) = task.await.expect("runner task joins");
+    result.expect("approved run completes");
 }
 
 #[tokio::test]

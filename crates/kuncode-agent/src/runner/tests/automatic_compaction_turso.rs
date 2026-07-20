@@ -2,9 +2,9 @@ use super::support::{
     AgentError, AgentRunner, AgentSession, Arc, AssistantContent, CancellationToken,
     CollectingObserver, CompactionMode, CompletionRequest, EventKind, FakeModel,
     FixedRunnerGroupEstimator, Message, NewSession, NonEmptyVec, RequestShapeEstimator, Seq,
-    SessionId, SessionStore, TestDir, TodoWrite, TokenCountPrecision, TokenEstimate,
-    TokenEstimationError, TokenEstimator, ToolOutput, ToolRegistry, TursoSessionStore, UserContent,
-    async_trait, configured_runner, event_label, response,
+    SessionId, SessionStore, TestDir, TokenCountPrecision, TokenEstimate, TokenEstimationError,
+    TokenEstimator, ToolOutput, ToolRegistry, TursoSessionStore, UserContent, async_trait,
+    configured_runner, event_label, register_todo, response,
 };
 
 // End-to-end automatic compaction tests against the Turso durability boundary.
@@ -299,7 +299,7 @@ async fn todo_retention_drives_runner_slimming_without_summary() {
         response(AssistantContent::text("plan recorded")),
     ]);
     let mut registry = ToolRegistry::new();
-    registry.register(TodoWrite::new());
+    register_todo(&mut registry);
     AgentRunner::new(tool_model, registry)
         .with_session_store(store.clone())
         .run_turn(&mut session, "record the plan")

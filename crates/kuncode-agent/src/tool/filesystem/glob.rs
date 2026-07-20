@@ -8,13 +8,19 @@ use std::{
 use async_trait::async_trait;
 use ignore::WalkBuilder;
 use kuncode_core::completion::ToolDefinition;
+use kuncode_core::non_empty_vec::NonEmptyVec;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
     glob::{glob_match, normalize_pattern},
-    permission::{PermissionAction, PermissionRequest},
-    tool::{ToolContext, ToolOutput, TypedTool, definition_for},
+    permission::{
+        CanonicalPath, CanonicalToolInput, PathSelector, PermissionCheckSpec, PermissionTarget,
+        ToolDisplay,
+    },
+    tool::{
+        PreparationContext, ToolContext, ToolOutput, TypedPreparation, TypedTool, definition_for,
+    },
     workspace::Workspace,
 };
 
@@ -69,41 +75,73 @@ impl Glob {
 #[async_trait]
 impl TypedTool for Glob {
     type Args = GlobArgs;
+    type Prepared = GlobArgs;
     type Output = GlobOutput;
 
     fn definition(&self) -> &ToolDefinition {
         &self.definition
     }
 
-    fn permission(&self, args: &GlobArgs, _ctx: &ToolContext) -> PermissionRequest {
-        let pattern = normalize_pattern(args.pattern.trim());
-        PermissionRequest::new(
-            "glob",
-            PermissionAction::Read,
-            Some(pattern.clone()),
-            format!("Search files: {pattern}"),
-        )
-    }
-
-    async fn run(&self, args: GlobArgs, _ctx: &ToolContext) -> ToolOutput<GlobOutput> {
+    async fn prepare_typed(
+        &self,
+        mut args: GlobArgs,
+        _canonical_input: CanonicalToolInput,
+        _ctx: &PreparationContext,
+    ) -> Result<TypedPreparation<Self::Prepared>, ToolOutput> {
         let pattern = args.pattern.trim();
         if pattern.is_empty() {
-            return ToolOutput::failure("invalid_arguments", "`pattern` must not be empty");
+            return Err(ToolOutput::failure(
+                "invalid_arguments",
+                "`pattern` must not be empty",
+            ));
         }
-
-        if let Err(message) = validate_glob_pattern(pattern) {
-            return ToolOutput::failure("invalid_arguments", message);
-        }
-
+        validate_glob_pattern(pattern)
+            .map_err(|message| ToolOutput::failure("invalid_arguments", message))?;
         let limit = args.limit.unwrap_or(DEFAULT_GLOB_LIMIT).min(MAX_GLOB_LIMIT);
         if limit == 0 {
-            return ToolOutput::failure("invalid_arguments", "`limit` must be greater than zero");
+            return Err(ToolOutput::failure(
+                "invalid_arguments",
+                "`limit` must be greater than zero",
+            ));
         }
+        let pattern = normalize_pattern(pattern);
+        args.pattern = pattern.clone();
+        args.limit = Some(limit);
+        let root = CanonicalPath::from_absolute(self.workspace.root())
+            .map_err(|error| ToolOutput::failure("invalid_arguments", error.to_string()))?;
+        let selector = PathSelector::pattern(root, pattern.clone())
+            .map_err(|error| ToolOutput::failure("invalid_arguments", error.to_string()))?;
+        let canonical_input = CanonicalToolInput::new(serde_json::json!({
+            "pattern": pattern,
+            "limit": limit,
+            "include_ignored": args.include_ignored,
+        }));
+        let mut checks =
+            NonEmptyVec::new(PermissionCheckSpec::new(PermissionTarget::Read(selector)));
+        if args.include_ignored {
+            let target = PermissionTarget::exact_tool("glob")
+                .map_err(|error| ToolOutput::failure("invalid_arguments", error.to_string()))?;
+            checks.push(PermissionCheckSpec::new(target));
+        }
+        Ok(TypedPreparation::new(
+            args,
+            canonical_input,
+            checks,
+            ToolDisplay::new("Search workspace paths"),
+        ))
+    }
+
+    async fn run_prepared(&self, prepared: GlobArgs, _ctx: &ToolContext) -> ToolOutput<GlobOutput> {
+        let pattern = prepared.pattern;
+        let limit = prepared
+            .limit
+            .unwrap_or(DEFAULT_GLOB_LIMIT)
+            .min(MAX_GLOB_LIMIT);
 
         // The `ignore` walker is synchronous and thread-based, so the whole
         // tree walk runs on the blocking pool to keep the async runtime free.
         let workspace = self.workspace.clone();
-        let include_ignored = args.include_ignored;
+        let include_ignored = prepared.include_ignored;
         let entries =
             match tokio::task::spawn_blocking(move || walk_workspace(&workspace, include_ignored))
                 .await
@@ -117,7 +155,7 @@ impl TypedTool for Glob {
                 }
             };
 
-        let normalized_pattern = normalize_pattern(pattern);
+        let normalized_pattern = pattern.clone();
         let mut matches = entries
             .into_iter()
             .filter(|entry| glob_match(&normalized_pattern, entry))
@@ -129,7 +167,7 @@ impl TypedTool for Glob {
         matches.truncate(limit);
 
         let output = ToolOutput::success(GlobOutput {
-            pattern: pattern.to_string(),
+            pattern,
             matches,
             total_matches,
         });
@@ -222,11 +260,20 @@ fn relative_slash(workspace: &Workspace, path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{fs, sync::Arc};
 
     use super::Glob;
     use crate::test_support::TestDir;
-    use crate::tool::{Tool, ToolContext};
+    use crate::{
+        permission::PermissionNamespace,
+        tool::{PreparationContext, Tool, ToolContext, ToolOutput, execute_for_test},
+    };
+
+    async fn call(tool: Glob, args: serde_json::Value) -> ToolOutput {
+        execute_for_test(Arc::new(tool), args, &ToolContext::new())
+            .await
+            .expect("no harness-level error")
+    }
 
     #[tokio::test]
     async fn glob_returns_sorted_workspace_relative_matches() {
@@ -237,13 +284,7 @@ mod tests {
         fs::write(tmp.path().join("README.md"), "").expect("file should be written");
         let tool = Glob::new(tmp.workspace().await);
 
-        let output = tool
-            .call(
-                serde_json::json!({ "pattern": "**/*.rs" }),
-                &ToolContext::new(),
-            )
-            .await
-            .expect("no harness-level error");
+        let output = call(tool, serde_json::json!({ "pattern": "**/*.rs" })).await;
 
         assert!(output.ok);
         let data = output.data.expect("data present");
@@ -268,13 +309,7 @@ mod tests {
         fs::write(tmp.path().join("src.rs"), "").expect("file should be written");
         let tool = Glob::new(tmp.workspace().await);
 
-        let output = tool
-            .call(
-                serde_json::json!({ "pattern": "**/*.rs" }),
-                &ToolContext::new(),
-            )
-            .await
-            .expect("no harness-level error");
+        let output = call(tool, serde_json::json!({ "pattern": "**/*.rs" })).await;
 
         assert!(output.ok);
         let data = output.data.expect("data present");
@@ -292,13 +327,11 @@ mod tests {
         let tool = Glob::new(tmp.workspace().await);
 
         // Even with `include_ignored`, the VCS store must never be traversed.
-        let output = tool
-            .call(
-                serde_json::json!({ "pattern": "**/*.rs", "include_ignored": true }),
-                &ToolContext::new(),
-            )
-            .await
-            .expect("no harness-level error");
+        let output = call(
+            tool,
+            serde_json::json!({ "pattern": "**/*.rs", "include_ignored": true }),
+        )
+        .await;
 
         assert!(output.ok);
         let data = output.data.expect("data present");
@@ -314,13 +347,11 @@ mod tests {
         fs::write(tmp.path().join("keep.rs"), "").expect("file should be written");
         let tool = Glob::new(tmp.workspace().await);
 
-        let output = tool
-            .call(
-                serde_json::json!({ "pattern": "**/*.rs", "include_ignored": true }),
-                &ToolContext::new(),
-            )
-            .await
-            .expect("no harness-level error");
+        let output = call(
+            tool,
+            serde_json::json!({ "pattern": "**/*.rs", "include_ignored": true }),
+        )
+        .await;
 
         assert!(output.ok);
         let data = output.data.expect("data present");
@@ -330,6 +361,26 @@ mod tests {
             serde_json::json!(["build/out.rs", "keep.rs"])
         );
         assert_eq!(data["total_matches"], 2);
+    }
+
+    #[tokio::test]
+    async fn include_ignored_adds_a_separate_approval_check() {
+        let tmp = TestDir::new();
+        let preparation = Tool::prepare(
+            Arc::new(Glob::new(tmp.workspace().await)),
+            serde_json::json!({ "pattern": "**/*", "include_ignored": true }),
+            &PreparationContext::new(),
+        )
+        .await
+        .expect("glob preparation succeeds");
+
+        assert_eq!(preparation.checks().len(), 2);
+        assert!(
+            preparation
+                .checks()
+                .iter()
+                .any(|check| check.target().namespace() == PermissionNamespace::ExactTool)
+        );
     }
 
     #[cfg(unix)]
@@ -353,13 +404,7 @@ mod tests {
         .expect("symlink should be created");
         let tool = Glob::new(tmp.workspace().await);
 
-        let output = tool
-            .call(
-                serde_json::json!({ "pattern": "**/*.rs" }),
-                &ToolContext::new(),
-            )
-            .await
-            .expect("no harness-level error");
+        let output = call(tool, serde_json::json!({ "pattern": "**/*.rs" })).await;
 
         let _ = fs::remove_file(outside);
         assert!(output.ok);
@@ -377,13 +422,7 @@ mod tests {
         let tmp = TestDir::new();
         let tool = Glob::new(tmp.workspace().await);
 
-        let output = tool
-            .call(
-                serde_json::json!({ "pattern": "../*.rs" }),
-                &ToolContext::new(),
-            )
-            .await
-            .expect("no harness-level error");
+        let output = call(tool, serde_json::json!({ "pattern": "../*.rs" })).await;
 
         assert!(!output.ok);
         assert_eq!(

@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use kuncode_agent::observer::EventKind;
-use kuncode_agent::permission::{ApprovalOutcome, PermissionMode};
+use kuncode_agent::permission::{ApprovalResolution, PermissionMode};
 use kuncode_agent::todo::TodoItem;
 
 use super::bridge::ApprovalRequest;
@@ -139,11 +139,15 @@ impl App {
             return;
         };
         let outcome = match choice {
-            Choice::AllowOnce => ApprovalOutcome::AllowOnce,
-            Choice::AllowAlways => ApprovalOutcome::AllowAlways(req.scope),
-            Choice::DenyOnce => ApprovalOutcome::DenyOnce,
-            Choice::DenyAlways => ApprovalOutcome::DenyAlways(req.scope),
-            Choice::Abort => ApprovalOutcome::Abort,
+            Choice::AllowOnce => ApprovalResolution::Approve { persistence: None },
+            Choice::AllowAlways => ApprovalResolution::Approve {
+                persistence: req.allow_session,
+            },
+            Choice::DenyOnce => ApprovalResolution::Deny { persistence: None },
+            Choice::DenyAlways => ApprovalResolution::Deny {
+                persistence: req.deny_session,
+            },
+            Choice::Abort => ApprovalResolution::Cancel,
         };
         let _ = req.respond.send(outcome);
     }
@@ -367,7 +371,9 @@ pub fn mode_label(mode: PermissionMode) -> &'static str {
     match mode {
         PermissionMode::Default => "default",
         PermissionMode::AcceptEdits => "accept-edits",
+        PermissionMode::Plan => "plan",
         PermissionMode::BypassPermissions => "bypass",
+        PermissionMode::DontAsk => "dont-ask",
     }
 }
 
@@ -447,7 +453,7 @@ mod tests {
             ok: false,
             truncated: false,
             error: Some(ToolFailure {
-                kind: ToolErrorKind::UnknownTool,
+                kind: ToolErrorKind::ToolNotFound,
                 message: "no such tool".to_string(),
             }),
         });

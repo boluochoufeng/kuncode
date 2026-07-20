@@ -233,10 +233,6 @@ pub(super) fn tool_exchange(id: &str, name: &str, body: &str) -> Vec<Message> {
     tool_exchange_with_text(id, name, &output)
 }
 
-pub(super) fn tool_exchange_with_output(id: &str, name: &str, output: ToolOutput) -> Vec<Message> {
-    tool_exchange_with_text(id, name, &output.to_model_content())
-}
-
 pub(super) fn tool_exchange_with_text(id: &str, name: &str, text: &str) -> Vec<Message> {
     vec![
         Message::Assistant {

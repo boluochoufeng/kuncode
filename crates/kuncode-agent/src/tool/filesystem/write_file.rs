@@ -1,16 +1,23 @@
 //! The `write_file` tool: write a UTF-8 file inside the workspace.
 
-use std::path::Path;
+use std::path::PathBuf;
 
 use async_trait::async_trait;
 use kuncode_core::completion::ToolDefinition;
+use kuncode_core::non_empty_vec::NonEmptyVec;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::helpers::{io_error, non_empty_path, rule_path, workspace_error};
+use super::helpers::{io_error, non_empty_path, workspace_error};
 use crate::{
-    permission::{PermissionAction, PermissionRequest},
-    tool::{ToolContext, ToolOutput, TypedTool, definition_for},
+    permission::{
+        CanonicalPath, CanonicalToolInput, PathSelector, PermissionCheckSpec, PermissionTarget,
+        ToolDisplay,
+    },
+    tool::{
+        PreparationContext, PreparedInvocationState, ToolContext, ToolError, ToolOutput,
+        TypedPreparation, TypedTool, definition_for,
+    },
     workspace::Workspace,
 };
 
@@ -30,6 +37,13 @@ pub struct WriteFileOutput {
     pub path: String,
     /// Number of UTF-8 bytes written.
     pub bytes: usize,
+}
+
+/// Canonical write target paired with the content retained for execution.
+#[derive(Debug)]
+pub struct PreparedWriteFile {
+    args: WriteFileArgs,
+    path: PathBuf,
 }
 
 /// Writes UTF-8 files inside the workspace.
@@ -55,92 +69,108 @@ impl WriteFile {
 #[async_trait]
 impl TypedTool for WriteFile {
     type Args = WriteFileArgs;
+    type Prepared = PreparedWriteFile;
     type Output = WriteFileOutput;
 
     fn definition(&self) -> &ToolDefinition {
         &self.definition
     }
 
-    fn permission(&self, args: &WriteFileArgs, _ctx: &ToolContext) -> PermissionRequest {
-        let path = rule_path(&self.workspace, &args.path);
-        PermissionRequest::new(
-            "write_file",
-            PermissionAction::Write,
-            Some(path.clone()),
-            format!("Write file: {path}"),
-        )
+    async fn prepare_typed(
+        &self,
+        mut args: WriteFileArgs,
+        _canonical_input: CanonicalToolInput,
+        _ctx: &PreparationContext,
+    ) -> Result<TypedPreparation<Self::Prepared>, ToolOutput> {
+        let path = non_empty_path(&args.path)?;
+        let resolved = self
+            .workspace
+            .resolve_target(path)
+            .await
+            .map_err(workspace_error)?;
+
+        let canonical_path = CanonicalPath::from_absolute(&resolved)
+            .map_err(|error| ToolOutput::failure("invalid_arguments", error.to_string()))?;
+        let display_path = self.workspace.relative_display(&resolved);
+        args.path = canonical_path.as_str().to_string();
+        let canonical_input = CanonicalToolInput::new(serde_json::json!({
+            "path": canonical_path.as_str(),
+            "content": args.content,
+        }));
+        Ok(TypedPreparation::new(
+            PreparedWriteFile {
+                args,
+                path: resolved,
+            },
+            canonical_input,
+            NonEmptyVec::new(PermissionCheckSpec::new(PermissionTarget::Edit(
+                PathSelector::exact(canonical_path),
+            ))),
+            ToolDisplay::new(format!("Write file: {display_path}")),
+        ))
     }
 
-    async fn run(&self, args: WriteFileArgs, _ctx: &ToolContext) -> ToolOutput<WriteFileOutput> {
-        let path = match non_empty_path(&args.path) {
-            Ok(path) => path,
-            Err(output) => return output,
-        };
-
-        let resolved = match self.workspace.resolve_for_write(path).await {
-            Ok(path) => path,
-            Err(err) => return workspace_error(err),
-        };
-
-        if is_dir(&resolved).await {
-            return ToolOutput::failure(
-                "invalid_path",
-                format!(
-                    "`{}` is a directory",
-                    self.workspace.relative_display(&resolved)
-                ),
-            );
+    async fn run_prepared(
+        &self,
+        prepared: PreparedWriteFile,
+        _ctx: &ToolContext,
+    ) -> ToolOutput<WriteFileOutput> {
+        let PreparedWriteFile { args, path } = prepared;
+        if let Err(error) = tokio::fs::write(&path, args.content.as_bytes()).await {
+            return io_error("write", &path, error, &self.workspace);
         }
-
-        if let Err(err) = tokio::fs::write(&resolved, args.content.as_bytes()).await {
-            return io_error("write", &resolved, err, &self.workspace);
-        }
-
         ToolOutput::success(WriteFileOutput {
-            path: self.workspace.relative_display(&resolved),
+            path: self.workspace.relative_display(&path),
             bytes: args.content.len(),
         })
     }
-}
 
-/// Non-blocking `stat` predicate. A missing path or stat error resolves to
-/// `false`, matching the semantics of [`Path::is_dir`].
-async fn is_dir(path: &Path) -> bool {
-    tokio::fs::metadata(path)
-        .await
-        .map(|meta| meta.is_dir())
-        .unwrap_or(false)
+    async fn revalidate_prepared(
+        &self,
+        prepared: &mut PreparedWriteFile,
+        _ctx: &ToolContext,
+    ) -> Result<PreparedInvocationState, ToolError> {
+        Ok(
+            if self
+                .workspace
+                .revalidate_target(&prepared.path)
+                .await
+                .is_ok()
+            {
+                PreparedInvocationState::Current
+            } else {
+                PreparedInvocationState::Stale
+            },
+        )
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{fs, sync::Arc};
 
     use super::WriteFile;
     use crate::test_support::TestDir;
-    use crate::tool::{Tool, ToolContext};
+    use crate::tool::{ToolContext, execute_for_test};
 
     #[tokio::test]
     async fn write_file_rejects_missing_parent() {
         let tmp = TestDir::new();
         let tool = WriteFile::new(tmp.workspace().await);
 
-        let output = tool
-            .call(
-                serde_json::json!({
-                    "path": "missing/new.txt",
-                    "content": "hello"
-                }),
-                &ToolContext::new(),
-            )
-            .await
-            .expect("no harness-level error");
+        let output = execute_for_test(
+            Arc::new(tool),
+            serde_json::json!({
+                "path": "missing/new.txt",
+                "content": "hello"
+            }),
+            &ToolContext::new(),
+        )
+        .await
+        .expect("no harness-level error");
 
         assert!(!output.ok);
-        assert_eq!(
-            output.error.expect("error present").kind.as_str(),
-            "workspace_path"
-        );
+        assert_eq!(output.error.expect("error present").kind.as_str(), "write");
     }
 
     #[tokio::test]
@@ -149,16 +179,16 @@ mod tests {
         fs::create_dir_all(tmp.path().join("src")).expect("directory should be created");
         let tool = WriteFile::new(tmp.workspace().await);
 
-        let output = tool
-            .call(
-                serde_json::json!({
-                    "path": "src/new.txt",
-                    "content": "hello"
-                }),
-                &ToolContext::new(),
-            )
-            .await
-            .expect("no harness-level error");
+        let output = execute_for_test(
+            Arc::new(tool),
+            serde_json::json!({
+                "path": "src/new.txt",
+                "content": "hello"
+            }),
+            &ToolContext::new(),
+        )
+        .await
+        .expect("no harness-level error");
 
         assert!(output.ok);
         assert_eq!(

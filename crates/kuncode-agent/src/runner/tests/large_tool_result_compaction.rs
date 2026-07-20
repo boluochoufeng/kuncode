@@ -1,10 +1,11 @@
 use super::support::{
-    AgentCompactionConfig, AgentConfig, AgentRunner, AgentSession, Arc, AssistantContent,
-    CollectingObserver, CompactionConfig, CompactionMode, Deserialize, EventKind, FakeModel,
-    FixedRunnerGroupEstimator, JsonSchema, LARGE_RESULT_BYTES, Message, NewSession,
-    PermissionAction, PermissionRequest, ScriptedRequestEstimator, Seq, SessionStore, TestDir,
-    ToolContext, ToolDefinition, ToolOutput, ToolRegistry, ToolResultContent, TursoSessionStore,
-    TypedTool, UserContent, Value, async_trait, definition_for, response,
+    AgentCompactionConfig, AgentConfig, AgentRunner, AgentSession, ApproveAll, Arc,
+    AssistantContent, CanonicalToolInput, CollectingObserver, CompactionConfig, CompactionMode,
+    Deserialize, EventKind, FakeModel, FixedRunnerGroupEstimator, JsonSchema, LARGE_RESULT_BYTES,
+    Message, NewSession, PreparationContext, ScriptedRequestEstimator, Seq, SessionStore, TestDir,
+    ToolContext, ToolDefinition, ToolDisplay, ToolOutput, ToolRegistry, ToolResultContent,
+    TursoSessionStore, TypedPreparation, TypedTool, UserContent, Value, async_trait,
+    definition_for, exact_typed_preparation, response,
 };
 
 use crate::compaction::protocol::group_messages;
@@ -32,23 +33,33 @@ impl ScriptedResultTool {
 #[async_trait]
 impl TypedTool for ScriptedResultTool {
     type Args = ScriptedResultArgs;
+    type Prepared = ScriptedResultArgs;
     type Output = String;
 
     fn definition(&self) -> &ToolDefinition {
         &self.definition
     }
 
-    fn permission(&self, _args: &Self::Args, _ctx: &ToolContext) -> PermissionRequest {
-        PermissionRequest::new(
+    async fn prepare_typed(
+        &self,
+        args: Self::Args,
+        canonical_input: CanonicalToolInput,
+        _ctx: &PreparationContext,
+    ) -> Result<TypedPreparation<Self::Prepared>, ToolOutput> {
+        exact_typed_preparation(
             "scripted_result",
-            PermissionAction::Read,
-            None,
-            "return scripted result",
+            args,
+            canonical_input,
+            ToolDisplay::new("Return scripted result"),
         )
     }
 
-    async fn run(&self, args: Self::Args, _ctx: &ToolContext) -> ToolOutput<Self::Output> {
-        let payload = if args.large {
+    async fn run_prepared(
+        &self,
+        prepared: Self::Prepared,
+        _ctx: &ToolContext,
+    ) -> ToolOutput<Self::Output> {
+        let payload = if prepared.large {
             "L".repeat(LARGE_RESULT_BYTES)
         } else {
             "small".to_string()
@@ -88,7 +99,9 @@ async fn runner_spills_old_large_tool_result_and_commits_turso_checkpoint() {
         response(AssistantContent::text("done")),
     ]);
     let mut registry = ToolRegistry::new();
-    registry.register(ScriptedResultTool::new());
+    registry
+        .register(ScriptedResultTool::new())
+        .expect("scripted result tool registration");
     let policy = CompactionConfig::new(CompactionMode::Enabled, 1_000, 100, 0)
         .expect("test window should be valid");
     let compaction = AgentCompactionConfig::new(policy, "test-model", 128)
@@ -103,6 +116,7 @@ async fn runner_spills_old_large_tool_result_and_commits_turso_checkpoint() {
             ..AgentConfig::default()
         },
     )
+    .with_approval_resolver(Arc::new(ApproveAll))
     .with_session_store(store.clone())
     .with_observer(observer.clone());
     runner.token_estimator = Arc::new(ScriptedRequestEstimator);

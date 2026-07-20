@@ -1,7 +1,7 @@
 use super::support::{
-    AgentError, AgentRunner, AgentSession, ApprovalOutcome, Arc, AssistantContent,
-    CancellationToken, FakeModel, HangModel, HangTool, ScriptedApprover, ToolRegistry, bash,
-    cancellable, response, response_many, tool_result_id, tool_result_text,
+    AgentError, AgentRunner, AgentSession, ApprovalResolution, ApproveAll, Arc, AssistantContent,
+    CancellationToken, FakeModel, HangModel, HangTool, ScriptedApprovalResolver, ToolRegistry,
+    cancellable, register_bash, response, response_many, tool_result_id, tool_result_text,
 };
 
 #[tokio::test]
@@ -29,9 +29,10 @@ async fn abort_pairs_every_tool_call_with_a_result() {
         AssistantContent::tool_call("call_2", "bash", serde_json::json!({ "cmd": "printf two" })),
     ])]);
     let mut registry = ToolRegistry::new();
-    registry.register(bash().await);
-    let runner = AgentRunner::new(model, registry)
-        .with_approver(Arc::new(ScriptedApprover::new([ApprovalOutcome::Abort])));
+    register_bash(&mut registry).await;
+    let runner = AgentRunner::new(model, registry).with_approval_resolver(Arc::new(
+        ScriptedApprovalResolver::new([ApprovalResolution::Cancel]),
+    ));
     let mut session = AgentSession::new();
 
     let err = runner
@@ -57,8 +58,10 @@ async fn cancellation_token_interrupts_a_running_tool() {
         serde_json::json!({}),
     ))]);
     let mut registry = ToolRegistry::new();
-    registry.register(HangTool::new());
-    let runner = AgentRunner::new(model, registry);
+    registry
+        .register(HangTool::new())
+        .expect("hang tool registration");
+    let runner = AgentRunner::new(model, registry).with_approval_resolver(Arc::new(ApproveAll));
     let mut session = AgentSession::new();
 
     // A fresh (un-cancelled) token: the model stage runs normally and the

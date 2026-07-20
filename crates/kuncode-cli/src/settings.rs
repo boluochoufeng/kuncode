@@ -1,14 +1,14 @@
 //! Loads `.kuncode/settings.json` into validated runtime settings.
 //!
 //! Missing sections and fields inherit built-in defaults. Rules remain
-//! attributable to [`RuleOrigin::ProjectSettings`], while model and compaction
+//! attributable to project policy, while model and compaction
 //! budgets are checked against known provider capabilities before assembly.
 
 use std::{num::NonZeroU32, path::Path};
 
 use kuncode_agent::{
     compaction::budget::{CompactionConfig, CompactionMode},
-    permission::{PermissionMode, PermissionPolicy, Rule, RuleOrigin, parse_rule},
+    permission::{CanonicalPath, PermissionMode, PolicyEffect, PolicyOrigin, PolicySet},
     runner::{AgentCompactionConfig, AgentCompactionConfigError, AgentConfig},
 };
 use kuncode_core::providers::deepseek::{
@@ -22,6 +22,16 @@ const DEFAULT_SUMMARY_MAX_TOKENS: u64 = 16_384;
 const DEFAULT_MAX_ITERATIONS: usize = 50;
 const DEFAULT_TODO_REMINDER_INTERVAL: usize = 3;
 const DEFAULT_LOG_LEVEL: &str = "info";
+
+/// User-controlled trust assigned outside the repository settings file.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum ProjectTrust {
+    /// Repository configuration may only tighten permissions.
+    #[default]
+    Untrusted,
+    /// Repository Allow rules and relaxing default modes may be activated.
+    Trusted,
+}
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -150,10 +160,12 @@ impl ProjectCompaction {
 /// Runtime settings read from the project file.
 #[derive(Debug)]
 pub struct ProjectSettings {
-    /// Rules contributed by the file (origin = `ProjectSettings`).
-    pub policy: PermissionPolicy,
+    /// Typed rules contributed by the file and anchored to its workspace.
+    pub policy: Option<PolicySet>,
     /// Default mode requested by the file, if any.
     pub default_mode: Option<PermissionMode>,
+    /// Trust comes from CLI/user state, never from the project file itself.
+    pub(crate) trust: ProjectTrust,
     /// Effective model identifier after file and environment precedence.
     pub(crate) model_name: String,
     /// Effective provider output budget for an ordinary turn.
@@ -173,8 +185,9 @@ impl Default for ProjectSettings {
             DeepSeekModelProfile::default_max_tokens,
         );
         Self {
-            policy: PermissionPolicy::new(),
+            policy: None,
             default_mode: None,
+            trust: ProjectTrust::Untrusted,
             model_name: DEEPSEEK_V4_PRO_MODEL_ID.to_string(),
             max_tokens,
             max_iterations: DEFAULT_MAX_ITERATIONS,
@@ -196,18 +209,22 @@ impl Default for ProjectSettings {
 /// schema is invalid, a permission rule or mode is invalid, or an active
 /// compaction section has an unsupported mode, missing context limit, invalid
 /// budget, or inconsistent thresholds.
-pub fn load_project_settings(root: &Path) -> Result<ProjectSettings, SettingsError> {
+pub(crate) fn load_project_settings(
+    root: &Path,
+    trust: ProjectTrust,
+) -> Result<ProjectSettings, SettingsError> {
     let model_override = std::env::var("DEEPSEEK_MODEL").ok();
-    load_project_settings_from(root, model_override.as_deref())
+    load_project_settings_from(root, model_override.as_deref(), trust)
 }
 
 pub(crate) fn load_project_settings_from(
     root: &Path,
     model_override: Option<&str>,
+    trust: ProjectTrust,
 ) -> Result<ProjectSettings, SettingsError> {
     let file = read_settings_file(root)?;
 
-    resolve_settings(file, model_override)
+    resolve_settings(file, model_override, root, trust)
 }
 
 /// Loads only the bootstrap settings required to initialize file logging.
@@ -240,6 +257,8 @@ fn read_settings_file(root: &Path) -> Result<SettingsFile, SettingsError> {
 fn resolve_settings(
     file: SettingsFile,
     model_override: Option<&str>,
+    root: &Path,
+    trust: ProjectTrust,
 ) -> Result<ProjectSettings, SettingsError> {
     let model_name = model_override.unwrap_or(&file.model.name).to_string();
     if model_name.trim().is_empty() {
@@ -258,10 +277,18 @@ fn resolve_settings(
     validate_agent(&file.agent)?;
     validate_log_level(&file.logging.level)?;
 
-    let mut policy = PermissionPolicy::new();
-    push_rules(&mut policy.allow, &file.permissions.allow)?;
-    push_rules(&mut policy.ask, &file.permissions.ask)?;
-    push_rules(&mut policy.deny, &file.permissions.deny)?;
+    let canonical_root =
+        std::fs::canonicalize(root).map_err(|error| SettingsError::Workspace(error.to_string()))?;
+    let canonical_root = CanonicalPath::from_absolute(&canonical_root)
+        .map_err(|error| SettingsError::Workspace(error.to_string()))?;
+    let mut policy = PolicySet::new(canonical_root);
+    push_rules(&mut policy, &file.permissions.allow, PolicyEffect::Allow)?;
+    push_rules(
+        &mut policy,
+        &file.permissions.ask,
+        PolicyEffect::RequireApproval,
+    )?;
+    push_rules(&mut policy, &file.permissions.deny, PolicyEffect::Deny)?;
 
     let default_mode = match file.permissions.default_mode {
         Some(name) => Some(PermissionMode::parse(&name).ok_or(SettingsError::Mode(name))?),
@@ -270,8 +297,9 @@ fn resolve_settings(
     let compaction = parse_compaction(file.compaction, profile, max_tokens)?;
 
     Ok(ProjectSettings {
-        policy,
+        policy: Some(policy),
         default_mode,
+        trust,
         model_name,
         max_tokens,
         max_iterations: file.agent.max_iterations,
@@ -419,11 +447,15 @@ fn default_agent_max_tokens() -> u64 {
     AgentConfig::default().max_tokens.unwrap_or(32_768)
 }
 
-fn push_rules(target: &mut Vec<Rule>, rules: &[String]) -> Result<(), SettingsError> {
+fn push_rules(
+    policy: &mut PolicySet,
+    rules: &[String],
+    effect: PolicyEffect,
+) -> Result<(), SettingsError> {
     for rule in rules {
-        let parsed = parse_rule(rule, RuleOrigin::ProjectSettings)
-            .map_err(|err| SettingsError::Rule(rule.clone(), err.to_string()))?;
-        target.extend(parsed);
+        policy
+            .compile_and_push(rule, effect, PolicyOrigin::Project)
+            .map_err(|error| SettingsError::Rule(rule.clone(), error.to_string()))?;
     }
     Ok(())
 }
@@ -435,6 +467,8 @@ pub enum SettingsError {
     Read(std::io::Error),
     /// JSON syntax or the closed settings schema was invalid.
     Parse(serde_json::Error),
+    /// The project root could not become a canonical permission anchor.
+    Workspace(String),
     /// A permission rule and its parser diagnostic.
     Rule(String, String),
     /// The permission default mode is unsupported.
@@ -458,6 +492,9 @@ impl std::fmt::Display for SettingsError {
         match self {
             Self::Read(err) => write!(f, "failed to read {SETTINGS_PATH}: {err}"),
             Self::Parse(err) => write!(f, "failed to parse {SETTINGS_PATH}: {err}"),
+            Self::Workspace(err) => {
+                write!(f, "failed to resolve project permission root: {err}")
+            }
             Self::Rule(rule, err) => write!(f, "invalid rule `{rule}` in {SETTINGS_PATH}: {err}"),
             Self::Mode(mode) => write!(f, "invalid defaultMode `{mode}` in {SETTINGS_PATH}"),
             Self::Model(message) => {
@@ -504,7 +541,7 @@ mod tests {
     fn load_json(tag: &str, json: &str) -> Result<ProjectSettings, SettingsError> {
         let dir = unique_dir(tag);
         fs::write(dir.join(".kuncode/settings.json"), json).expect("write settings");
-        let result = load_project_settings_from(&dir, None);
+        let result = load_project_settings_from(&dir, None, ProjectTrust::Trusted);
         let _ = fs::remove_dir_all(&dir);
         result
     }
@@ -512,10 +549,13 @@ mod tests {
     #[test]
     fn missing_file_is_default_not_error() {
         let dir = std::env::temp_dir().join(format!("kuncode-absent-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("temp dir");
 
-        let loaded = load_project_settings_from(&dir, None).expect("a missing file is fine");
+        let loaded = load_project_settings_from(&dir, None, ProjectTrust::Untrusted)
+            .expect("a missing file is fine");
+        let _ = fs::remove_dir_all(&dir);
 
-        assert!(loaded.policy.deny.is_empty());
+        assert!(loaded.policy.expect("resolved policy").rules().is_empty());
         assert!(loaded.default_mode.is_none());
         assert!(loaded.compaction.is_none());
         assert_eq!(loaded.model_name, "deepseek-v4-pro");
@@ -593,15 +633,30 @@ mod tests {
         let loaded = load_json(
             "permissions-ok",
             r#"{ "permissions": {
-                "allow": ["Read", "Bash(cargo *)"],
+                "allow": ["Read(**)", "Bash(cargo *)"],
                 "deny": ["Bash(curl *)"],
                 "defaultMode": "acceptEdits"
             } }"#,
         )
         .expect("loads");
 
-        assert_eq!(loaded.policy.allow.len(), 3);
-        assert_eq!(loaded.policy.deny.len(), 1);
+        let policy = loaded.policy.expect("resolved policy");
+        assert_eq!(
+            policy
+                .rules()
+                .iter()
+                .filter(|rule| rule.effect() == PolicyEffect::Allow)
+                .count(),
+            2
+        );
+        assert_eq!(
+            policy
+                .rules()
+                .iter()
+                .filter(|rule| rule.effect() == PolicyEffect::Deny)
+                .count(),
+            1
+        );
         assert_eq!(loaded.default_mode, Some(PermissionMode::AcceptEdits));
     }
 
@@ -757,8 +812,9 @@ mod tests {
         )
         .expect("write settings");
 
-        let loaded = load_project_settings_from(&dir, Some("deepseek-v4-flash"))
-            .expect("environment override selects a known model");
+        let loaded =
+            load_project_settings_from(&dir, Some("deepseek-v4-flash"), ProjectTrust::Trusted)
+                .expect("environment override selects a known model");
         let _ = fs::remove_dir_all(&dir);
 
         assert_eq!(loaded.model_name, "deepseek-v4-flash");

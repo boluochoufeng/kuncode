@@ -3,6 +3,8 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
+const MAX_TOOL_ERROR_BYTES: usize = 2_048;
+
 /// Harness-level failures the agent loop must handle itself.
 #[derive(Debug, Error)]
 pub enum ToolError {
@@ -45,11 +47,9 @@ pub enum ToolErrorKind {
     /// Arguments failed to parse or validate before the tool ran.
     InvalidArguments,
     /// No tool with the requested name is registered.
-    UnknownTool,
+    ToolNotFound,
     /// Blocked by a permission rule at the gate.
     PermissionDenied,
-    /// Vetoed by a `PreToolUse` hook.
-    BlockedByHook,
     /// The call was interrupted before the tool returned.
     Cancelled,
     /// A harness-boundary tool failure.
@@ -63,9 +63,8 @@ impl ToolErrorKind {
     pub fn as_str(&self) -> &str {
         match self {
             Self::InvalidArguments => "invalid_arguments",
-            Self::UnknownTool => "unknown_tool",
+            Self::ToolNotFound => "tool_not_found",
             Self::PermissionDenied => "permission_denied",
-            Self::BlockedByHook => "blocked_by_hook",
             Self::Cancelled => "cancelled",
             Self::ToolError => "tool_error",
             Self::Other(kind) => kind,
@@ -77,9 +76,8 @@ impl From<&str> for ToolErrorKind {
     fn from(kind: &str) -> Self {
         match kind {
             "invalid_arguments" => Self::InvalidArguments,
-            "unknown_tool" => Self::UnknownTool,
+            "tool_not_found" => Self::ToolNotFound,
             "permission_denied" => Self::PermissionDenied,
-            "blocked_by_hook" => Self::BlockedByHook,
             "cancelled" => Self::Cancelled,
             "tool_error" => Self::ToolError,
             other => Self::Other(other.to_string()),
@@ -141,7 +139,7 @@ impl<D> ToolOutput<D> {
             data: None,
             error: Some(ToolErrorPayload {
                 kind: kind.into(),
-                message: message.into(),
+                message: bounded_error_message(message.into()),
             }),
             truncated: false,
         }
@@ -152,6 +150,22 @@ impl<D> ToolOutput<D> {
         self.truncated = true;
         self
     }
+}
+
+fn bounded_error_message(message: String) -> String {
+    let mut bounded = String::with_capacity(message.len().min(MAX_TOOL_ERROR_BYTES));
+    for character in message.chars() {
+        let character = if character.is_control() && character != '\n' && character != '\t' {
+            ' '
+        } else {
+            character
+        };
+        if bounded.len() + character.len_utf8() > MAX_TOOL_ERROR_BYTES {
+            break;
+        }
+        bounded.push(character);
+    }
+    bounded
 }
 
 impl<D: Serialize> ToolOutput<D> {
@@ -187,5 +201,23 @@ impl<D: Serialize> ToolOutput<D> {
             })
             .to_string()
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failure_messages_are_bounded_and_strip_terminal_controls() {
+        let output: ToolOutput<()> = ToolOutput::failure(
+            "test",
+            format!("secret\u{1b}[31m{}", "🙂".repeat(MAX_TOOL_ERROR_BYTES)),
+        );
+        let message = output.error.expect("error exists").message;
+
+        assert!(message.len() <= MAX_TOOL_ERROR_BYTES);
+        assert!(message.len() >= MAX_TOOL_ERROR_BYTES - 3);
+        assert!(!message.contains('\u{1b}'));
     }
 }

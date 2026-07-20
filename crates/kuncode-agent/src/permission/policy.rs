@@ -1,308 +1,439 @@
-//! Static rule set and the pure decision function.
+//! Resolves typed checks against immutable, session, mode, and Hook policy.
 
-use super::request::{DenyReason, PermissionAction, PermissionRequest, Verdict};
-use super::rule::{Rule, RuleOrigin, first_match, matches_any, parse_rule};
-use super::state::{PermissionMode, PermissionSessionState};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Built-in deny rules. These replace the old `DANGEROUS_COMMAND_PATTERNS`
-/// substring blocklist from `tool/bash.rs`: same intent, but expressed in the
-/// unified rule pipeline so they are explainable and user-extensible. They are
-/// demo guards, not security — the real boundary is "bash defaults to Ask".
-const BUILTIN_DENY: &[&str] = &[
-    "Bash(sudo*)",
-    "Bash(rm -rf /*)",
-    "Bash(shutdown*)",
-    "Bash(reboot*)",
-    "Bash(* > /dev/*)",
-];
+use super::rule::{
+    PermissionRule, PermissionRuleError, RuleCompileContext, compile_permission_rule,
+};
+use super::state::{PermissionMode, SessionPolicyOverlay};
+use super::{
+    AuthorizationRequest, AuthorizationResolution, CanonicalPath, PermissionCheck,
+    PermissionTarget, PolicyContribution, PolicyEffect, PolicyOrigin, SafeExplanation,
+    resolve_authorization, resolve_check,
+};
+use kuncode_core::non_empty_vec::NonEmptyVec;
+use thiserror::Error;
 
-/// Static permission rules, owned read-only by the runner. The three lists are
-/// *append-only* across sources (builtin + project file + CLI flags); runtime
-/// precedence in [`evaluate`] decides who wins, not list order.
-#[derive(Clone, Debug, Default)]
-pub struct PermissionPolicy {
-    pub allow: Vec<Rule>,
-    pub ask: Vec<Rule>,
-    pub deny: Vec<Rule>,
+static NEXT_POLICY_REVISION: AtomicU64 = AtomicU64::new(1);
+
+/// Whether repository-owned configuration may relax this workspace's policy.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum WorkspaceTrust {
+    /// Project Allow rules and relaxing modes must not be activated.
+    #[default]
+    Untrusted,
+    /// A user-controlled trust decision permits project relaxations.
+    Trusted,
 }
 
-impl PermissionPolicy {
-    /// An empty policy (everything falls through to per-action defaults).
-    pub fn new() -> Self {
-        Self::default()
-    }
+/// Monotonic immutable-policy version bound into authorization context.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct PolicySetRevision(u64);
 
-    /// A policy seeded with the built-in deny rules.
-    pub fn builtin() -> Self {
-        let mut policy = Self::new();
-        for rule in BUILTIN_DENY {
-            // `BUILTIN_DENY` are compile-time constants with valid rule syntax,
-            // so parsing cannot fail at runtime; a bad edit is a build-time bug
-            // caught by `builtin_deny_blocks_sudo` rather than a user-facing
-            // error path. Hence `expect`, not `?`.
-            policy
-                .deny
-                .extend(parse_rule(rule, RuleOrigin::Builtin).expect("builtin deny rule parses"));
+impl PolicySetRevision {
+    /// Returns the monotonic version.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Product policy containing typed rules from every static source.
+#[derive(Clone, Debug)]
+pub struct PolicySet {
+    rules: Vec<PermissionRule>,
+    workspace_root: CanonicalPath,
+    workspace_trust: WorkspaceTrust,
+    revision: PolicySetRevision,
+}
+
+impl PolicySet {
+    /// Creates an empty policy anchored to one canonical workspace.
+    pub fn new(workspace_root: CanonicalPath) -> Self {
+        Self {
+            rules: Vec::new(),
+            workspace_root,
+            workspace_trust: WorkspaceTrust::Untrusted,
+            revision: next_policy_revision(),
         }
-        policy
     }
 
-    /// Appends every rule from `other` into the matching list. Used to fold
-    /// project-file and CLI-flag rules onto the built-ins.
-    pub fn append(&mut self, other: PermissionPolicy) {
-        self.allow.extend(other.allow);
-        self.ask.extend(other.ask);
-        self.deny.extend(other.deny);
+    pub(crate) fn fail_closed(workspace_root: CanonicalPath) -> Self {
+        Self {
+            rules: vec![PermissionRule::fail_closed()],
+            workspace_root,
+            workspace_trust: WorkspaceTrust::Untrusted,
+            revision: next_policy_revision(),
+        }
+    }
+
+    /// Creates the built-in hardening rules.
+    ///
+    /// # Errors
+    /// Returns an error if a shipped rule is invalid; callers must fail startup
+    /// rather than silently dropping a security rule.
+    pub fn builtin(workspace_root: CanonicalPath) -> Result<Self, PolicySetError> {
+        let mut policy = Self::new(workspace_root);
+        for (effect, rule) in [
+            (PolicyEffect::Deny, "Bash(sudo)"),
+            (PolicyEffect::Deny, "Bash(sudo *)"),
+            (PolicyEffect::Deny, "Bash(rm -rf /*)"),
+            (PolicyEffect::Deny, "Bash(shutdown)"),
+            (PolicyEffect::Deny, "Bash(shutdown *)"),
+            (PolicyEffect::Deny, "Bash(reboot)"),
+            (PolicyEffect::Deny, "Bash(reboot *)"),
+            (PolicyEffect::Deny, "Bash(* > /dev/*)"),
+            (PolicyEffect::RequireApproval, "Read(.env)"),
+            (PolicyEffect::RequireApproval, "Read(**/.env)"),
+            (PolicyEffect::RequireApproval, "Read(**/*.pem)"),
+            (PolicyEffect::RequireApproval, "Read(**/id_rsa)"),
+        ] {
+            policy.compile_and_push(rule, effect, PolicyOrigin::Builtin)?;
+        }
+        Ok(policy)
+    }
+
+    /// Compiles and appends one rule.
+    ///
+    /// # Errors
+    /// Returns a namespace-specific parse error for invalid syntax.
+    pub fn compile_and_push(
+        &mut self,
+        input: &str,
+        effect: PolicyEffect,
+        origin: PolicyOrigin,
+    ) -> Result<(), PolicySetError> {
+        let context = RuleCompileContext::new(self.workspace_root.clone());
+        let rule = compile_permission_rule(input, effect, origin, &context)?;
+        self.push(rule);
+        Ok(())
+    }
+
+    /// Appends an already compiled trusted rule and advances the revision.
+    pub fn push(&mut self, rule: PermissionRule) {
+        self.rules.push(rule);
+        self.revision = next_policy_revision();
+    }
+
+    /// Appends another policy without applying source precedence.
+    ///
+    /// # Errors
+    /// Returns an error when the two policies use different workspace anchors.
+    pub fn append(&mut self, other: Self) -> Result<(), PolicySetError> {
+        if self.workspace_root != other.workspace_root {
+            return Err(PolicySetError::WorkspaceMismatch);
+        }
+        for rule in other.rules {
+            self.push(rule);
+        }
+        Ok(())
+    }
+
+    /// Returns the immutable policy revision.
+    pub const fn revision(&self) -> PolicySetRevision {
+        self.revision
+    }
+
+    /// Returns the workspace anchor used by modes and relative matchers.
+    pub fn workspace_root(&self) -> &CanonicalPath {
+        &self.workspace_root
+    }
+
+    /// Records the user-controlled workspace trust decision in the revision.
+    pub fn set_workspace_trust(&mut self, trust: WorkspaceTrust) {
+        if self.workspace_trust != trust {
+            self.workspace_trust = trust;
+            self.revision = next_policy_revision();
+        }
+    }
+
+    /// Returns the trust state bound into authorization context snapshots.
+    pub const fn workspace_trust(&self) -> WorkspaceTrust {
+        self.workspace_trust
+    }
+
+    /// Resolves every check with static, session, mode, and Hook contributions.
+    ///
+    /// # Errors
+    /// Returns an error only when a profile-default cause cannot be encoded.
+    pub fn resolve(
+        &self,
+        request: &AuthorizationRequest,
+        session_rules: &[PermissionRule],
+        mode: PermissionMode,
+        hook_contributions: &[PolicyContribution],
+    ) -> Result<AuthorizationResolution, PolicySetError> {
+        let mut resolutions = Vec::with_capacity(request.checks().len());
+        for check in request.checks().iter() {
+            let mut contributions = self
+                .rules
+                .iter()
+                .filter(|rule| self.static_rule_is_effective(rule))
+                .chain(session_rules)
+                .filter_map(|rule| rule.contribution(check))
+                .collect::<Vec<_>>();
+            contributions.extend(hook_contributions.iter().cloned());
+            if let Some(contribution) = mode_contribution(mode, check, &self.workspace_root)? {
+                contributions.push(contribution);
+            }
+            resolutions.push(resolve_check(
+                check.clone(),
+                contributions,
+                request.profile_revision(),
+            )?);
+        }
+        let resolutions = NonEmptyVec::try_from(resolutions)
+            .map_err(|_| PolicySetError::EmptyAuthorizationRequest)?;
+        Ok(resolve_authorization(resolutions))
+    }
+
+    /// Resolves against one revisioned, session-isolated overlay.
+    ///
+    /// # Errors
+    /// Returns the same resolution failures as [`Self::resolve`].
+    pub fn resolve_with_overlay(
+        &self,
+        request: &AuthorizationRequest,
+        overlay: &SessionPolicyOverlay,
+        hook_contributions: &[PolicyContribution],
+    ) -> Result<AuthorizationResolution, PolicySetError> {
+        self.resolve(request, overlay.rules(), overlay.mode(), hook_contributions)
+    }
+
+    /// Returns all static compiled rules for diagnostics and tests.
+    pub fn rules(&self) -> &[PermissionRule] {
+        &self.rules
+    }
+
+    fn static_rule_is_effective(&self, rule: &PermissionRule) -> bool {
+        self.workspace_trust == WorkspaceTrust::Trusted
+            || rule.origin() != &PolicyOrigin::Project
+            || rule.effect() != PolicyEffect::Allow
     }
 }
 
-/// Decides a request against the static policy and mutable session state.
-///
-/// Pure: no IO, no mutation. Precedence:
-/// `deny → Bypass → ask → allow → AcceptEdits(Write) → default_for(action)`.
-pub fn evaluate(
-    policy: &PermissionPolicy,
-    state: &PermissionSessionState,
-    req: &PermissionRequest,
-) -> Verdict {
-    // 1. deny always wins — static rules then session deny-grants. No exception
-    //    (not even Bypass), so "deny is unbypassable" is a clean invariant.
-    if let Some(rule) =
-        first_match(&policy.deny, req).or_else(|| first_match(state.deny_grants(), req))
-    {
-        return Verdict::Deny(DenyReason {
-            origin: rule.origin,
-            rule: rule.raw.clone(),
-        });
-    }
+/// Invalid policy construction or resolution.
+#[derive(Debug, Error)]
+pub enum PolicySetError {
+    /// A typed rule failed to compile.
+    #[error(transparent)]
+    Rule(#[from] PermissionRuleError),
+    /// Policies anchored to different roots cannot be merged.
+    #[error("permission policies use different workspace roots")]
+    WorkspaceMismatch,
+    /// Authorization requests are required to contain checks.
+    #[error("authorization request contains no permission checks")]
+    EmptyAuthorizationRequest,
+    /// Cause encoding failed.
+    #[error("failed to encode permission decision: {0}")]
+    Encoding(#[from] serde_json::Error),
+}
 
-    // 2. Bypass skips prompts, but respected the deny above.
-    if state.mode() == PermissionMode::BypassPermissions {
-        return Verdict::Allow;
+fn mode_contribution(
+    mode: PermissionMode,
+    check: &PermissionCheck,
+    workspace_root: &CanonicalPath,
+) -> Result<Option<PolicyContribution>, serde_json::Error> {
+    let effect = match mode {
+        PermissionMode::Default | PermissionMode::DontAsk => return Ok(None),
+        PermissionMode::AcceptEdits => match check.target() {
+            PermissionTarget::Edit(super::PathSelector::Exact { path })
+                if path_is_inside(path, workspace_root) =>
+            {
+                PolicyEffect::Allow
+            }
+            _ => return Ok(None),
+        },
+        PermissionMode::Plan => match check.target() {
+            PermissionTarget::Read(_) | PermissionTarget::TodoWrite => return Ok(None),
+            PermissionTarget::Edit(_)
+            | PermissionTarget::Bash(_)
+            | PermissionTarget::WebFetch(_)
+            | PermissionTarget::Mcp(_)
+            | PermissionTarget::Agent(_)
+            | PermissionTarget::ExactTool(_) => PolicyEffect::Deny,
+        },
+        PermissionMode::BypassPermissions => PolicyEffect::Allow,
+    };
+    #[derive(serde::Serialize)]
+    struct Cause<'a> {
+        mode: &'a str,
+        check_id: &'a str,
     }
+    let mode_name = match mode {
+        PermissionMode::Default => "default",
+        PermissionMode::AcceptEdits => "accept_edits",
+        PermissionMode::Plan => "plan",
+        PermissionMode::BypassPermissions => "bypass_permissions",
+        PermissionMode::DontAsk => "dont_ask",
+    };
+    Ok(Some(PolicyContribution::new(
+        effect,
+        PolicyOrigin::Mode,
+        super::PermissionCauseId::derive(&Cause {
+            mode: mode_name,
+            check_id: check.id().as_str(),
+        })?,
+        SafeExplanation::new(format!("permission mode {mode_name}")),
+    )))
+}
 
-    // 3. Explicit ask beats explicit allow, so a narrow `ask:Edit(.env)` can
-    //    override a broad `allow:Edit(**)`.
-    if matches_any(&policy.ask, req) {
-        return Verdict::Ask;
-    }
+fn path_is_inside(path: &CanonicalPath, root: &CanonicalPath) -> bool {
+    path.as_str() == root.as_str()
+        || path
+            .as_str()
+            .strip_prefix(root.as_str())
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
 
-    // 4. Explicit allow — static rules then session allow-grants.
-    if matches_any(&policy.allow, req) || matches_any(state.allow_grants(), req) {
-        return Verdict::Allow;
-    }
-
-    // 5. AcceptEdits auto-allows writes only; reads are already free and
-    //    execute keeps asking. Sits after ask, so an explicit ask still prompts.
-    if state.mode() == PermissionMode::AcceptEdits && req.action == PermissionAction::Write {
-        return Verdict::Allow;
-    }
-
-    // 6. Per-action default: reads and side-effect-free meta ops are always
-    //    free; writes/exec ask.
-    match req.action {
-        PermissionAction::Read | PermissionAction::Meta => Verdict::Allow,
-        PermissionAction::Write | PermissionAction::Execute => Verdict::Ask,
-    }
+fn next_policy_revision() -> PolicySetRevision {
+    PolicySetRevision(NEXT_POLICY_REVISION.fetch_add(1, Ordering::Relaxed))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::permission::request::PermissionRequest;
 
-    fn req(tool: &str, action: PermissionAction, resource: Option<&str>) -> PermissionRequest {
-        PermissionRequest::new(tool, action, resource.map(str::to_string), "test")
+    fn typed_request(
+        target: PermissionTarget,
+        default: super::super::ProfileDefault,
+    ) -> AuthorizationRequest {
+        let namespace = target.namespace();
+        let profile =
+            super::super::ToolPermissionProfile::new("test_tool", [(namespace, default)], false)
+                .expect("valid profile");
+        let checks = profile
+            .validate([super::super::PermissionCheckSpec::new(target)])
+            .expect("valid check");
+        AuthorizationRequest::new(
+            "call-1",
+            0,
+            super::super::ToolIdentity::new("test_tool").expect("valid tool"),
+            super::super::CanonicalToolInput::new(serde_json::json!({})),
+            checks,
+            super::super::ToolDisplay::new("test"),
+            profile.revision().clone(),
+        )
+        .expect("request encodes")
     }
 
-    fn policy(allow: &[&str], ask: &[&str], deny: &[&str]) -> PermissionPolicy {
-        let mut p = PermissionPolicy::new();
-        for r in allow {
-            p.allow
-                .extend(parse_rule(r, RuleOrigin::ProjectSettings).unwrap());
-        }
-        for r in ask {
-            p.ask
-                .extend(parse_rule(r, RuleOrigin::ProjectSettings).unwrap());
-        }
-        for r in deny {
-            p.deny
-                .extend(parse_rule(r, RuleOrigin::ProjectSettings).unwrap());
-        }
-        p
-    }
-
-    fn state(mode: PermissionMode) -> PermissionSessionState {
-        PermissionSessionState::new(mode)
+    fn root() -> CanonicalPath {
+        CanonicalPath::from_absolute(std::path::Path::new("/workspace")).expect("absolute root")
     }
 
     #[test]
-    fn reads_are_free_by_default() {
-        let v = evaluate(
-            &PermissionPolicy::new(),
-            &state(PermissionMode::Default),
-            &req("read_file", PermissionAction::Read, Some("src/lib.rs")),
+    fn typed_explicit_ask_beats_bypass_allow() {
+        let request = typed_request(
+            PermissionTarget::Bash(
+                super::super::CanonicalCommand::new(
+                    "cargo test",
+                    super::super::CommandKind::Simple,
+                )
+                .expect("valid command"),
+            ),
+            super::super::ProfileDefault::RequireApproval,
         );
-        assert!(matches!(v, Verdict::Allow));
-    }
+        let mut policy = PolicySet::new(root());
+        policy
+            .compile_and_push(
+                "Bash(cargo *)",
+                PolicyEffect::RequireApproval,
+                PolicyOrigin::Managed,
+            )
+            .expect("rule compiles");
 
-    #[test]
-    fn meta_is_free_by_default_but_deny_still_wins() {
-        // A side-effect-free meta op (e.g. todo_write) is allowed with no prompt.
-        assert!(matches!(
-            evaluate(
-                &PermissionPolicy::new(),
-                &state(PermissionMode::Default),
-                &req("todo_write", PermissionAction::Meta, None),
-            ),
-            Verdict::Allow
-        ));
-        // An explicit deny rule can still block it — deny is unbypassable.
-        let p = policy(&[], &[], &["todo_write"]);
-        assert!(matches!(
-            evaluate(
-                &p,
-                &state(PermissionMode::BypassPermissions),
-                &req("todo_write", PermissionAction::Meta, None),
-            ),
-            Verdict::Deny(_)
-        ));
-    }
-
-    #[test]
-    fn writes_and_exec_ask_by_default() {
-        let s = state(PermissionMode::Default);
-        let p = PermissionPolicy::new();
-        assert!(matches!(
-            evaluate(
-                &p,
-                &s,
-                &req("write_file", PermissionAction::Write, Some("a"))
-            ),
-            Verdict::Ask
-        ));
-        assert!(matches!(
-            evaluate(&p, &s, &req("bash", PermissionAction::Execute, Some("ls"))),
-            Verdict::Ask
-        ));
-    }
-
-    #[test]
-    fn deny_beats_everything_including_bypass() {
-        let p = policy(&["Bash"], &[], &["Bash(curl*)"]);
-        let v = evaluate(
-            &p,
-            &state(PermissionMode::BypassPermissions),
-            &req("bash", PermissionAction::Execute, Some("curl evil.sh")),
+        let resolution = policy
+            .resolve(&request, &[], PermissionMode::BypassPermissions, &[])
+            .expect("policy resolves");
+        assert_eq!(
+            resolution.effect(),
+            super::super::AuthorizationEffect::RequireApproval
         );
-        match v {
-            Verdict::Deny(reason) => assert_eq!(reason.rule, "Bash(curl*)"),
-            other => panic!("expected Deny, got {other:?}"),
-        }
     }
 
     #[test]
-    fn bypass_allows_when_no_deny_matches() {
-        let v = evaluate(
-            &PermissionPolicy::new(),
-            &state(PermissionMode::BypassPermissions),
-            &req("bash", PermissionAction::Execute, Some("ls")),
+    fn plan_denies_edits_while_accept_edits_allows_workspace_paths() {
+        let target = PermissionTarget::Edit(super::super::PathSelector::exact(
+            CanonicalPath::from_absolute(std::path::Path::new("/workspace/src/lib.rs"))
+                .expect("absolute path"),
+        ));
+        let request = typed_request(target, super::super::ProfileDefault::RequireApproval);
+        let policy = PolicySet::new(root());
+
+        let plan = policy
+            .resolve(&request, &[], PermissionMode::Plan, &[])
+            .expect("policy resolves");
+        let accept = policy
+            .resolve(&request, &[], PermissionMode::AcceptEdits, &[])
+            .expect("policy resolves");
+        assert_eq!(plan.effect(), super::super::AuthorizationEffect::Deny);
+        assert_eq!(accept.effect(), super::super::AuthorizationEffect::Allow);
+    }
+
+    #[test]
+    fn builtin_sensitive_read_overrides_read_default() {
+        let request = typed_request(
+            PermissionTarget::Read(super::super::PathSelector::exact(
+                CanonicalPath::from_absolute(std::path::Path::new("/workspace/.env"))
+                    .expect("absolute path"),
+            )),
+            super::super::ProfileDefault::Allow,
         );
-        assert!(matches!(v, Verdict::Allow));
-    }
+        let policy = PolicySet::builtin(root()).expect("builtins compile");
+        let resolution = policy
+            .resolve(&request, &[], PermissionMode::Default, &[])
+            .expect("policy resolves");
 
-    #[test]
-    fn narrow_ask_overrides_broad_allow() {
-        let p = policy(&["Edit(**)"], &["Edit(.env)"], &[]);
-        // The carve-out path still allows (allow rule, not the default ask).
-        assert!(matches!(
-            evaluate(
-                &p,
-                &state(PermissionMode::Default),
-                &req("edit_file", PermissionAction::Write, Some("src/lib.rs"))
-            ),
-            Verdict::Allow
-        ));
-        // The protected path asks despite the broad allow.
-        assert!(matches!(
-            evaluate(
-                &p,
-                &state(PermissionMode::Default),
-                &req("edit_file", PermissionAction::Write, Some(".env"))
-            ),
-            Verdict::Ask
-        ));
-    }
-
-    #[test]
-    fn accept_edits_allows_writes_but_not_explicit_ask() {
-        let p = policy(&[], &["Edit(.env)"], &[]);
-        let s = state(PermissionMode::AcceptEdits);
-        // A normal write is auto-allowed.
-        assert!(matches!(
-            evaluate(
-                &p,
-                &s,
-                &req("write_file", PermissionAction::Write, Some("a.txt"))
-            ),
-            Verdict::Allow
-        ));
-        // The explicit ask still prompts (ask is checked before AcceptEdits).
-        assert!(matches!(
-            evaluate(
-                &p,
-                &s,
-                &req("edit_file", PermissionAction::Write, Some(".env"))
-            ),
-            Verdict::Ask
-        ));
-        // Execute is not a write, so AcceptEdits leaves it asking.
-        assert!(matches!(
-            evaluate(&p, &s, &req("bash", PermissionAction::Execute, Some("ls"))),
-            Verdict::Ask
-        ));
-    }
-
-    #[test]
-    fn session_grants_are_honored() {
-        let p = PermissionPolicy::new();
-        let mut s = state(PermissionMode::Default);
-        s.grant_allow(parse_rule("Bash(cargo*)", RuleOrigin::SessionGrant).unwrap()[0].clone());
-        assert!(matches!(
-            evaluate(
-                &p,
-                &s,
-                &req("bash", PermissionAction::Execute, Some("cargo build"))
-            ),
-            Verdict::Allow
-        ));
-        s.grant_deny(
-            parse_rule("Bash(cargo publish*)", RuleOrigin::SessionGrant).unwrap()[0].clone(),
+        assert_eq!(
+            resolution.effect(),
+            super::super::AuthorizationEffect::RequireApproval
         );
-        // Deny-grant wins over the allow-grant (deny checked first).
-        assert!(matches!(
-            evaluate(
-                &p,
-                &s,
-                &req("bash", PermissionAction::Execute, Some("cargo publish"))
-            ),
-            Verdict::Deny(_)
-        ));
     }
 
     #[test]
-    fn builtin_deny_blocks_sudo() {
-        let v = evaluate(
-            &PermissionPolicy::builtin(),
-            &state(PermissionMode::Default),
-            &req("bash", PermissionAction::Execute, Some("sudo ls")),
+    fn untrusted_project_allow_is_ignored_but_project_deny_remains_effective() {
+        let request = typed_request(
+            PermissionTarget::Bash(
+                super::super::CanonicalCommand::new(
+                    "cargo test",
+                    super::super::CommandKind::Simple,
+                )
+                .expect("valid command"),
+            ),
+            super::super::ProfileDefault::RequireApproval,
         );
-        match v {
-            Verdict::Deny(reason) => {
-                assert_eq!(reason.origin, RuleOrigin::Builtin);
-                assert_eq!(reason.rule, "Bash(sudo*)");
-            }
-            other => panic!("expected Deny, got {other:?}"),
-        }
+        let mut policy = PolicySet::new(root());
+        policy
+            .compile_and_push(
+                "Bash(cargo test)",
+                PolicyEffect::Allow,
+                PolicyOrigin::Project,
+            )
+            .expect("allow compiles");
+        let untrusted = policy
+            .resolve(&request, &[], PermissionMode::Default, &[])
+            .expect("policy resolves");
+        assert_eq!(
+            untrusted.effect(),
+            super::super::AuthorizationEffect::RequireApproval
+        );
+
+        policy.set_workspace_trust(WorkspaceTrust::Trusted);
+        let trusted = policy
+            .resolve(&request, &[], PermissionMode::Default, &[])
+            .expect("policy resolves");
+        assert_eq!(trusted.effect(), super::super::AuthorizationEffect::Allow);
+
+        policy
+            .compile_and_push(
+                "Bash(cargo test)",
+                PolicyEffect::Deny,
+                PolicyOrigin::Project,
+            )
+            .expect("deny compiles");
+        policy.set_workspace_trust(WorkspaceTrust::Untrusted);
+        let denied = policy
+            .resolve(&request, &[], PermissionMode::Default, &[])
+            .expect("policy resolves");
+        assert_eq!(denied.effect(), super::super::AuthorizationEffect::Deny);
     }
 }

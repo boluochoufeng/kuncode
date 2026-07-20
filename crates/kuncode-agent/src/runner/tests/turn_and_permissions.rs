@@ -1,8 +1,59 @@
 use super::support::{
-    AgentConfig, AgentError, AgentRunner, AgentSession, ApprovalOutcome, Arc, AssistantContent,
-    FakeModel, IdentitySection, Message, PermissionPolicy, RuleOrigin, ScriptedApprover,
-    SystemPrompt, ToolRegistry, bash, parse_rule, response, tool_result_text,
+    AgentConfig, AgentError, AgentRunner, AgentSession, ApproveAll, Arc, AssistantContent,
+    CanonicalToolInput, ExecutedInvocation, FakeModel, IdentitySection, Message, NonEmptyVec,
+    PermissionCheckSpec, PermissionTarget, PolicyEffect, PolicyOrigin, PreparationContext,
+    PreparedInvocation, RememberExactOnce, SystemPrompt, Tool, ToolContext, ToolDefinition,
+    ToolDisplay, ToolError, ToolOutput, ToolPreparation, ToolRegistry, Value, async_trait,
+    empty_policy, register_bash, response, tool_result_text,
 };
+
+struct MisregisteredTool {
+    definition: ToolDefinition,
+}
+
+impl MisregisteredTool {
+    fn new() -> Self {
+        Self {
+            definition: ToolDefinition {
+                name: "misregistered".to_string(),
+                description: "test profile invariant".to_string(),
+                parameters: serde_json::json!({ "type": "object" }),
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for MisregisteredTool {
+    fn definition(&self) -> &ToolDefinition {
+        &self.definition
+    }
+
+    async fn prepare(
+        self: Arc<Self>,
+        args: Value,
+        _ctx: &PreparationContext,
+    ) -> Result<ToolPreparation, ToolOutput> {
+        Ok(ToolPreparation::new(
+            CanonicalToolInput::new(args),
+            Box::new(UnreachableInvocation),
+            NonEmptyVec::new(PermissionCheckSpec::new(PermissionTarget::TodoWrite)),
+            ToolDisplay::new("Run misregistered tool"),
+        ))
+    }
+}
+
+struct UnreachableInvocation;
+
+#[async_trait]
+impl PreparedInvocation for UnreachableInvocation {
+    async fn execute(self: Box<Self>, _ctx: &ToolContext) -> Result<ExecutedInvocation, ToolError> {
+        Ok(ExecutedInvocation::new(
+            ToolOutput::success(serde_json::json!({})),
+            crate::tool::ToolResultRetention::Verbatim,
+        ))
+    }
+}
 
 #[tokio::test]
 async fn run_turn_updates_transcript_in_place() {
@@ -31,8 +82,9 @@ async fn requests_keep_stable_prefix_between_tool_iterations() {
         response(AssistantContent::text("done")),
     ]);
     let mut registry = ToolRegistry::new();
-    registry.register(bash().await);
+    register_bash(&mut registry).await;
     let runner = AgentRunner::with_config(model.clone(), registry, AgentConfig::default())
+        .with_approval_resolver(Arc::new(ApproveAll))
         .with_system_prompt(SystemPrompt::new(vec![Box::new(IdentitySection::new(
             "be stable",
         ))]));
@@ -63,7 +115,7 @@ async fn stops_when_max_iterations_is_exhausted() {
         serde_json::json!({ "cmd": "printf loop" }),
     ))]);
     let mut registry = ToolRegistry::new();
-    registry.register(bash().await);
+    register_bash(&mut registry).await;
     let runner = AgentRunner::with_config(
         model,
         registry,
@@ -71,7 +123,8 @@ async fn stops_when_max_iterations_is_exhausted() {
             max_iterations: 1,
             ..AgentConfig::default()
         },
-    );
+    )
+    .with_approval_resolver(Arc::new(ApproveAll));
     let mut session = AgentSession::new();
 
     let err = runner
@@ -99,7 +152,7 @@ async fn stops_when_max_iterations_is_exhausted() {
 async fn injects_system_prompt_as_first_message() {
     let model = FakeModel::new([response(AssistantContent::text("hi"))]);
     let mut registry = ToolRegistry::new();
-    registry.register(bash().await);
+    register_bash(&mut registry).await;
     // Only an identity section, so the assembled prompt is exactly the text
     // asserted below (no tools/plan blocks appended).
     let runner = AgentRunner::with_config(model.clone(), registry, AgentConfig::default())
@@ -150,12 +203,14 @@ async fn deny_rule_blocks_tool_with_permission_denied() {
         response(AssistantContent::text("understood")),
     ]);
     let mut registry = ToolRegistry::new();
-    registry.register(bash().await);
-    let mut policy = PermissionPolicy::new();
+    register_bash(&mut registry).await;
+    let mut policy = empty_policy();
     policy
-        .deny
-        .extend(parse_rule("Bash(curl*)", RuleOrigin::ProjectSettings).unwrap());
-    let runner = AgentRunner::new(model, registry).with_policy(policy);
+        .compile_and_push("Bash(curl*)", PolicyEffect::Deny, PolicyOrigin::Project)
+        .expect("valid deny rule");
+    let runner = AgentRunner::new(model, registry)
+        .with_policy(policy)
+        .expect("policy root matches registry");
     let mut session = AgentSession::new();
 
     runner
@@ -166,11 +221,10 @@ async fn deny_rule_blocks_tool_with_permission_denied() {
     // The tool never ran; the model got a clear permission_denied result.
     let result = tool_result_text(&session, 2);
     assert!(result.contains("permission_denied"), "got {result}");
-    assert!(result.contains("Bash(curl*)"), "got {result}");
 }
 
 #[tokio::test]
-async fn allow_always_grant_skips_the_second_prompt() {
+async fn exact_session_grant_skips_only_the_same_second_prompt() {
     let model = FakeModel::new([
         response(AssistantContent::tool_call(
             "call_1",
@@ -180,20 +234,14 @@ async fn allow_always_grant_skips_the_second_prompt() {
         response(AssistantContent::tool_call(
             "call_2",
             "bash",
-            serde_json::json!({ "cmd": "printf two" }),
+            serde_json::json!({ "cmd": "printf one" }),
         )),
         response(AssistantContent::text("done")),
     ]);
     let mut registry = ToolRegistry::new();
-    registry.register(bash().await);
-    let grant = parse_rule("Bash(printf*)", RuleOrigin::SessionGrant).unwrap()[0].clone();
-    // Exactly ONE scripted outcome: if the second call also prompted, the
-    // scripted approver would panic ("ran out of outcomes"). A clean pass
-    // proves the session grant short-circuited the gate.
-    let runner =
-        AgentRunner::new(model, registry).with_approver(Arc::new(ScriptedApprover::new([
-            ApprovalOutcome::AllowAlways(grant),
-        ])));
+    register_bash(&mut registry).await;
+    let resolver = Arc::new(RememberExactOnce::default());
+    let runner = AgentRunner::new(model, registry).with_approval_resolver(resolver.clone());
     let mut session = AgentSession::new();
 
     let turn = runner
@@ -203,7 +251,32 @@ async fn allow_always_grant_skips_the_second_prompt() {
 
     assert_eq!(turn.final_text(&session), "done");
     assert!(tool_result_text(&session, 2).contains("\"stdout\":\"one\""));
-    assert!(tool_result_text(&session, 4).contains("\"stdout\":\"two\""));
-    // The grant is recorded on the session for later turns too.
-    assert_eq!(session.permissions().allow_grants().len(), 1);
+    assert!(tool_result_text(&session, 4).contains("\"stdout\":\"one\""));
+    assert_eq!(resolver.calls(), 1);
+    assert_eq!(session.permissions().rules().len(), 1);
+}
+
+#[tokio::test]
+async fn profile_violation_aborts_with_an_honest_tool_registration_result() {
+    let model = FakeModel::new([response(AssistantContent::tool_call(
+        "call_1",
+        "misregistered",
+        serde_json::json!({}),
+    ))]);
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(MisregisteredTool::new())
+        .expect("fallback profile registers");
+    let runner = AgentRunner::new(model, registry);
+    let mut session = AgentSession::new();
+
+    let error = runner
+        .run_turn(&mut session, "run the invalid adapter")
+        .await
+        .expect_err("profile violation stops the runner");
+
+    assert!(matches!(error, AgentError::ToolRegistration { .. }));
+    let result = tool_result_text(&session, 2);
+    assert!(result.contains("tool_registration"), "got {result}");
+    assert!(!result.contains("cancelled"), "got {result}");
 }

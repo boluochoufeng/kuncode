@@ -1,6 +1,6 @@
 //! Full-screen terminal UI built on ratatui + crossterm.
 //!
-//! Mirrors the existing `Observer`/`Approver` split: this is just another
+//! Mirrors the observer/approval-resolver split: this is just another
 //! frontend wired to the same agent runner. [`run`] owns the terminal lifecycle
 //! (raw mode, alternate screen, panic-safe restore) and the single event loop
 //! that folds the keyboard, the agent's event stream, and approval requests into
@@ -69,10 +69,12 @@ where
     let model_name = runtime.model_name().to_string();
     let mode = runtime.mode();
     let mut session = runtime.session().await;
-    let runner = runtime.into_runner(
-        Arc::new(TuiApprover::new(approval_tx)),
-        Arc::new(TuiObserver::new(event_tx)),
-    );
+    let runner = runtime
+        .into_runner(
+            Arc::new(TuiApprover::new(approval_tx)),
+            Arc::new(TuiObserver::new(event_tx)),
+        )
+        .map_err(io::Error::other)?;
     let mut app = App::new(model_name, mode);
 
     let mut terminal = ratatui::init();

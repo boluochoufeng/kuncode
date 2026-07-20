@@ -1,8 +1,7 @@
 use super::support::{
     AgentError, AgentRunner, AgentSession, Arc, AssistantContent, CollectingObserver,
-    CompletionRequest, EventKind, FakeModel, Message, PermissionPolicy, RuleOrigin,
-    ScriptedApprover, ScriptedHook, ToolRegistry, UserContent, bash, parse_rule, response,
-    tool_result_text, user_text,
+    CompletionRequest, EventKind, FakeModel, Message, PolicyEffect, PolicyOrigin, ScriptedHook,
+    ToolRegistry, UserContent, empty_policy, register_bash, response, tool_result_text, user_text,
 };
 
 #[tokio::test]
@@ -49,12 +48,9 @@ async fn pre_tool_use_deny_short_circuits_the_gate() {
         response(AssistantContent::text("understood")),
     ]);
     let mut registry = ToolRegistry::new();
-    registry.register(bash().await);
+    register_bash(&mut registry).await;
     let observer = Arc::new(CollectingObserver::default());
-    // A scripted approver with no outcomes panics if consulted, proving the
-    // hook deny short-circuits before the gate reaches the approver.
     let runner = AgentRunner::new(model, registry)
-        .with_approver(Arc::new(ScriptedApprover::new([])))
         .with_observer(observer.clone())
         .with_hook(Arc::new(ScriptedHook::default().deny_tool("bash")));
     let mut session = AgentSession::new();
@@ -65,7 +61,7 @@ async fn pre_tool_use_deny_short_circuits_the_gate() {
         .expect("a hook denial is model-recoverable");
 
     let result = tool_result_text(&session, 2);
-    assert!(result.contains("blocked_by_hook"), "got {result}");
+    assert!(result.contains("permission_denied"), "got {result}");
 
     // Same event shape as a permission denial: ToolStart, then a failed ToolEnd.
     let events = observer.events();
@@ -82,7 +78,7 @@ async fn pre_tool_use_deny_short_circuits_the_gate() {
         })
         .collect();
     assert_eq!(tool_ends.len(), 1);
-    assert!(matches!(&tool_ends[0], Some(f) if f.kind.as_str() == "blocked_by_hook"));
+    assert!(matches!(&tool_ends[0], Some(f) if f.kind.as_str() == "permission_denied"));
 }
 
 #[tokio::test]
@@ -96,14 +92,15 @@ async fn hook_proceed_does_not_bypass_a_gate_deny() {
         response(AssistantContent::text("ok")),
     ]);
     let mut registry = ToolRegistry::new();
-    registry.register(bash().await);
-    let mut policy = PermissionPolicy::new();
+    register_bash(&mut registry).await;
+    let mut policy = empty_policy();
     policy
-        .deny
-        .extend(parse_rule("Bash(curl*)", RuleOrigin::ProjectSettings).unwrap());
+        .compile_and_push("Bash(curl*)", PolicyEffect::Deny, PolicyOrigin::Project)
+        .expect("valid deny rule");
     // A hook that only proceeds must not turn a gate deny into an allow.
     let runner = AgentRunner::new(model, registry)
         .with_policy(policy)
+        .expect("policy root matches registry")
         .with_hook(Arc::new(ScriptedHook::default()));
     let mut session = AgentSession::new();
 

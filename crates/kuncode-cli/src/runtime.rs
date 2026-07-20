@@ -4,7 +4,7 @@
 //! on-disk project settings into the configured pieces a run needs — model,
 //! tool registry, system prompt, permission policy/mode. Both run paths (the
 //! one-shot renderer in `main` and the [`tui`](crate::tui)) consume it and
-//! differ *only* in the frontend's [`Approver`] + [`AgentObserver`], which they
+//! differ *only* in the frontend's approval resolver + [`AgentObserver`], which they
 //! pass to [`into_runner`](CliRuntime::into_runner). This keeps the assembly —
 //! and the CLI's business decisions (identity prompt, todo-reminder cadence) —
 //! out of `main`, and gives each frontend a single argument instead of a long
@@ -13,9 +13,11 @@
 use std::sync::Arc;
 
 use kuncode_agent::observer::{AgentObserver, CompositeObserver};
-use kuncode_agent::permission::{Approver, PermissionMode, PermissionPolicy};
+use kuncode_agent::permission::{ApprovalResolver, CanonicalPath, PermissionMode, PolicySet};
 use kuncode_agent::registry::ToolRegistry;
-use kuncode_agent::runner::{AgentCompactionConfigError, AgentConfig, AgentRunner};
+use kuncode_agent::runner::{
+    AgentCompactionConfigError, AgentConfig, AgentRunner, AgentRunnerBuildError,
+};
 use kuncode_agent::session::AgentSession;
 use kuncode_agent::session_store::{
     NewSession, SessionStore, session_store_path, turso::TursoSessionStore,
@@ -28,7 +30,7 @@ use kuncode_core::completion::{CompletionModel, RetryModel, RetryPolicy};
 use kuncode_core::providers::deepseek::{DeepSeekClient, DeepSeekCompletionModel};
 
 use crate::config::{PermissionFlags, resolve_permissions};
-use crate::settings::{ProjectSettings, load_project_settings};
+use crate::settings::{ProjectSettings, ProjectTrust, load_project_settings};
 use crate::{Cli, logging::LoggingObserver};
 
 /// Identity and behavioral instructions rendered as the first system-prompt
@@ -54,7 +56,7 @@ pub struct CliRuntime<M> {
     registry: ToolRegistry,
     config: AgentConfig,
     system_prompt: SystemPrompt,
-    policy: PermissionPolicy,
+    policy: PolicySet,
     mode: PermissionMode,
     model_name: String,
     project_root: std::path::PathBuf,
@@ -87,7 +89,12 @@ impl CliRuntime<RetryModel<DeepSeekCompletionModel>> {
 
         // The merge is pure and tested in `config`; loading the project file
         // (I/O) stays in `settings`.
-        let project = load_project_settings(workspace.root())?;
+        let project_trust = if cli.trust_project {
+            ProjectTrust::Trusted
+        } else {
+            ProjectTrust::Untrusted
+        };
+        let project = load_project_settings(workspace.root(), project_trust)?;
         let model_name = project.model_name.clone();
         let config = agent_config(&project)?;
         let flags = PermissionFlags {
@@ -96,7 +103,15 @@ impl CliRuntime<RetryModel<DeepSeekCompletionModel>> {
             deny: &cli.deny,
             mode: cli.mode.as_deref(),
         };
-        let resolved = resolve_permissions(project, &flags)?;
+        let permission_root = CanonicalPath::from_absolute(workspace.root())?;
+        let resolved = resolve_permissions(project, &flags, permission_root)?;
+        if resolved.ignored_project_relaxations > 0 {
+            tracing::warn!(
+                target: "kuncode::authorization",
+                ignored_relaxations = resolved.ignored_project_relaxations,
+                "untrusted project permission relaxations were ignored; use --trust-project only after reviewing the workspace",
+            );
+        }
         tracing::info!(
             target: "kuncode::runtime",
             model = %model_name,
@@ -152,7 +167,7 @@ impl CliRuntime<RetryModel<DeepSeekCompletionModel>> {
         let provider = DeepSeekCompletionModel::make(&client, model_name.clone());
         let model = RetryModel::with_policy(provider.clone(), RetryPolicy::default());
         let summary_model = RetryModel::with_policy(provider, summary_retry_policy());
-        let registry = ToolRegistry::with_default_workspace_tools(workspace);
+        let registry = ToolRegistry::with_default_workspace_tools(workspace)?;
 
         Ok(Self {
             model,
@@ -243,24 +258,24 @@ impl<M: CompletionModel> CliRuntime<M> {
     /// `with_*` chain both run paths share.
     pub fn into_runner(
         self,
-        approver: Arc<dyn Approver>,
+        approver: Arc<dyn ApprovalResolver>,
         observer: Arc<dyn AgentObserver>,
-    ) -> AgentRunner<M> {
+    ) -> Result<AgentRunner<M>, AgentRunnerBuildError> {
         let observer = Arc::new(CompositeObserver(vec![
             observer,
             Arc::new(LoggingObserver) as Arc<dyn AgentObserver>,
         ]));
-        let runner = AgentRunner::with_config(self.model, self.registry, self.config)
+        let runner = AgentRunner::try_with_config(self.model, self.registry, self.config)?
             .with_summary_model(self.summary_model)
             .with_system_prompt(self.system_prompt)
-            .with_policy(self.policy)
-            .with_approver(approver)
+            .with_policy(self.policy)?
+            .with_approval_resolver(approver)
             .with_observer(observer);
-        if let Some(store) = self.session_store {
+        Ok(if let Some(store) = self.session_store {
             runner.with_session_store(store)
         } else {
             runner
-        }
+        })
     }
 }
 
@@ -285,7 +300,8 @@ mod tests {
             } }"#,
         )
         .expect("write settings");
-        let settings = load_project_settings_from(&dir, None).expect("load settings");
+        let settings =
+            load_project_settings_from(&dir, None, ProjectTrust::Untrusted).expect("load settings");
         let _ = fs::remove_dir_all(&dir);
         settings
     }

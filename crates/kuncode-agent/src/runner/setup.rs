@@ -3,7 +3,7 @@
 //! Durable appends precede in-memory mutation. Any append uncertainty poisons
 //! later lossy compaction even though the message remains available in memory.
 
-use std::{panic::AssertUnwindSafe, sync::Arc};
+use std::{io, panic::AssertUnwindSafe, sync::Arc};
 
 use kuncode_core::completion::{CompletionModel, Message};
 
@@ -12,7 +12,10 @@ use crate::{
     error::AgentError,
     hook::{Hook, Hooks},
     observer::{AgentEvent, AgentObserver, EventKind},
-    permission::{Approver, AutoApprove, PermissionPolicy},
+    permission::{
+        ApprovalBroker, ApprovalResolver, CanonicalPath, PermissionTargetError, PolicySet,
+        PolicySetError,
+    },
     registry::ToolRegistry,
     session::AgentSession,
     session_store::{NewJournalEntry, SessionStore},
@@ -28,15 +31,62 @@ where
 {
     /// Creates a runner with default loop configuration.
     ///
-    /// Defaults to the built-in deny rules and an [`AutoApprove`] approver, so
-    /// dangerous commands are still blocked but nothing prompts. Callers that
-    /// want a human in the loop set one via [`with_approver`](Self::with_approver).
+    /// Defaults to built-in policy and fail-closed unavailable approval.
+    ///
+    /// Initialization failure installs a deny-all policy; product frontends
+    /// should use [`Self::try_new`] when startup must report the root cause.
     pub fn new(model: M, registry: ToolRegistry) -> Self {
         Self::with_config(model, registry, AgentConfig::default())
     }
 
+    /// Creates a runner and reports permission-policy initialization failure.
+    ///
+    /// # Errors
+    /// Returns an error when the policy workspace or shipped rules cannot be
+    /// initialized safely.
+    pub fn try_new(model: M, registry: ToolRegistry) -> Result<Self, AgentRunnerBuildError> {
+        Self::try_with_config(model, registry, AgentConfig::default())
+    }
+
     /// Creates a runner with explicit loop configuration.
+    ///
+    /// Initialization failure installs a deny-all policy; product frontends
+    /// should use [`Self::try_with_config`] to fail startup explicitly.
     pub fn with_config(model: M, registry: ToolRegistry, config: AgentConfig) -> Self {
+        let policy = match initialize_policy(&registry) {
+            Ok(policy) => policy,
+            Err(error) => {
+                tracing::error!(
+                    target: "kuncode::authorization",
+                    error = %error,
+                    "permission policy initialization failed; installing deny-all policy",
+                );
+                PolicySet::fail_closed(CanonicalPath::fail_closed_anchor())
+            }
+        };
+        Self::from_parts(model, registry, config, policy)
+    }
+
+    /// Creates a runner with explicit configuration and startup validation.
+    ///
+    /// # Errors
+    /// Returns an error when the policy workspace or shipped rules cannot be
+    /// initialized safely.
+    pub fn try_with_config(
+        model: M,
+        registry: ToolRegistry,
+        config: AgentConfig,
+    ) -> Result<Self, AgentRunnerBuildError> {
+        let policy = initialize_policy(&registry)?;
+        Ok(Self::from_parts(model, registry, config, policy))
+    }
+
+    fn from_parts(
+        model: M,
+        registry: ToolRegistry,
+        config: AgentConfig,
+        policy: PolicySet,
+    ) -> Self {
         let token_estimator: Arc<dyn TokenEstimator> =
             Arc::new(ConservativeTokenEstimator::default());
         Self {
@@ -45,8 +95,8 @@ where
             registry,
             config,
             system_prompt: Arc::new(SystemPrompt::default()),
-            policy: Arc::new(PermissionPolicy::builtin()),
-            approver: Arc::new(AutoApprove),
+            policy: Arc::new(policy),
+            approvals: Arc::new(ApprovalBroker::new()),
             observer: None,
             hooks: Arc::new(Hooks::new()),
             session_store: None,
@@ -61,15 +111,28 @@ where
         self
     }
 
-    /// Replaces the static permission policy.
-    pub fn with_policy(mut self, policy: PermissionPolicy) -> Self {
+    /// Replaces the static permission policy after checking its workspace anchor.
+    ///
+    /// # Errors
+    /// Returns an error when the policy was compiled for a different workspace.
+    pub fn with_policy(mut self, policy: PolicySet) -> Result<Self, AgentRunnerBuildError> {
+        let registry_root = permission_workspace_root(&self.registry)?;
+        if policy.workspace_root() != &registry_root {
+            return Err(AgentRunnerBuildError::PolicyWorkspaceMismatch);
+        }
         self.policy = Arc::new(policy);
+        Ok(self)
+    }
+
+    /// Appends a frontend resolver before the fail-closed fallback.
+    pub fn with_approval_resolver(mut self, resolver: Arc<dyn ApprovalResolver>) -> Self {
+        Arc::make_mut(&mut self.approvals).push(resolver);
         self
     }
 
-    /// Replaces the approval layer (e.g. a terminal prompt in the CLI).
-    pub fn with_approver(mut self, approver: Arc<dyn Approver>) -> Self {
-        self.approver = approver;
+    /// Replaces the complete challenge broker.
+    pub fn with_approval_broker(mut self, approvals: ApprovalBroker) -> Self {
+        self.approvals = Arc::new(approvals);
         self
     }
 
@@ -127,12 +190,7 @@ where
     /// a bare observer as well as a
     /// [`CompositeObserver`](crate::observer::CompositeObserver), whose own
     /// per-observer guard additionally keeps siblings rendering when one panics.
-    pub(super) fn emit(
-        &self,
-        session: &mut AgentSession,
-        iteration: Option<usize>,
-        kind: EventKind,
-    ) {
+    pub(super) fn emit(&self, session: &AgentSession, iteration: Option<usize>, kind: EventKind) {
         if let Some(observer) = &self.observer {
             let event = AgentEvent {
                 seq: session.next_seq(),
@@ -244,12 +302,59 @@ where
     }
 }
 
+/// Failure to construct the authorization boundary for a runner.
+#[derive(Debug, thiserror::Error)]
+pub enum AgentRunnerBuildError {
+    /// The process working directory could not be read for a custom registry.
+    #[error("failed to read current directory for permission policy: {0}")]
+    CurrentDirectory(#[source] io::Error),
+    /// The working directory could not be canonicalized.
+    #[error("failed to canonicalize permission policy root `{path}`: {source}")]
+    Canonicalize {
+        /// Unresolved process working directory.
+        path: std::path::PathBuf,
+        /// Filesystem resolution error.
+        #[source]
+        source: io::Error,
+    },
+    /// The canonical root could not become a permission target.
+    #[error(transparent)]
+    Target(#[from] PermissionTargetError),
+    /// Shipped policy rules did not compile.
+    #[error(transparent)]
+    Policy(#[from] PolicySetError),
+    /// Relative rules and mode boundaries must use the tool registry workspace.
+    #[error("permission policy and tool registry use different workspace roots")]
+    PolicyWorkspaceMismatch,
+}
+
+fn permission_workspace_root(
+    registry: &ToolRegistry,
+) -> Result<CanonicalPath, AgentRunnerBuildError> {
+    if let Some(root) = registry.workspace_root() {
+        return Ok(root.clone());
+    }
+    let current = std::env::current_dir().map_err(AgentRunnerBuildError::CurrentDirectory)?;
+    let canonical =
+        std::fs::canonicalize(&current).map_err(|source| AgentRunnerBuildError::Canonicalize {
+            path: current,
+            source,
+        })?;
+    Ok(CanonicalPath::from_absolute(&canonical)?)
+}
+
+fn initialize_policy(registry: &ToolRegistry) -> Result<PolicySet, AgentRunnerBuildError> {
+    Ok(PolicySet::builtin(permission_workspace_root(registry)?)?)
+}
+
 // Keep the stable external code mapping exhaustive so new errors require an
 // explicit observability decision.
 fn error_kind(error: &AgentError) -> &'static str {
     match error {
         AgentError::Completion(_) => "completion",
         AgentError::Tool { .. } => "tool",
+        AgentError::Authorization(_) => "authorization",
+        AgentError::ToolRegistration { .. } => "tool_registration",
         AgentError::EmptyTranscript => "empty_transcript",
         AgentError::RequestEncoding(_) => "request_encoding",
         AgentError::Compaction { .. } => "compaction",

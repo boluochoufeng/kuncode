@@ -1,8 +1,9 @@
 use super::support::{
-    AgentConfig, AgentError, AgentRunner, AgentSession, AlwaysContinueHook, Arc, AssistantContent,
-    AtomicUsize, BrokenTool, CancelInPostHook, CancelInPreHook, CancellationToken,
-    CountingPostHook, FakeModel, Ordering, ScriptedHook, ToolRegistry, bash, is_tool_result,
-    response, response_many, tool_result_id, tool_result_text, user_text,
+    AgentConfig, AgentError, AgentRunner, AgentSession, AlwaysContinueHook, ApproveAll, Arc,
+    AssistantContent, AtomicUsize, BrokenTool, CancelInPostHook, CancelInPreHook,
+    CancellationToken, CountingPostHook, FakeModel, Ordering, ScriptedHook, ToolRegistry,
+    is_tool_result, register_bash, response, response_many, tool_result_id, tool_result_text,
+    user_text,
 };
 
 #[tokio::test]
@@ -23,8 +24,9 @@ async fn post_tool_use_feedback_lands_after_the_batch() {
         response(AssistantContent::text("done")),
     ]);
     let mut registry = ToolRegistry::new();
-    registry.register(bash().await);
+    register_bash(&mut registry).await;
     let runner = AgentRunner::new(model, registry)
+        .with_approval_resolver(Arc::new(ApproveAll))
         .with_hook(Arc::new(ScriptedHook::default().add_feedback("FB")));
     let mut session = AgentSession::new();
 
@@ -47,10 +49,13 @@ async fn post_tool_use_does_not_fire_on_a_harness_error() {
         serde_json::json!({}),
     ))]);
     let mut registry = ToolRegistry::new();
-    registry.register(BrokenTool::new());
+    registry
+        .register(BrokenTool::new())
+        .expect("broken tool registration");
     let count = Arc::new(AtomicUsize::new(0));
-    let runner =
-        AgentRunner::new(model, registry).with_hook(Arc::new(CountingPostHook(count.clone())));
+    let runner = AgentRunner::new(model, registry)
+        .with_approval_resolver(Arc::new(ApproveAll))
+        .with_hook(Arc::new(CountingPostHook(count.clone())));
     let mut session = AgentSession::new();
 
     let err = runner
@@ -72,10 +77,11 @@ async fn post_tool_use_cancellation_keeps_results_paired() {
         AssistantContent::tool_call("call_2", "bash", serde_json::json!({ "cmd": "printf two" })),
     ])]);
     let mut registry = ToolRegistry::new();
-    registry.register(bash().await);
+    register_bash(&mut registry).await;
     let cancel = CancellationToken::new();
-    let runner =
-        AgentRunner::new(model, registry).with_hook(Arc::new(CancelInPostHook(cancel.clone())));
+    let runner = AgentRunner::new(model, registry)
+        .with_approval_resolver(Arc::new(ApproveAll))
+        .with_hook(Arc::new(CancelInPostHook(cancel.clone())));
     let mut session = AgentSession::new();
 
     let err = runner
@@ -178,7 +184,7 @@ async fn hook_cancellation_is_not_a_model_visible_deny() {
         serde_json::json!({ "cmd": "printf hi" }),
     ))]);
     let mut registry = ToolRegistry::new();
-    registry.register(bash().await);
+    register_bash(&mut registry).await;
     let cancel = CancellationToken::new();
     let runner =
         AgentRunner::new(model, registry).with_hook(Arc::new(CancelInPreHook(cancel.clone())));
@@ -190,12 +196,12 @@ async fn hook_cancellation_is_not_a_model_visible_deny() {
         .expect_err("the hook cancels the turn");
     assert!(matches!(err, AgentError::Cancelled));
 
-    // The call is paired as interrupted ("cancelled"), never a blocked_by_hook
+    // The call is paired as interrupted ("cancelled"), never a permission denial
     // deny — a user cancel must not be mistaken for a hook decision.
     let result = tool_result_text(&session, 2);
     assert!(result.contains("cancelled"), "got {result}");
     assert!(
-        !result.contains("blocked_by_hook"),
+        !result.contains("permission_denied"),
         "cancellation was mis-mapped to a deny: {result}"
     );
 }

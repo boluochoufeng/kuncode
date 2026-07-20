@@ -1,4 +1,4 @@
-//! Bridges the agent's `Observer`/`Approver` callbacks to the TUI event loop.
+//! Bridges the agent's observer and approval callbacks to the TUI event loop.
 //!
 //! The runner invokes these on its own task; each forwards over a channel so the
 //! single-owner event loop renders them. Events go one-way (`on_event` is sync
@@ -8,7 +8,8 @@
 use async_trait::async_trait;
 use kuncode_agent::observer::{AgentEvent, AgentObserver};
 use kuncode_agent::permission::{
-    ApprovalOutcome, Approver, PermissionRequest, Rule, suggest_scope,
+    ApprovalChallenge, ApprovalResolution, ApprovalResolver, PolicyEffect,
+    PolicyMutationTemplateId, PolicyScope,
 };
 use tokio::sync::{mpsc::UnboundedSender, oneshot};
 
@@ -30,20 +31,26 @@ impl AgentObserver for TuiObserver {
     }
 }
 
-/// A pending approval handed to the event loop: what to show, the rule an
-/// "always" choice would persist, and the channel to answer on.
+/// A pending approval handed to the event loop.
+///
+/// Persistence choices are opaque IDs produced by the engine. The TUI can
+/// select one but cannot construct or widen a policy rule.
 pub struct ApprovalRequest {
     pub summary: String,
-    /// Rule an "always allow/deny" choice persists — broader than the single
-    /// call for bash (a command prefix), so the modal surfaces it.
-    pub scope: Rule,
-    pub respond: oneshot::Sender<ApprovalOutcome>,
+    pub targets: Vec<String>,
+    pub allow_session: Option<PolicyMutationTemplateId>,
+    pub deny_session: Option<PolicyMutationTemplateId>,
+    pub respond: oneshot::Sender<ApprovalResolution>,
 }
 
 impl ApprovalRequest {
-    /// The rule text an "always" choice will remember.
-    pub fn scope_rule(&self) -> &str {
-        &self.scope.raw
+    /// Summarizes the exact targets whose decision can be remembered.
+    pub fn persistence_label(&self) -> String {
+        match self.targets.as_slice() {
+            [] => "无".to_string(),
+            [target] => target.clone(),
+            targets => format!("{} 个精确目标", targets.len()),
+        }
     }
 }
 
@@ -61,17 +68,37 @@ impl TuiApprover {
 }
 
 #[async_trait]
-impl Approver for TuiApprover {
-    async fn request(&self, req: &PermissionRequest) -> ApprovalOutcome {
+impl ApprovalResolver for TuiApprover {
+    async fn resolve(&self, challenge: &ApprovalChallenge) -> ApprovalResolution {
         let (respond, rx) = oneshot::channel();
+        let targets = challenge
+            .pending_checks()
+            .iter()
+            .map(|check| check.target().to_string())
+            .collect();
         let message = ApprovalRequest {
-            summary: req.summary.clone(),
-            scope: suggest_scope(req),
+            summary: challenge.request_snapshot().display().summary().to_string(),
+            targets,
+            allow_session: mutation_id(challenge, PolicyEffect::Allow),
+            deny_session: mutation_id(challenge, PolicyEffect::Deny),
             respond,
         };
         if self.tx.send(message).is_err() {
-            return ApprovalOutcome::DenyOnce;
+            return ApprovalResolution::Deny { persistence: None };
         }
-        rx.await.unwrap_or(ApprovalOutcome::DenyOnce)
+        rx.await
+            .unwrap_or(ApprovalResolution::Deny { persistence: None })
     }
+}
+
+fn mutation_id(
+    challenge: &ApprovalChallenge,
+    effect: PolicyEffect,
+) -> Option<PolicyMutationTemplateId> {
+    let mut matches = challenge
+        .mutation_options()
+        .iter()
+        .filter(|option| option.effect() == effect && option.scope() == PolicyScope::Session);
+    let selected = matches.next()?;
+    matches.next().is_none().then(|| selected.id().clone())
 }
