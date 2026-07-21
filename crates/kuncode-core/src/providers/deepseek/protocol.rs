@@ -51,6 +51,7 @@ pub enum Message {
     /// Assistant output: visible text plus optional tool calls and reasoning.
     Assistant {
         /// Visible assistant text.
+        #[serde(default, deserialize_with = "json_utils::null_or_default")]
         content: String,
         /// Optional speaker name accepted by OpenAI-compatible APIs.
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -207,6 +208,7 @@ pub struct ToolCall {
     // Position within parallel calls. DeepSeek includes it in responses and
     // streaming chunks; request replay uses array order instead, so outbound
     // conversion fills 0 and inbound projection does not read it.
+    #[serde(default)]
     pub index: usize,
     /// Tool-call kind; currently always [`ToolType::Function`].
     pub r#type: ToolType,
@@ -377,11 +379,13 @@ pub struct DeepSeekCompletionResponse {
     pub created: u64,
     /// Model id that served the request.
     pub model: String,
-    /// Provider backend fingerprint.
-    pub system_fingerprint: String,
+    /// Provider backend fingerprint; OpenAI-compatible endpoints may omit it.
+    #[serde(default)]
+    pub system_fingerprint: Option<String>,
     /// OpenAI-compatible object type.
     pub object: String,
-    /// Token accounting for the call.
+    /// Token accounting for the call; some compatible endpoints omit it.
+    #[serde(default)]
     pub usage: Usage,
 }
 
