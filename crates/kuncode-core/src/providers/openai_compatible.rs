@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use reqwest::header::CONTENT_TYPE;
 use serde_json::Value;
 use thiserror::Error;
 
@@ -143,8 +144,28 @@ impl CompletionModel for OpenAiCompatibleCompletionModel {
                 message: response.text().await.unwrap_or_default(),
             });
         }
+        validate_stream_content_type(
+            response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+        )?;
         Ok(crate::providers::deepseek::protocol::streaming::stream_events(response))
     }
+}
+
+fn validate_stream_content_type(content_type: Option<&str>) -> Result<(), CompletionError> {
+    let Some(content_type) = content_type else {
+        return Ok(());
+    };
+    let media_type = content_type.split(';').next().unwrap_or_default().trim();
+    if media_type.eq_ignore_ascii_case("text/event-stream") {
+        return Ok(());
+    }
+
+    Err(CompletionError::ResponseError(format!(
+        "expected an SSE response with content type `text/event-stream`, but the provider returned `{media_type}`; verify `baseUrl` points to the API root (usually ending in `/v1`) or the full `/chat/completions` endpoint"
+    )))
 }
 
 fn request_body(
@@ -223,6 +244,29 @@ mod tests {
                 .expect("valid endpoint"),
             "http://localhost:8000/v1/chat/completions"
         );
+    }
+
+    #[test]
+    fn accepts_sse_content_type_with_parameters() {
+        validate_stream_content_type(Some("text/event-stream; charset=utf-8"))
+            .expect("SSE content type should be accepted");
+    }
+
+    #[test]
+    fn accepts_missing_content_type_for_compatible_gateways() {
+        validate_stream_content_type(None)
+            .expect("a missing content type should fall through to the SSE decoder");
+    }
+
+    #[test]
+    fn rejects_html_with_base_url_guidance() {
+        let error = validate_stream_content_type(Some("text/html; charset=utf-8"))
+            .expect_err("HTML is not an SSE response")
+            .to_string();
+
+        assert!(error.contains("`text/html`"));
+        assert!(error.contains("`baseUrl`"));
+        assert!(error.contains("/v1"));
     }
 
     #[test]
