@@ -4,28 +4,40 @@ use kuncode_agent::todo::{TodoItem, TodoStatus};
 use ratatui::{
     Frame,
     layout::{Margin, Rect},
-    style::{Color, Style, Stylize},
-    text::{Line, Text},
-    widgets::{Block, Paragraph},
+    style::{Modifier, Style},
+    text::{Line, Span, Text},
+    widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
 };
 
 use super::super::app::{App, Item, ToolState};
+use super::Theme;
 
-pub(super) const USER_BG: Color = Color::Rgb(45, 50, 70);
-
-pub(super) fn draw_conversation(frame: &mut Frame, app: &mut App, area: Rect) {
-    let inner_width = area.width.saturating_sub(2).max(1);
-    let inner_height = area.height.saturating_sub(2);
+/// Renders the scrollable conversation viewport and its overflow indicator.
+pub(super) fn draw_conversation(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let horizontal_margin = if area.width >= 8 { 2 } else { 0 };
+    let vertical_margin = u16::from(area.height >= 5);
+    let viewport = area.inner(Margin::new(horizontal_margin, vertical_margin));
+    let scrollbar_width = u16::from(viewport.width >= 5);
+    let content_area = Rect::new(
+        viewport.x,
+        viewport.y,
+        viewport.width.saturating_sub(scrollbar_width),
+        viewport.height,
+    );
+    if content_area.width == 0 || content_area.height == 0 {
+        return;
+    }
 
     // Wrap to exact physical lines ourselves rather than letting `Paragraph`
     // word-wrap: a hard-division estimate runs short of the real wrapped count,
     // so `max_scroll` came out too small and PageUp got swallowed. Exact wrapping
     // makes the scroll range correct.
-    let lines = wrap_lines(conversation_lines(app), inner_width);
-    // Tag user rows by their background so we can repaint them after layout:
-    // `Paragraph` leaves a wide glyph's second cell untinted (sawtooth gaps).
-    let user_rows: Vec<bool> = lines.iter().map(|l| l.style.bg == Some(USER_BG)).collect();
-    let max_scroll = (lines.len() as u16).saturating_sub(inner_height);
+    let lines = wrap_lines(conversation_lines(app, theme), content_area.width);
+    let content_rows = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+    let max_scroll = content_rows.saturating_sub(content_area.height);
 
     // Follow pins to the bottom; a manual scroll clamps within range and
     // re-enables follow once it lands back at the bottom.
@@ -38,73 +50,67 @@ pub(super) fn draw_conversation(frame: &mut Frame, app: &mut App, area: Rect) {
         }
     }
 
-    let para = Paragraph::new(Text::from(lines))
-        .block(Block::bordered().title("kuncode"))
-        .scroll((app.scroll, 0));
-    frame.render_widget(para, area);
-    paint_user_bg(frame, area, app.scroll, &user_rows);
-}
-
-/// Repaints the full-width background of user-message rows after layout.
-///
-/// A line-level background doesn't reach the second cell of a wide (CJK) glyph,
-/// so `Paragraph` renders user rows with dotted/sawtooth gaps. This fills every
-/// inner cell of those rows uniformly, including the continuation cells.
-pub(super) fn paint_user_bg(frame: &mut Frame, area: Rect, scroll: u16, user_rows: &[bool]) {
-    let inner = area.inner(Margin::new(1, 1));
-    let buf = frame.buffer_mut();
-    for dy in 0..inner.height {
-        let idx = scroll as usize + dy as usize;
-        if user_rows.get(idx).copied().unwrap_or(false) {
-            let y = inner.y + dy;
-            for dx in 0..inner.width {
-                if let Some(cell) = buf.cell_mut((inner.x + dx, y)) {
-                    cell.bg = USER_BG;
-                }
-            }
-        }
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).scroll((app.scroll, 0)),
+        content_area,
+    );
+    if max_scroll > 0 && scrollbar_width > 0 {
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .track_symbol(Some("│"))
+            .track_style(theme.muted())
+            .thumb_symbol("┃")
+            .thumb_style(theme.accent());
+        let mut state = ScrollbarState::new(content_rows as usize)
+            .position(app.scroll as usize)
+            .viewport_content_length(content_area.height as usize);
+        let scrollbar_area = Rect::new(
+            viewport.x + viewport.width.saturating_sub(1),
+            viewport.y,
+            1,
+            viewport.height,
+        );
+        frame.render_stateful_widget(scrollbar, scrollbar_area, &mut state);
     }
 }
 
-/// Wraps logical lines to `width` display columns, preserving each line's style
-/// and padding every physical line out to the full width. Exact wrapping keeps
-/// the scroll range correct; full-width padding lets a line-level background
-/// (user input) span the whole row instead of hugging the text. Splits on
-/// character boundaries (not words) — fine for a conversation log.
+/// Wraps logical lines to exact display columns while preserving span styles.
 pub(super) fn wrap_lines(logical: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> {
     let width = width.max(1);
     let mut out = Vec::new();
-    for line in &logical {
-        let style = line.style;
-        let content: String = line
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect();
-        let mut seg = String::new();
-        let mut seg_width = 0u16;
-        for ch in content.chars() {
-            let cw = char_width(ch);
-            if !seg.is_empty() && seg_width + cw > width {
-                out.push(pad_line(seg, style, width));
-                seg = String::new();
-                seg_width = 0;
+    for line in logical {
+        let line_style = line.style;
+        let mut row = Vec::new();
+        let mut row_width = 0u16;
+        for span in line.spans {
+            let span_style = span.style;
+            let mut chunk = String::new();
+            for ch in span.content.chars() {
+                let char_width = char_width(ch);
+                if row_width > 0 && row_width.saturating_add(char_width) > width {
+                    push_chunk(&mut row, &mut chunk, span_style);
+                    out.push(finish_line(std::mem::take(&mut row), line_style));
+                    row_width = 0;
+                }
+                chunk.push(ch);
+                row_width = row_width.saturating_add(char_width);
             }
-            seg.push(ch);
-            seg_width += cw;
+            push_chunk(&mut row, &mut chunk, span_style);
         }
-        out.push(pad_line(seg, style, width));
+        out.push(finish_line(row, line_style));
     }
     out
 }
 
-/// Pads `content` with trailing spaces to `width` display columns and applies
-/// `style`, so a styled background fills the row to its right edge.
-fn pad_line(content: String, style: Style, width: u16) -> Line<'static> {
-    let used = Line::raw(content.as_str()).width() as u16;
-    let mut padded = content;
-    padded.push_str(&" ".repeat(width.saturating_sub(used) as usize));
-    Line::from(padded).style(style)
+fn push_chunk(spans: &mut Vec<Span<'static>>, chunk: &mut String, style: Style) {
+    if !chunk.is_empty() {
+        spans.push(Span::styled(std::mem::take(chunk), style));
+    }
+}
+
+fn finish_line(spans: Vec<Span<'static>>, style: Style) -> Line<'static> {
+    Line::from(spans).style(style)
 }
 
 /// Display width of a single char (`Line::width` is unicode-aware, counting CJK
@@ -113,26 +119,52 @@ pub(super) fn char_width(ch: char) -> u16 {
     Line::raw(ch.to_string()).width() as u16
 }
 
+/// Truncates text to `width` display cells and marks omitted content.
+pub(super) fn truncate_display(text: &str, width: u16) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let total = text
+        .chars()
+        .fold(0u16, |used, ch| used.saturating_add(char_width(ch)));
+    if total <= width {
+        return text.to_string();
+    }
+
+    let available = width.saturating_sub(1);
+    let mut output = String::new();
+    let mut used = 0u16;
+    for ch in text.chars() {
+        let char_width = char_width(ch);
+        if used.saturating_add(char_width) > available {
+            break;
+        }
+        output.push(ch);
+        used = used.saturating_add(char_width);
+    }
+    output.push('…');
+    output
+}
+
 /// Flattens the conversation log into styled lines. Multi-line user/assistant
 /// text is split so each physical line is its own [`Line`].
-fn conversation_lines(app: &App) -> Vec<Line<'static>> {
+fn conversation_lines(app: &App, theme: Theme) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::new();
     for item in &app.conversation {
         match item {
             Item::User(text) => {
-                // Tag rows with the user background; the gap-free fill happens in
-                // `paint_user_bg` after layout. A blank tinted row above and below
-                // gives the block vertical breathing room instead of hugging text.
-                lines.push(Line::from("").bg(USER_BG));
-                for (i, raw) in text.split('\n').enumerate() {
-                    let prefix = if i == 0 { "› " } else { "  " };
-                    lines.push(Line::from(format!("{prefix}{raw}")).bold().bg(USER_BG));
+                lines.push(Line::from(vec![
+                    Span::styled("❯", theme.accent_strong()),
+                    Span::styled(" 你", Style::new().add_modifier(Modifier::BOLD)),
+                ]));
+                for raw in text.split('\n') {
+                    lines.push(Line::from(format!("  {raw}")));
                 }
-                lines.push(Line::from("").bg(USER_BG));
             }
             Item::Assistant(text) => {
+                lines.push(assistant_heading(theme));
                 for raw in text.split('\n') {
-                    lines.push(Line::from(raw.to_string()));
+                    lines.push(Line::from(format!("  {raw}")));
                 }
             }
             Item::Tool {
@@ -141,18 +173,67 @@ fn conversation_lines(app: &App) -> Vec<Line<'static>> {
                 state,
                 ..
             } => {
-                let title = display_tool_name(name);
-                lines.push(Line::from(format!("⏺ {title}  {summary}")).cyan());
-                lines.push(tool_state_line(state));
+                append_tool(&mut lines, app, name, summary, state, theme);
             }
-            Item::Error(text) => lines.push(Line::from(format!("✗ {text}")).red()),
-            Item::Compaction => lines.push(Line::from("◆ 上下文已压缩").dim()),
-            Item::Warning(text) => lines.push(Line::from(format!("⚠ {text}")).yellow()),
+            Item::Error(text) => lines.push(Line::from(format!("× {text}")).style(theme.danger())),
+            Item::Compaction => lines.push(Line::from("◇ 上下文已整理").style(theme.muted())),
+            Item::Warning(text) => {
+                lines.push(Line::from(format!("! {text}")).style(theme.warning()))
+            }
         }
         lines.push(Line::from(""));
     }
-    append_stream_preview(&mut lines, app);
+    append_stream_preview(&mut lines, app, theme);
     lines
+}
+
+fn assistant_heading(theme: Theme) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("◆", theme.success()),
+        Span::styled(" kuncode", theme.success().add_modifier(Modifier::BOLD)),
+    ])
+}
+
+fn append_tool(
+    lines: &mut Vec<Line<'static>>,
+    app: &App,
+    name: &str,
+    summary: &str,
+    state: &ToolState,
+    theme: Theme,
+) {
+    let (glyph, glyph_style, suffix) = match state {
+        ToolState::Running => (app.activity_glyph(), theme.accent(), None),
+        ToolState::Ok { truncated: false } => ("✓", theme.success(), None),
+        ToolState::Ok { truncated: true } => ("✓", theme.warning(), Some("输出已截断")),
+        ToolState::Failed(_) => ("×", theme.danger(), None),
+        ToolState::Denied(_) => ("!", theme.warning(), None),
+    };
+    let mut spans = vec![
+        Span::raw("  "),
+        Span::styled(glyph, glyph_style),
+        Span::raw(" "),
+        Span::styled(
+            display_tool_name(name),
+            Style::new().add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if !summary.trim().is_empty() {
+        spans.push(Span::styled(format!("  {summary}"), theme.muted()));
+    }
+    if let Some(suffix) = suffix {
+        spans.push(Span::styled(format!("  {suffix}"), theme.warning()));
+    }
+    lines.push(Line::from(spans));
+    match state {
+        ToolState::Failed(message) => {
+            lines.push(Line::from(format!("    {message}")).style(theme.danger()));
+        }
+        ToolState::Denied(message) => {
+            lines.push(Line::from(format!("    {message}")).style(theme.warning()));
+        }
+        ToolState::Running | ToolState::Ok { .. } => {}
+    }
 }
 
 /// Appends the in-progress streamed answer/reasoning below the committed log.
@@ -164,48 +245,59 @@ fn conversation_lines(app: &App) -> Vec<Line<'static>> {
 ///
 /// Only the typewriter-revealed prefix is drawn (see [`App::advance_reveal`]), so
 /// a fast stream types out at a readable pace instead of flooding in at once.
-fn append_stream_preview(lines: &mut Vec<Line<'static>>, app: &App) {
+fn append_stream_preview(lines: &mut Vec<Line<'static>>, app: &App, theme: Theme) {
     let reasoning = &app.stream_reasoning[..app.reasoning_revealed];
+    let answer = &app.stream_answer[..app.answer_revealed];
+    if !reasoning.is_empty() || !answer.is_empty() {
+        lines.push(assistant_heading(theme));
+    }
     if !reasoning.is_empty() {
-        for raw in reasoning.split('\n') {
-            lines.push(Line::from(raw.to_string()).dim());
+        if answer.is_empty() {
+            lines.push(Line::from("  思考中").style(theme.muted()));
+            for raw in reasoning_preview(reasoning).split('\n') {
+                lines.push(Line::from(format!("  {raw}")).style(theme.muted()));
+            }
+        } else {
+            lines.push(Line::from("  思考完成").style(theme.muted()));
         }
     }
-    let answer = &app.stream_answer[..app.answer_revealed];
     if !answer.is_empty() {
         for raw in answer.split('\n') {
-            lines.push(Line::from(raw.to_string()));
+            lines.push(Line::from(format!("  {raw}")));
         }
     }
+}
+
+fn reasoning_preview(reasoning: &str) -> String {
+    const MAX_LINES: usize = 4;
+    const MAX_CHARS: usize = 240;
+
+    let lines: Vec<&str> = reasoning.lines().rev().take(MAX_LINES).collect();
+    let mut preview = lines.into_iter().rev().collect::<Vec<_>>().join("\n");
+    let total_chars = preview.chars().count();
+    if total_chars <= MAX_CHARS {
+        return preview;
+    }
+
+    let start = preview
+        .char_indices()
+        .nth(total_chars - MAX_CHARS)
+        .map_or(0, |(offset, _)| offset);
+    preview = format!("…{}", &preview[start..]);
+    preview
 }
 
 /// One checklist row for the plan panel: the shared status glyph + text, colored
 /// per status. The glyph and text-field choice come from
 /// [`crate::observer::todo_glyph_and_text`] so this and the plain renderer stay
 /// in lockstep; only the color is TUI-local.
-pub(super) fn plan_item_line(todo: &TodoItem) -> Line<'static> {
+pub(super) fn plan_item_line(todo: &TodoItem, width: u16, theme: Theme) -> Line<'static> {
     let (glyph, text) = crate::observer::todo_glyph_and_text(todo);
-    let body = format!(" {glyph} {text}");
+    let body = truncate_display(&format!(" {glyph} {text}"), width);
     match todo.status {
-        TodoStatus::Pending => Line::from(body).dim(),
-        TodoStatus::InProgress => Line::from(body).cyan(),
-        TodoStatus::Completed => Line::from(body).green(),
-    }
-}
-
-fn tool_state_line(state: &ToolState) -> Line<'static> {
-    match state {
-        ToolState::Running => Line::from("  ⎿ …".to_string()).dim(),
-        ToolState::Ok { truncated } => {
-            let mark = if *truncated {
-                "  ⎿ ✓ (截断)"
-            } else {
-                "  ⎿ ✓"
-            };
-            Line::from(mark.to_string()).green()
-        }
-        ToolState::Failed(msg) => Line::from(format!("  ⎿ ✗ {msg}")).red(),
-        ToolState::Denied(msg) => Line::from(format!("  ⎿ ⛔ {msg}")).yellow(),
+        TodoStatus::Pending => Line::from(body).style(theme.muted()),
+        TodoStatus::InProgress => Line::from(body).style(theme.accent_strong()),
+        TodoStatus::Completed => Line::from(body).style(theme.success()),
     }
 }
 
@@ -235,11 +327,16 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     #[test]
-    fn streamed_preview_renders_answer_and_reasoning_below_the_log() {
+    fn streamed_answer_collapses_completed_reasoning() {
         let mut app = App::new("model-x", PermissionMode::Default);
         app.apply_event(EventKind::ReasoningDelta {
             text: "weighing options".to_string(),
         });
+        app.advance_reveal(std::time::Duration::from_secs(1), 100_000);
+        let mut terminal = Terminal::new(TestBackend::new(60, 16)).expect("test terminal");
+        terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
+        assert!(format!("{}", terminal.backend()).contains("weighing options"));
+
         app.apply_event(EventKind::TextDelta {
             text: "partial answer".to_string(),
         });
@@ -247,7 +344,6 @@ mod tests {
         // this assertion (the typewriter pacing itself is tested in app.rs).
         app.advance_reveal(std::time::Duration::from_secs(1), 100_000);
 
-        let mut terminal = Terminal::new(TestBackend::new(60, 16)).expect("test terminal");
         terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
 
         let rendered = format!("{}", terminal.backend());
@@ -256,9 +352,10 @@ mod tests {
             "in-progress answer should render live"
         );
         assert!(
-            rendered.contains("weighing options"),
-            "in-progress reasoning should render live"
+            rendered.contains("思考完成"),
+            "completed reasoning should collapse once the answer starts"
         );
+        assert!(!rendered.contains("weighing options"));
     }
 
     #[test]
@@ -269,35 +366,74 @@ mod tests {
     }
 
     #[test]
-    fn wraps_to_exact_lines_and_pads_full_width() {
-        // "abcdef" at width 4 → "abcd" + "ef", each padded back out to width 4 so
-        // a line background would fill the row.
+    fn wraps_to_exact_lines_without_padding_short_rows() {
         let wrapped = wrap_lines(vec![Line::from("abcdef".to_string())], 4);
         assert_eq!(wrapped.len(), 2);
-        for line in &wrapped {
-            assert_eq!(line.width(), 4, "each physical line filled to full width");
-        }
+        assert_eq!(wrapped[0].width(), 4);
+        assert_eq!(wrapped[1].width(), 2);
     }
 
     #[test]
-    fn user_rows_get_a_gapless_background() {
-        // A wide (CJK) glyph occupies two cells but a line-level background only
-        // tints the first; `paint_user_bg` must fill the continuation cell too so
-        // the background has no sawtooth gaps.
+    fn user_message_uses_a_role_marker_without_forcing_a_background() {
         let mut app = App::new("m", PermissionMode::Default);
+        app.set_colors_enabled(true);
         app.push_user("你好世界".to_string());
         let (w, h) = (20u16, 8u16);
         let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("terminal");
         terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
 
+        let rendered = format!("{}", terminal.backend());
+        assert!(rendered.contains("你"), "the user role should be labeled");
         let buf = terminal.backend().buffer();
-        // Inner content spans columns 1..w-1 (inside the border). Find a row whose
-        // first inner cell is tinted (a user row) and assert the whole inner span
-        // is tinted — no gaps.
-        let tinted = |x: u16, y: u16| buf.cell((x, y)).unwrap().bg == USER_BG;
-        let user_row = (0..h).find(|&y| tinted(1, y)).expect("a tinted user row");
-        for x in 1..w - 1 {
-            assert!(tinted(x, user_row), "gap in user background at column {x}");
+        for y in 0..h {
+            for x in 0..w {
+                assert_eq!(
+                    buf.cell((x, y)).expect("cell").bg,
+                    ratatui::style::Color::Reset,
+                    "conversation should inherit the terminal background"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn wrapping_preserves_span_styles() {
+        let accent = Style::new().fg(ratatui::style::Color::Cyan);
+        let wrapped = wrap_lines(
+            vec![Line::from(vec![
+                Span::styled("ab", accent),
+                Span::raw("cdef"),
+            ])],
+            3,
+        );
+
+        assert_eq!(wrapped.len(), 2);
+        assert_eq!(
+            wrapped[0].spans[0].style.fg,
+            Some(ratatui::style::Color::Cyan)
+        );
+        assert_eq!(wrapped[0].width(), 3);
+        assert_eq!(wrapped[1].width(), 3);
+    }
+
+    #[test]
+    fn reasoning_preview_keeps_only_a_bounded_tail() {
+        let reasoning = (0..10)
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let preview = reasoning_preview(&reasoning);
+
+        assert!(!preview.contains("line 5"));
+        assert!(preview.contains("line 6"));
+        assert!(preview.contains("line 9"));
+        assert_eq!(preview.lines().count(), 4);
+    }
+
+    #[test]
+    fn display_truncation_respects_wide_characters() {
+        assert_eq!(truncate_display("abcdef", 4), "abc…");
+        assert_eq!(truncate_display("你好世界", 5), "你好…");
+        assert_eq!(truncate_display("abc", 3), "abc");
     }
 }
