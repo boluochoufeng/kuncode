@@ -214,6 +214,8 @@ fn settings_error_kind(error: &SettingsError) -> &'static str {
     match error {
         SettingsError::Read(_) => "settings_read",
         SettingsError::Parse(_) => "settings_parse",
+        SettingsError::UserRead(_) => "provider_profiles_read",
+        SettingsError::UserParse(_) => "provider_profiles_parse",
         SettingsError::Workspace(_) => "settings_workspace",
         SettingsError::Rule(_, _) => "settings_rule",
         SettingsError::Mode(_) => "settings_mode",

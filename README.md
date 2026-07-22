@@ -41,14 +41,18 @@ export DEEPSEEK_API_KEY="your-api-key"
 DEEPSEEK_API_KEY=your-api-key
 ```
 
-使用 OpenAI 官方接口时，在 `.kuncode/settings.json` 配置：
+使用 OpenAI 官方接口时，在用户目录的 `~/.kuncode/providers.json` 配置：
 
 ```json
 {
-  "model": {
-    "provider": "openai",
-    "name": "your-openai-model",
-    "maxTokens": 16384
+  "defaultProfile": "openai",
+  "profiles": {
+    "openai": {
+      "provider": "openai",
+      "apiKeyEnv": "OPENAI_API_KEY",
+      "model": "your-openai-model",
+      "maxTokens": 16384
+    }
   }
 }
 ```
@@ -58,6 +62,10 @@ DEEPSEEK_API_KEY=your-api-key
 ```bash
 export OPENAI_API_KEY="your-api-key"
 ```
+
+兼容 OpenAI Chat Completions 的服务可以在 Profile 中增加 `baseUrl` 和
+`headers`。`baseUrl` 支持服务根地址或完整 `/chat/completions` endpoint；
+`apiKeyEnv` 为空时不发送 `Authorization`。
 
 一次性执行任务：
 
@@ -111,8 +119,12 @@ cargo build --release -p kuncode-cli
 补充说明：
 
 - `KUNCODE_MODEL` 可以覆盖配置文件中的模型名称；`DEEPSEEK_MODEL` 作为兼容别名保留。
-- `model.provider` 支持 `deepseek` 和 `openai`；两者分别使用固定官方 endpoint，
-  并读取 `DEEPSEEK_API_KEY` 或 `OPENAI_API_KEY`。
+- Provider 配置优先级为 CLI `--profile` / `--model` > 可信项目配置 >
+  用户 Profile > 内置 DeepSeek 默认值。
+- 未使用 `--trust-project` 时，项目中的 `profile`、`provider`、`name`、
+  `baseUrl`、`apiKeyEnv`、`headers` 和 `maxTokens` 不会覆盖用户配置。
+- `model.provider` 支持 `deepseek` 和 `openai`；自定义 endpoint 和 headers
+  仅适用于 `openai` 协议。
 - 内置模型配置包括 `deepseek-v4-pro` 和 `deepseek-v4-flash`。
 - 非内置模型启用上下文压缩时，需要显式设置 `compaction.contextLimit`。
 - `compaction.mode` 支持 `disabled`、`shadow` 和 `enabled`，默认是 `disabled`。

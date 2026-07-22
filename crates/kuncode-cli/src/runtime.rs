@@ -98,7 +98,12 @@ impl CliRuntime<RetryModel<AnyChatCompletionModel>> {
         } else {
             ProjectTrust::Untrusted
         };
-        let project = load_project_settings(workspace.root(), project_trust)?;
+        let project = load_project_settings(
+            workspace.root(),
+            project_trust,
+            cli.profile.as_deref(),
+            cli.model.as_deref(),
+        )?;
         let model_name = project.model_name.clone();
         let config = agent_config(&project)?;
         let client = provider_client(&project)?;
@@ -190,9 +195,36 @@ impl CliRuntime<RetryModel<AnyChatCompletionModel>> {
 }
 
 fn provider_client(project: &ProjectSettings) -> Result<AnyChatClient, Box<dyn std::error::Error>> {
+    let api_key = if project.api_key_env.is_empty() {
+        String::new()
+    } else {
+        std::env::var(&project.api_key_env).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "provider API key environment variable `{}` is unavailable: {error}",
+                    project.api_key_env
+                ),
+            )
+        })?
+    };
     match project.provider {
-        ProviderKind::DeepSeek => Ok(AnyChatClient::DeepSeek(DeepSeekClient::from_env()?)),
-        ProviderKind::OpenAi => Ok(AnyChatClient::OpenAi(OpenAiClient::from_env()?)),
+        ProviderKind::DeepSeek => Ok(AnyChatClient::DeepSeek(DeepSeekClient::new(api_key)?)),
+        ProviderKind::OpenAi => match project.base_url.as_deref() {
+            Some(base_url) => Ok(AnyChatClient::OpenAi(OpenAiClient::with_endpoint(
+                api_key,
+                base_url,
+                project.headers.clone(),
+            )?)),
+            None if project.headers.is_empty() => {
+                Ok(AnyChatClient::OpenAi(OpenAiClient::new(api_key)?))
+            }
+            None => Ok(AnyChatClient::OpenAi(OpenAiClient::with_endpoint(
+                api_key,
+                "https://api.openai.com/v1",
+                project.headers.clone(),
+            )?)),
+        },
     }
 }
 
@@ -312,7 +344,7 @@ mod tests {
         )
         .expect("write settings");
         let settings =
-            load_project_settings_from(&dir, None, ProjectTrust::Untrusted).expect("load settings");
+            load_project_settings_from(&dir, None, ProjectTrust::Trusted).expect("load settings");
         let _ = fs::remove_dir_all(&dir);
         settings
     }
