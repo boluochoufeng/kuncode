@@ -1,99 +1,275 @@
-//! ratatui rendering: conversation log, input box, status line, approval modal.
+//! Responsive ratatui shell for conversation, planning, input, and approval.
 
 mod conversation;
 
 use ratatui::{
     Frame,
-    layout::{Constraint, Layout, Position, Rect},
-    style::{Style, Stylize},
-    text::{Line, Text},
-    widgets::{Block, Paragraph, Wrap},
+    layout::{Alignment, Constraint, Layout, Margin, Position, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span, Text},
+    widgets::{Block, Borders, Paragraph},
 };
 
+use kuncode_agent::permission::PermissionMode;
 use kuncode_agent::todo::TodoStatus;
 
-use self::conversation::{char_width, draw_conversation, plan_item_line, wrap_lines};
+use self::conversation::{
+    char_width, draw_conversation, plan_item_line, truncate_display, wrap_lines,
+};
 use super::app::{App, Status, mode_label};
 use super::bridge::ApprovalRequest;
 
-/// Height of the approval panel when it takes the input box's place: a wrapped
-/// summary line, the rule line, the choices line, plus the border.
-const APPROVAL_HEIGHT: u16 = 6;
+const HEADER_HEIGHT: u16 = 2;
+const FOOTER_HEIGHT: u16 = 1;
+const INPUT_MAX_ROWS: u16 = 6;
+const PLAN_MAX_ROWS: usize = 5;
+const MIN_CONVERSATION_ROWS: u16 = 2;
 
-/// Largest the plan panel grows to (border + this many task rows); longer plans
-/// clip rather than crowd out the conversation.
-const PLAN_MAX_ROWS: u16 = 8;
-
-/// Draws one frame: conversation body, the sticky plan panel (while work is
-/// outstanding), a bottom pane, and the status line. The bottom pane is the input
-/// box, or —
-/// while an approval is pending — the permission panel *in its place* (aligned to
-/// the input, not a centered popup). The plan sits between the scrolling log and
-/// the input so the live checklist stays pinned below the latest activity.
-pub fn draw(frame: &mut Frame, app: &mut App) {
-    let bottom_height = if app.approval.is_some() {
-        APPROVAL_HEIGHT
-    } else {
-        // Border (2) + content, capped so a long paste can't swallow the screen.
-        let input_lines = app.input.split('\n').count().max(1) as u16;
-        (input_lines + 2).min(8)
-    };
-
-    // Show the panel only while work is outstanding: an empty plan, or one whose
-    // tasks are all completed, collapses the region to zero height. The last task
-    // ticking to ✓ makes the panel vanish — that disappearance *is* the "done"
-    // signal, instead of leaving an all-✓ checklist lingering as noise.
-    let plan_outstanding = app
-        .plan
-        .iter()
-        .any(|task| task.status != TodoStatus::Completed);
-    let plan_height = if plan_outstanding {
-        (app.plan.len() as u16).min(PLAN_MAX_ROWS) + 2 // + border
-    } else {
-        0
-    };
-
-    let [body, plan_area, bottom, status_area] = Layout::vertical([
-        Constraint::Min(1),
-        Constraint::Length(plan_height),
-        Constraint::Length(bottom_height),
-        Constraint::Length(1),
-    ])
-    .areas(frame.area());
-
-    draw_conversation(frame, app, body);
-    if plan_height > 0 {
-        draw_plan(frame, app, plan_area);
-    }
-    if let Some(approval) = &app.approval {
-        draw_approval(frame, approval, bottom);
-    } else {
-        draw_input(frame, app, bottom);
-    }
-    draw_status(frame, app, status_area);
+#[derive(Clone, Copy)]
+pub(super) struct Theme {
+    colors: bool,
 }
 
-/// Renders the live task plan as a bordered panel: one colored checklist row per
-/// task. Pinned above the input by [`draw`], so it never scrolls away with the
-/// log.
-fn draw_plan(frame: &mut Frame, app: &App, area: Rect) {
-    let rows: Vec<Line> = app.plan.iter().map(plan_item_line).collect();
+impl Theme {
+    const fn new(colors: bool) -> Self {
+        Self { colors }
+    }
+
+    fn color(self, color: Color) -> Style {
+        if self.colors {
+            Style::new().fg(color)
+        } else {
+            Style::new()
+        }
+    }
+
+    pub(super) fn accent(self) -> Style {
+        self.color(Color::Cyan)
+    }
+
+    pub(super) fn accent_strong(self) -> Style {
+        self.accent().add_modifier(Modifier::BOLD)
+    }
+
+    pub(super) fn success(self) -> Style {
+        self.color(Color::Green)
+    }
+
+    pub(super) fn warning(self) -> Style {
+        self.color(Color::Yellow)
+    }
+
+    pub(super) fn danger(self) -> Style {
+        self.color(Color::Red)
+    }
+
+    pub(super) fn muted(self) -> Style {
+        self.color(Color::DarkGray).add_modifier(Modifier::DIM)
+    }
+
+    fn divider(self) -> Style {
+        self.color(Color::DarkGray)
+    }
+}
+
+/// Draws a responsive frame with stable priority: approval, composer, active
+/// plan, then conversation history.
+pub fn draw(frame: &mut Frame, app: &mut App) {
+    let area = frame.area();
+    let theme = Theme::new(app.colors_enabled());
+    let approval_lines = app
+        .approval
+        .as_ref()
+        .map(|approval| approval_lines(approval, area.width.saturating_sub(2).max(1), theme));
+    let requested_bottom = if let Some(lines) = &approval_lines {
+        lines.len() as u16 + 2
+    } else {
+        input_height(app, area.width)
+    };
+    let (bottom_height, plan_height) = pane_heights(app, area.height, requested_bottom);
+
+    let [header, body, plan_area, bottom, footer] = Layout::vertical([
+        Constraint::Length(HEADER_HEIGHT),
+        Constraint::Min(0),
+        Constraint::Length(plan_height),
+        Constraint::Length(bottom_height),
+        Constraint::Length(FOOTER_HEIGHT),
+    ])
+    .areas(area);
+
+    draw_header(frame, app, header, theme);
+    draw_conversation(frame, app, body, theme);
+    if plan_height > 0 {
+        draw_plan(frame, app, plan_area, theme);
+    }
+    if let Some(lines) = approval_lines {
+        draw_approval(frame, lines, bottom, theme);
+    } else {
+        draw_input(frame, app, bottom, theme);
+    }
+    draw_footer(frame, app, footer, theme);
+}
+
+fn pane_heights(app: &App, frame_height: u16, requested_bottom: u16) -> (u16, u16) {
+    let fixed = HEADER_HEIGHT.saturating_add(FOOTER_HEIGHT);
+    let usable = frame_height.saturating_sub(fixed);
+    let bottom = requested_bottom.min(usable);
+    if app.approval.is_some() {
+        return (bottom, 0);
+    }
+
+    let plan_rows = visible_plan(app, PLAN_MAX_ROWS).len() as u16;
+    let requested_plan = u16::from(plan_rows > 0).saturating_add(plan_rows);
+    let plan_capacity = usable
+        .saturating_sub(bottom)
+        .saturating_sub(MIN_CONVERSATION_ROWS);
+    (bottom, requested_plan.min(plan_capacity))
+}
+
+fn draw_header(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
+    frame.render_widget(
+        Block::new()
+            .borders(Borders::BOTTOM)
+            .border_style(theme.divider()),
+        area,
+    );
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+
+    let state = match app.status {
+        Status::Idle => Line::from(vec![Span::styled("●", theme.success()), Span::raw(" 就绪")]),
+        Status::Running => Line::from(vec![
+            Span::styled(app.activity_glyph(), theme.accent()),
+            Span::raw(" 处理中"),
+        ]),
+        Status::Compacting => Line::from(vec![
+            Span::styled(app.activity_glyph(), theme.warning()),
+            Span::raw(" 整理上下文"),
+        ]),
+    };
+    let brand_width = 12u16.min(area.width);
+    let [brand, state_area] =
+        Layout::horizontal([Constraint::Length(brand_width), Constraint::Min(0)])
+            .areas(Rect::new(area.x, area.y, area.width, 1));
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("◆", theme.accent()),
+            Span::styled(" kuncode", theme.accent_strong()),
+        ])),
+        brand,
+    );
+    frame.render_widget(Paragraph::new(state), state_area);
+}
+
+/// Renders the active slice of a plan, centered around the in-progress item.
+fn draw_plan(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
+    let row_capacity = area.height.saturating_sub(1) as usize;
+    let visible = visible_plan(app, row_capacity.min(PLAN_MAX_ROWS));
+    let completed = app
+        .plan
+        .iter()
+        .filter(|task| task.status == TodoStatus::Completed)
+        .count();
+    let inner_width = area.width.saturating_sub(2).max(1);
+    let rows: Vec<Line> = visible
+        .into_iter()
+        .map(|task| plan_item_line(task, inner_width, theme))
+        .collect();
+    let title = format!(" 计划 {completed}/{} ", app.plan.len());
     let panel = Paragraph::new(Text::from(rows)).block(
-        Block::bordered()
-            .title("任务计划")
-            .border_style(Style::new().cyan()),
+        Block::new()
+            .borders(Borders::TOP)
+            .title(Line::from(title).style(theme.accent_strong()))
+            .border_style(theme.divider()),
     );
     frame.render_widget(panel, area);
 }
 
-fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
+fn visible_plan(app: &App, max_rows: usize) -> Vec<&kuncode_agent::todo::TodoItem> {
+    if max_rows == 0 {
+        return Vec::new();
+    }
+    if !app
+        .plan
+        .iter()
+        .any(|task| task.status != TodoStatus::Completed)
+    {
+        return Vec::new();
+    }
+    if app.plan.len() <= max_rows {
+        return app.plan.iter().collect();
+    }
+
+    let focus = app
+        .plan
+        .iter()
+        .position(|task| task.status == TodoStatus::InProgress)
+        .or_else(|| {
+            app.plan
+                .iter()
+                .position(|task| task.status == TodoStatus::Pending)
+        })
+        .unwrap_or(0);
+    let start = focus
+        .saturating_sub(max_rows / 2)
+        .min(app.plan.len() - max_rows);
+    app.plan[start..start + max_rows].iter().collect()
+}
+
+fn input_height(app: &App, width: u16) -> u16 {
+    let content_width = width.saturating_sub(4).max(1);
+    let logical: Vec<Line> = app
+        .input
+        .split('\n')
+        .map(|segment| Line::raw(segment.to_string()))
+        .collect();
+    let rows = wrap_lines(logical, content_width).len() as u16;
+    rows.clamp(1, INPUT_MAX_ROWS).saturating_add(2)
+}
+
+fn draw_input(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
     let title = match app.status {
-        Status::Idle => "input",
-        Status::Running => "input (运行中)",
-        Status::Compacting => "input (压缩上下文)",
+        Status::Idle => " 提问 ",
+        Status::Running => " 处理中 ",
+        Status::Compacting => " 整理上下文 ",
     };
-    let inner_width = area.width.saturating_sub(2).max(1);
-    let inner_height = area.height.saturating_sub(2).max(1);
+    let block = Block::bordered()
+        .title(Line::from(title).style(if app.status == Status::Idle {
+            theme.accent_strong()
+        } else {
+            theme.muted()
+        }))
+        .border_style(if app.status == Status::Idle {
+            theme.accent()
+        } else {
+            theme.divider()
+        });
+    let inner = area.inner(Margin::new(1, 1));
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let prompt_width = inner.width.min(2);
+    let [prompt_area, text_area] =
+        Layout::horizontal([Constraint::Length(prompt_width), Constraint::Min(0)]).areas(inner);
+    frame.render_widget(
+        Paragraph::new(if app.status == Status::Idle {
+            "›"
+        } else {
+            "·"
+        })
+        .style(if app.status == Status::Idle {
+            theme.accent_strong()
+        } else {
+            theme.muted()
+        }),
+        prompt_area,
+    );
+
+    let inner_width = text_area.width.max(1);
+    let inner_height = text_area.height.max(1);
 
     // Wrap the input on char boundaries exactly as the conversation does, and
     // render without `Paragraph`'s word-wrap. The caret uses the *same* wrap
@@ -113,16 +289,23 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
     // Scroll so the caret's row is the bottom visible row of the box.
     let scroll = caret_row.saturating_sub(inner_height - 1);
 
-    let para = Paragraph::new(Text::from(wrapped))
-        .block(Block::bordered().title(title))
-        .scroll((scroll, 0));
-    frame.render_widget(para, area);
+    let content = if app.input.is_empty() {
+        let placeholder = match app.status {
+            Status::Idle => "描述你想完成的任务",
+            Status::Running => "等待当前任务完成",
+            Status::Compacting => "正在整理会话上下文",
+        };
+        Text::from(Line::from(placeholder).style(theme.muted()))
+    } else {
+        Text::from(wrapped)
+    };
+    frame.render_widget(Paragraph::new(content).scroll((scroll, 0)), text_area);
 
     // Show the cursor only when the user can type (idle, no modal), clamped inside
     // the visible box.
     if app.status == Status::Idle && app.approval.is_none() {
-        let cursor_x = area.x + 1 + caret_col.min(inner_width.saturating_sub(1));
-        let cursor_y = area.y + 1 + (caret_row - scroll).min(inner_height - 1);
+        let cursor_x = text_area.x + caret_col.min(inner_width.saturating_sub(1));
+        let cursor_y = text_area.y + (caret_row - scroll).min(inner_height - 1);
         frame.set_cursor_position(Position::new(cursor_x, cursor_y));
     }
 }
@@ -151,37 +334,110 @@ fn caret_position(input: &str, inner_width: u16) -> (u16, u16) {
     (row, col)
 }
 
-fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
-    let (state, hint) = match app.status {
-        Status::Idle => ("就绪", "⏎ 发送 · exit/^C 退出"),
-        Status::Running => ("运行中", "^C 取消"),
-        Status::Compacting => ("正在压缩上下文", "^C 取消"),
+fn draw_footer(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let metadata = format!("{} · {}", app.model_name, mode_label(app.mode));
+    let metadata = truncate_display(&metadata, area.width.saturating_sub(1));
+    let mode_style = if app.mode == PermissionMode::BypassPermissions {
+        theme.warning()
+    } else {
+        theme.muted()
     };
-    let text = format!(
-        " {} · {} · {} · {} ",
-        app.model_name,
-        mode_label(app.mode),
-        state,
-        hint
-    );
-    frame.render_widget(Paragraph::new(text).dim(), area);
+
+    if !app.follow && area.width >= 24 {
+        let left_width = 14u16.min(area.width);
+        let [left, right] =
+            Layout::horizontal([Constraint::Length(left_width), Constraint::Min(0)]).areas(area);
+        frame.render_widget(
+            Paragraph::new(Line::from("↑ 较早内容").style(theme.warning())),
+            left,
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(metadata).style(mode_style)).alignment(Alignment::Right),
+            right,
+        );
+    } else {
+        frame.render_widget(
+            Paragraph::new(Line::from(metadata).style(mode_style)).alignment(Alignment::Right),
+            area,
+        );
+    }
 }
 
-/// Renders the approval as a full-width bar in the bottom pane, sharing the
-/// input box's left edge and width.
-fn draw_approval(frame: &mut Frame, approval: &ApprovalRequest, area: Rect) {
-    let lines = vec![
-        Line::from(format!("⚠ 需要授权: {}", approval.summary)).yellow(),
-        Line::from(format!("精确范围: {}", approval.persistence_label())).dim(),
-        Line::from("[y] 允许一次  [a] 总是  [n] 否  [d] 永久拒绝  [c] 取消"),
-    ];
-    let panel = Paragraph::new(Text::from(lines))
-        .block(
-            Block::bordered()
-                .title("权限")
-                .border_style(Style::new().yellow()),
-        )
-        .wrap(Wrap { trim: false });
+fn approval_lines(approval: &ApprovalRequest, width: u16, theme: Theme) -> Vec<Line<'static>> {
+    let detail_rows = if width >= 46 { 2 } else { 1 };
+    let summary = truncate_display(
+        &format!("操作  {}", approval.summary),
+        width.saturating_mul(detail_rows),
+    );
+    let scope = truncate_display(
+        &format!("范围  {}", approval.persistence_label()),
+        width.saturating_mul(detail_rows),
+    );
+    let mut lines = wrap_lines(
+        vec![
+            Line::from(summary).style(theme.warning()),
+            Line::from(scope).style(theme.muted()),
+        ],
+        width,
+    );
+
+    let mut actions = vec![("y", "允许一次")];
+    if approval.allow_session.is_some() {
+        actions.push(("a", "本次会话允许"));
+    }
+    actions.push(("n", "拒绝一次"));
+    if approval.deny_session.is_some() {
+        actions.push(("d", "本次会话拒绝"));
+    }
+    actions.push(("Esc", "取消任务"));
+    lines.extend(action_lines(&actions, width, theme));
+    lines
+}
+
+fn action_lines(actions: &[(&str, &str)], width: u16, theme: Theme) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let mut spans = Vec::new();
+    let mut used = 0u16;
+    for (key, label) in actions {
+        let key_text = format!("[{key}]");
+        let action_width = char_widths(&key_text)
+            .saturating_add(1)
+            .saturating_add(char_widths(label));
+        let separator = u16::from(used > 0).saturating_mul(2);
+        if used > 0 && used.saturating_add(separator).saturating_add(action_width) > width {
+            lines.push(Line::from(std::mem::take(&mut spans)));
+            used = 0;
+        }
+        if used > 0 {
+            spans.push(Span::raw("  "));
+            used = used.saturating_add(2);
+        }
+        spans.push(Span::styled(key_text, theme.accent_strong()));
+        spans.push(Span::raw(format!(" {label}")));
+        used = used.saturating_add(action_width);
+    }
+    if !spans.is_empty() {
+        lines.push(Line::from(spans));
+    }
+    lines
+}
+
+fn char_widths(text: &str) -> u16 {
+    text.chars()
+        .fold(0u16, |width, ch| width.saturating_add(char_width(ch)))
+}
+
+/// Renders a permission decision in place of the composer so it cannot be
+/// mistaken for ordinary model output.
+fn draw_approval(frame: &mut Frame, lines: Vec<Line<'static>>, area: Rect, theme: Theme) {
+    let panel = Paragraph::new(Text::from(lines)).block(
+        Block::bordered()
+            .title(Line::from(" 需要授权 ").style(theme.warning()))
+            .border_style(theme.warning()),
+    );
     frame.render_widget(panel, area);
 }
 
@@ -189,11 +445,25 @@ fn draw_approval(frame: &mut Frame, approval: &ApprovalRequest, area: Rect) {
 mod tests {
     use super::*;
     use crate::tui::app::{Item, ToolState};
+    use crate::tui::bridge::ApprovalRequest;
     use kuncode_agent::compaction::budget::TokenCountPrecision;
     use kuncode_agent::observer::EventKind;
     use kuncode_agent::permission::PermissionMode;
+    use kuncode_agent::todo::{TodoItem, TodoStatus};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use tokio::sync::oneshot;
+
+    fn approval(summary: impl Into<String>) -> ApprovalRequest {
+        let (respond, _rx) = oneshot::channel();
+        ApprovalRequest {
+            summary: summary.into(),
+            targets: vec!["Bash(cargo test --workspace)".to_string()],
+            allow_session: None,
+            deny_session: None,
+            respond,
+        }
+    }
 
     #[test]
     fn renders_key_elements_without_panicking() {
@@ -225,7 +495,6 @@ mod tests {
 
     #[test]
     fn plan_panel_renders_the_live_plan() {
-        use kuncode_agent::todo::{TodoItem, TodoStatus};
         let mut app = App::new("m", PermissionMode::Default);
         // A long log: the plan panel must still show even when the log scrolls.
         for i in 0..30 {
@@ -247,8 +516,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(60, 20)).expect("test terminal");
         terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
         let rendered = format!("{}", terminal.backend());
-
-        assert!(rendered.contains("任务计划"), "plan panel title shown");
+        assert!(rendered.contains("计划 1/2"), "plan progress is shown");
         // The in_progress row shows the present-tense active_form, not content.
         assert!(
             rendered.contains("Doing second step"),
@@ -262,7 +530,6 @@ mod tests {
 
     #[test]
     fn plan_panel_hides_once_every_task_is_completed() {
-        use kuncode_agent::todo::{TodoItem, TodoStatus};
         let mut app = App::new("m", PermissionMode::Default);
         app.plan = vec![
             TodoItem {
@@ -283,9 +550,110 @@ mod tests {
 
         // All tasks done → the panel collapses, so its title is gone.
         assert!(
-            !rendered.contains("任务计划"),
+            !rendered.contains("计划 2/2"),
             "an all-completed plan hides the panel"
         );
+    }
+
+    #[test]
+    fn plan_window_keeps_a_late_active_item_visible() {
+        let mut app = App::new("m", PermissionMode::Default);
+        app.plan = (0..10)
+            .map(|index| TodoItem {
+                content: format!("Task {}", index + 1),
+                active_form: format!("Executing task {}", index + 1),
+                status: if index < 8 {
+                    TodoStatus::Completed
+                } else if index == 8 {
+                    TodoStatus::InProgress
+                } else {
+                    TodoStatus::Pending
+                },
+            })
+            .collect();
+
+        let mut terminal = Terminal::new(TestBackend::new(48, 16)).expect("terminal");
+        terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
+        let rendered = format!("{}", terminal.backend());
+
+        assert!(rendered.contains("计划 8/10"));
+        assert!(rendered.contains("Executing task 9"));
+
+        let mut terminal = Terminal::new(TestBackend::new(32, 10)).expect("small terminal");
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("small draw");
+        assert!(
+            format!("{}", terminal.backend()).contains("Executing task 9"),
+            "the active item remains visible when the plan shrinks to one row"
+        );
+    }
+
+    #[test]
+    fn narrow_approval_keeps_real_actions_visible() {
+        let mut app = App::new("m", PermissionMode::Default);
+        app.set_approval(approval(
+            "run a deliberately long command summary that must not hide decisions",
+        ));
+
+        let mut terminal = Terminal::new(TestBackend::new(32, 10)).expect("terminal");
+        terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
+        let rendered = format!("{}", terminal.backend());
+
+        assert!(rendered.contains("[y]"));
+        assert!(rendered.contains("[n]"));
+        assert!(rendered.contains("[Esc]"));
+        assert!(!rendered.contains("[a]"));
+        assert!(!rendered.contains("[d]"));
+    }
+
+    #[test]
+    fn responsive_layout_renders_at_supported_small_sizes() {
+        for (width, height) in [(80, 24), (48, 14), (32, 10)] {
+            let mut app = App::new("a-model-name-that-is-long", PermissionMode::Default);
+            app.push_user("分析这个项目并运行测试".to_string());
+            app.plan = (0..8)
+                .map(|index| TodoItem {
+                    content: format!("Long plan task {index}"),
+                    active_form: format!("Working on long plan task {index}"),
+                    status: if index == 7 {
+                        TodoStatus::InProgress
+                    } else {
+                        TodoStatus::Completed
+                    },
+                })
+                .collect();
+            app.set_approval(approval("run cargo test --workspace"));
+
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+            terminal
+                .draw(|frame| draw(frame, &mut app))
+                .expect("responsive draw");
+            let rendered = format!("{}", terminal.backend());
+            assert!(rendered.contains("需要授权"));
+            assert!(rendered.contains("[y]"));
+            assert!(rendered.contains("[n]"));
+        }
+    }
+
+    #[test]
+    fn no_color_mode_emits_no_foreground_or_background_colors() {
+        let mut app = App::new("model", PermissionMode::Default);
+        app.set_colors_enabled(false);
+        app.push_user("hello".to_string());
+        app.push_assistant("world".to_string());
+        let (width, height) = (40u16, 12u16);
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
+
+        let buffer = terminal.backend().buffer();
+        for y in 0..height {
+            for x in 0..width {
+                let cell = buffer.cell((x, y)).expect("cell");
+                assert_eq!(cell.fg, Color::Reset, "foreground color at ({x}, {y})");
+                assert_eq!(cell.bg, Color::Reset, "background color at ({x}, {y})");
+            }
+        }
     }
 
     #[test]
@@ -332,11 +700,10 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(40, 10)).expect("terminal");
         terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
 
-        // Full-width box at x=0: caret column 3 renders at x = 0 + border(1) + 3.
-        // Were the caret still pinned to the input's end it would sit at x=6.
+        // The composer reserves border(1) + prompt(2), then uses the edit column.
         let pos = terminal.get_cursor_position().expect("cursor position");
         assert_eq!(
-            pos.x, 4,
+            pos.x, 6,
             "cursor sits at the edit column, not the input end"
         );
     }
@@ -358,7 +725,7 @@ mod tests {
 
         // Then
         let rendered = format!("{}", terminal.backend());
-        assert!(rendered.contains("正在压缩上下文"));
+        assert!(rendered.contains("整理上下文"));
         assert!(!rendered.contains("98765"));
 
         // When
@@ -379,7 +746,7 @@ mod tests {
 
         // Then
         let rendered = format!("{}", terminal.backend());
-        assert!(rendered.contains("上下文已压缩"));
+        assert!(rendered.contains("上下文已整理"));
         assert!(!rendered.contains("98765"));
         assert!(!rendered.contains("12345"));
     }

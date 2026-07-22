@@ -8,6 +8,13 @@ impl App {
         self.cursor += c.len_utf8();
     }
 
+    /// Inserts a bracketed paste atomically, normalizing platform newlines.
+    pub fn insert_paste(&mut self, text: &str) {
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        self.input.insert_str(self.cursor, &normalized);
+        self.cursor += normalized.len();
+    }
+
     pub fn insert_newline(&mut self) {
         self.insert_char('\n');
     }
@@ -160,6 +167,16 @@ mod tests {
         app.move_end();
         app.backspace();
         assert_eq!(app.input, "ell");
+    }
+
+    #[test]
+    fn paste_is_inserted_at_the_cursor_and_normalizes_newlines() {
+        let mut app = typed("ac");
+        app.move_left();
+        app.insert_paste("b\r\n你\r");
+
+        assert_eq!(app.input, "ab\n你\nc");
+        assert_eq!(&app.input[..app.cursor], "ab\n你\n");
     }
 
     #[test]

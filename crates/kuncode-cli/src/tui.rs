@@ -15,8 +15,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, MouseEvent, MouseEventKind,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use futures_util::StreamExt;
@@ -84,6 +84,9 @@ where
     if let Err(error) = execute!(io::stdout(), EnableMouseCapture) {
         log_tui_io("enable_mouse_capture", &error, false);
     }
+    if let Err(error) = execute!(io::stdout(), EnableBracketedPaste) {
+        log_tui_io("enable_bracketed_paste", &error, false);
+    }
     let result = event_loop(
         &mut terminal,
         &runner,
@@ -93,6 +96,9 @@ where
         &mut approval_rx,
     )
     .await;
+    if let Err(error) = execute!(io::stdout(), DisableBracketedPaste) {
+        log_tui_io("disable_bracketed_paste", &error, false);
+    }
     if let Err(error) = execute!(io::stdout(), DisableMouseCapture) {
         log_tui_io("disable_mouse_capture", &error, false);
     }
@@ -141,6 +147,7 @@ async fn event_loop<M: CompletionModel>(
                 }
             }
             Some(Ok(Event::Mouse(mouse))) => handle_scroll(app, mouse),
+            Some(Ok(Event::Paste(text))) => app.insert_paste(&text),
             Some(Ok(_)) => {} // resize / non-press keys
             Some(Err(error)) => return Err(log_tui_io("idle_input", &error, true)),
             None => break, // stdin closed
@@ -192,6 +199,7 @@ async fn run_one_turn<M: CompletionModel>(
                 // into the preview, and the typewriter + repaint happen here at a
                 // fixed cadence rather than once per streamed token.
                 _ = frame.tick() => {
+                    app.advance_animation();
                     app.advance_reveal(FRAME_INTERVAL, REVEAL_CPS);
                     io_stage(
                         "turn_stream_draw",
@@ -296,6 +304,10 @@ fn handle_idle_key(app: &mut App, key: KeyEvent) -> Option<String> {
         }
         (KeyModifiers::CONTROL, KeyCode::Char('e')) => {
             app.move_end();
+            None
+        }
+        (KeyModifiers::CONTROL, KeyCode::Char('j')) => {
+            app.insert_newline();
             None
         }
         (_, KeyCode::PageUp) => {
@@ -426,5 +438,22 @@ mod tests {
             Some("exit now")
         );
         assert!(!app.should_quit, "a prompt containing exit must not quit");
+    }
+
+    #[test]
+    fn control_j_inserts_a_reliable_newline() {
+        let mut app = App::new("m", PermissionMode::Default);
+        typing(&mut app, "first");
+
+        assert!(
+            handle_idle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+            )
+            .is_none()
+        );
+        typing(&mut app, "second");
+
+        assert_eq!(app.input, "first\nsecond");
     }
 }
