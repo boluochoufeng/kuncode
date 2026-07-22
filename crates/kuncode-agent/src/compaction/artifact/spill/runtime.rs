@@ -255,7 +255,9 @@ fn call_names(message: &Message) -> BTreeMap<String, String> {
     if let Message::Assistant { content, .. } = message {
         for call in content.iter().filter_map(|block| match block {
             AssistantContent::ToolCall(call) => Some(call),
-            AssistantContent::Text(_) | AssistantContent::Reasoning(_) => None,
+            AssistantContent::Text(_)
+            | AssistantContent::Reasoning(_)
+            | AssistantContent::Refusal(_) => None,
         }) {
             names.insert(call.id.clone(), call.function.name.clone());
         }

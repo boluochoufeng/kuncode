@@ -8,7 +8,7 @@ use crate::{
     },
     providers::{
         deepseek::{DeepSeekClient, DeepSeekCompletionModel},
-        openai_compatible::{OpenAiCompatibleClient, OpenAiCompatibleCompletionModel},
+        openai::{OpenAiClient, OpenAiCompletionModel},
     },
 };
 
@@ -18,7 +18,7 @@ pub enum AnyChatClient {
     /// Native DeepSeek protocol behavior.
     DeepSeek(DeepSeekClient),
     /// OpenAI-compatible Chat Completions behavior.
-    OpenAiCompatible(OpenAiCompatibleClient),
+    OpenAi(OpenAiClient),
 }
 
 /// Model handle that keeps the agent runtime independent of provider choice.
@@ -27,7 +27,7 @@ pub enum AnyChatCompletionModel {
     /// Native DeepSeek model.
     DeepSeek(DeepSeekCompletionModel),
     /// OpenAI-compatible model.
-    OpenAiCompatible(OpenAiCompatibleCompletionModel),
+    OpenAi(OpenAiCompletionModel),
 }
 
 impl CompletionModel for AnyChatCompletionModel {
@@ -40,8 +40,8 @@ impl CompletionModel for AnyChatCompletionModel {
             AnyChatClient::DeepSeek(client) => {
                 Self::DeepSeek(DeepSeekCompletionModel::make(client, model))
             }
-            AnyChatClient::OpenAiCompatible(client) => {
-                Self::OpenAiCompatible(OpenAiCompatibleCompletionModel::make(client, model))
+            AnyChatClient::OpenAi(client) => {
+                Self::OpenAi(OpenAiCompletionModel::make(client, model))
             }
         }
     }
@@ -61,7 +61,7 @@ impl CompletionModel for AnyChatCompletionModel {
                     message_id: response.message_id,
                 })
             }
-            Self::OpenAiCompatible(model) => model.completion(request).await,
+            Self::OpenAi(model) => model.completion(request).await,
         }
     }
 
@@ -71,7 +71,7 @@ impl CompletionModel for AnyChatCompletionModel {
     ) -> Result<CompletionStream, CompletionError> {
         match self {
             Self::DeepSeek(model) => model.stream(request).await,
-            Self::OpenAiCompatible(model) => model.stream(request).await,
+            Self::OpenAi(model) => model.stream(request).await,
         }
     }
 }

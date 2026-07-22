@@ -127,7 +127,9 @@ pub fn group_messages(messages: &[Message]) -> Result<Vec<ProtocolGroup>, Protoc
                     .iter()
                     .filter_map(|block| match block {
                         AssistantContent::ToolCall(call) => Some(call),
-                        AssistantContent::Text(_) | AssistantContent::Reasoning(_) => None,
+                        AssistantContent::Text(_)
+                        | AssistantContent::Reasoning(_)
+                        | AssistantContent::Refusal(_) => None,
                     })
                     .collect::<Vec<_>>();
                 if calls.is_empty() {

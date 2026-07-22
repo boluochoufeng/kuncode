@@ -144,6 +144,9 @@ where
                 StreamEvent::ReasoningDelta(text) => {
                     self.emit(session, Some(iteration), EventKind::ReasoningDelta { text });
                 }
+                StreamEvent::RefusalDelta(text) => {
+                    self.emit(session, Some(iteration), EventKind::TextDelta { text });
+                }
                 // The "calling X" hint is surfaced by `ToolStart` after the turn
                 // completes and the call is gated; ignore the earlier signal.
                 StreamEvent::ToolCallStart { .. } => {}
@@ -188,6 +191,7 @@ fn stream_event_kind(event: &StreamEvent) -> &'static str {
     match event {
         StreamEvent::TextDelta(_) => "text_delta",
         StreamEvent::ReasoningDelta(_) => "reasoning_delta",
+        StreamEvent::RefusalDelta(_) => "refusal_delta",
         StreamEvent::ToolCallStart { .. } => "tool_call_start",
         StreamEvent::Completed { .. } => "completed",
     }
