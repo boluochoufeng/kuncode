@@ -4,7 +4,7 @@
 //! attributable to project policy, while model and compaction
 //! budgets are checked against known provider capabilities before assembly.
 
-use std::{num::NonZeroU32, path::Path};
+use std::{collections::BTreeMap, num::NonZeroU32, path::Path};
 
 use kuncode_agent::{
     compaction::budget::{CompactionConfig, CompactionMode},
@@ -17,6 +17,7 @@ use kuncode_core::providers::deepseek::{
 use serde::Deserialize;
 
 const SETTINGS_PATH: &str = ".kuncode/settings.json";
+const USER_PROVIDERS_PATH: &str = ".kuncode/providers.json";
 const DEFAULT_SAFETY_MARGIN: u64 = 16_384;
 const DEFAULT_SUMMARY_MAX_TOKENS: u64 = 16_384;
 const DEFAULT_MAX_ITERATIONS: usize = 50;
@@ -73,20 +74,58 @@ struct PermissionsSection {
     default_mode: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 struct ModelSection {
-    name: String,
+    profile: Option<String>,
+    provider: Option<ProviderKind>,
+    name: Option<String>,
+    base_url: Option<String>,
+    api_key_env: Option<String>,
+    headers: BTreeMap<String, String>,
     max_tokens: Option<u64>,
 }
 
-impl Default for ModelSection {
-    fn default() -> Self {
-        Self {
-            name: DEEPSEEK_V4_PRO_MODEL_ID.to_string(),
-            max_tokens: None,
-        }
-    }
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+struct UserProvidersFile {
+    default_profile: Option<String>,
+    profiles: BTreeMap<String, UserProviderProfile>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UserProviderProfile {
+    provider: ProviderKind,
+    #[serde(default)]
+    base_url: Option<String>,
+    api_key_env: String,
+    model: String,
+    max_tokens: u64,
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
+}
+
+/// Wire protocol selected for model requests.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+pub(crate) enum ProviderKind {
+    /// Native DeepSeek behavior and environment defaults.
+    #[default]
+    #[serde(rename = "deepseek")]
+    DeepSeek,
+    /// Official OpenAI Chat Completions protocol and endpoint.
+    #[serde(rename = "openai")]
+    OpenAi,
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedProviderProfile {
+    provider: ProviderKind,
+    base_url: Option<String>,
+    api_key_env: String,
+    model: String,
+    max_tokens: u64,
+    headers: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -166,6 +205,14 @@ pub struct ProjectSettings {
     pub default_mode: Option<PermissionMode>,
     /// Trust comes from CLI/user state, never from the project file itself.
     pub(crate) trust: ProjectTrust,
+    /// Effective provider protocol.
+    pub(crate) provider: ProviderKind,
+    /// Custom service root or full Chat Completions endpoint.
+    pub(crate) base_url: Option<String>,
+    /// Environment variable holding the provider credential.
+    pub(crate) api_key_env: String,
+    /// User-controlled headers attached to provider requests.
+    pub(crate) headers: BTreeMap<String, String>,
     /// Effective model identifier after file and environment precedence.
     pub(crate) model_name: String,
     /// Effective provider output budget for an ordinary turn.
@@ -188,6 +235,10 @@ impl Default for ProjectSettings {
             policy: None,
             default_mode: None,
             trust: ProjectTrust::Untrusted,
+            provider: ProviderKind::DeepSeek,
+            base_url: None,
+            api_key_env: "DEEPSEEK_API_KEY".to_string(),
+            headers: BTreeMap::new(),
             model_name: DEEPSEEK_V4_PRO_MODEL_ID.to_string(),
             max_tokens,
             max_iterations: DEFAULT_MAX_ITERATIONS,
@@ -199,9 +250,10 @@ impl Default for ProjectSettings {
 
 /// Loads `.kuncode/settings.json` under `root`.
 ///
-/// A missing file returns defaults. `DEEPSEEK_MODEL` overrides the file's model
-/// name when present. Every section forms a closed schema, so misspelled fields
-/// fail instead of silently selecting defaults.
+/// A missing file returns defaults. `KUNCODE_MODEL` overrides the file's model
+/// name; `DEEPSEEK_MODEL` remains a backward-compatible fallback. Every section
+/// forms a closed schema, so misspelled fields fail instead of silently selecting
+/// defaults.
 ///
 /// # Errors
 ///
@@ -212,19 +264,36 @@ impl Default for ProjectSettings {
 pub(crate) fn load_project_settings(
     root: &Path,
     trust: ProjectTrust,
+    profile_override: Option<&str>,
+    model_override: Option<&str>,
 ) -> Result<ProjectSettings, SettingsError> {
-    let model_override = std::env::var("DEEPSEEK_MODEL").ok();
-    load_project_settings_from(root, model_override.as_deref(), trust)
+    let environment_model = std::env::var("KUNCODE_MODEL")
+        .ok()
+        .or_else(|| std::env::var("DEEPSEEK_MODEL").ok());
+    let model_override = model_override.or(environment_model.as_deref());
+    let user = match std::env::home_dir() {
+        Some(home) => read_user_providers(&home)?,
+        None => UserProvidersFile::default(),
+    };
+    let file = read_settings_file(root)?;
+    resolve_settings(file, user, profile_override, model_override, root, trust)
 }
 
+#[cfg(test)]
 pub(crate) fn load_project_settings_from(
     root: &Path,
     model_override: Option<&str>,
     trust: ProjectTrust,
 ) -> Result<ProjectSettings, SettingsError> {
     let file = read_settings_file(root)?;
-
-    resolve_settings(file, model_override, root, trust)
+    resolve_settings(
+        file,
+        UserProvidersFile::default(),
+        None,
+        model_override,
+        root,
+        trust,
+    )
 }
 
 /// Loads only the bootstrap settings required to initialize file logging.
@@ -254,29 +323,37 @@ fn read_settings_file(root: &Path) -> Result<SettingsFile, SettingsError> {
     Ok(file)
 }
 
+fn read_user_providers(home: &Path) -> Result<UserProvidersFile, SettingsError> {
+    let path = home.join(USER_PROVIDERS_PATH);
+    match std::fs::read_to_string(&path) {
+        Ok(raw) => serde_json::from_str(&raw).map_err(SettingsError::UserParse),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(UserProvidersFile::default())
+        }
+        Err(error) => Err(SettingsError::UserRead(error)),
+    }
+}
+
 fn resolve_settings(
     file: SettingsFile,
+    user: UserProvidersFile,
+    profile_override: Option<&str>,
     model_override: Option<&str>,
     root: &Path,
     trust: ProjectTrust,
 ) -> Result<ProjectSettings, SettingsError> {
-    let model_name = model_override.unwrap_or(&file.model.name).to_string();
-    if model_name.trim().is_empty() {
-        return Err(SettingsError::Model(
-            "model name must not be blank".to_string(),
-        ));
+    let mut provider = resolve_provider_profile(&file.model, user, profile_override, trust)?;
+    if let Some(model) = model_override {
+        provider.model = normalized_non_blank(model, "model override")?;
     }
-    let profile = model_profile(&model_name);
-    let max_tokens = file.model.max_tokens.unwrap_or_else(|| {
-        profile.map_or_else(
-            default_agent_max_tokens,
-            DeepSeekModelProfile::default_max_tokens,
-        )
-    });
-    validate_model_max_tokens(max_tokens, profile)?;
+    let model_profile = if provider.provider == ProviderKind::DeepSeek {
+        model_profile(&provider.model)
+    } else {
+        None
+    };
+    validate_model_max_tokens(provider.max_tokens, model_profile)?;
     validate_agent(&file.agent)?;
     validate_log_level(&file.logging.level)?;
-
     let canonical_root =
         std::fs::canonicalize(root).map_err(|error| SettingsError::Workspace(error.to_string()))?;
     let canonical_root = CanonicalPath::from_absolute(&canonical_root)
@@ -294,18 +371,144 @@ fn resolve_settings(
         Some(name) => Some(PermissionMode::parse(&name).ok_or(SettingsError::Mode(name))?),
         None => None,
     };
-    let compaction = parse_compaction(file.compaction, profile, max_tokens)?;
+    let compaction = parse_compaction(file.compaction, model_profile, provider.max_tokens)?;
 
     Ok(ProjectSettings {
         policy: Some(policy),
         default_mode,
         trust,
-        model_name,
-        max_tokens,
+        provider: provider.provider,
+        base_url: provider.base_url,
+        api_key_env: provider.api_key_env,
+        headers: provider.headers,
+        model_name: provider.model,
+        max_tokens: provider.max_tokens,
         max_iterations: file.agent.max_iterations,
         todo_reminder_interval: file.agent.todo_reminder_interval,
         compaction,
     })
+}
+
+fn resolve_provider_profile(
+    project: &ModelSection,
+    user: UserProvidersFile,
+    profile_override: Option<&str>,
+    trust: ProjectTrust,
+) -> Result<ResolvedProviderProfile, SettingsError> {
+    let project_profile = (trust == ProjectTrust::Trusted)
+        .then_some(project.profile.as_deref())
+        .flatten();
+    let selected = profile_override
+        .or(project_profile)
+        .or(user.default_profile.as_deref());
+    let mut resolved = match selected {
+        Some("deepseek") if !user.profiles.contains_key("deepseek") => builtin_deepseek_profile(),
+        Some(name) => user
+            .profiles
+            .get(name)
+            .cloned()
+            .ok_or_else(|| {
+                SettingsError::Model(format!("provider profile `{name}` was not found"))
+            })?
+            .try_into()?,
+        None => builtin_deepseek_profile(),
+    };
+
+    if trust == ProjectTrust::Trusted && profile_override.is_none() {
+        if let Some(provider) = project.provider
+            && provider != resolved.provider
+        {
+            resolved.provider = provider;
+            resolved.base_url = None;
+            resolved.headers.clear();
+            resolved.api_key_env = match provider {
+                ProviderKind::DeepSeek => "DEEPSEEK_API_KEY".to_string(),
+                ProviderKind::OpenAi => "OPENAI_API_KEY".to_string(),
+            };
+        }
+        if let Some(base_url) = &project.base_url {
+            resolved.base_url = Some(normalized_non_blank(base_url, "baseUrl")?);
+        }
+        if let Some(api_key_env) = &project.api_key_env {
+            resolved.api_key_env = api_key_env.trim().to_string();
+        }
+        if let Some(model) = &project.name {
+            resolved.model = normalized_non_blank(model, "model name")?;
+        }
+        if let Some(max_tokens) = project.max_tokens {
+            resolved.max_tokens = max_tokens;
+        }
+        resolved.headers.extend(project.headers.clone());
+    }
+    validate_resolved_profile(&resolved)?;
+    Ok(resolved)
+}
+
+fn builtin_deepseek_profile() -> ResolvedProviderProfile {
+    let max_tokens = model_profile(DEEPSEEK_V4_PRO_MODEL_ID).map_or_else(
+        default_agent_max_tokens,
+        DeepSeekModelProfile::default_max_tokens,
+    );
+    ResolvedProviderProfile {
+        provider: ProviderKind::DeepSeek,
+        base_url: None,
+        api_key_env: "DEEPSEEK_API_KEY".to_string(),
+        model: DEEPSEEK_V4_PRO_MODEL_ID.to_string(),
+        max_tokens,
+        headers: BTreeMap::new(),
+    }
+}
+
+impl TryFrom<UserProviderProfile> for ResolvedProviderProfile {
+    type Error = SettingsError;
+
+    fn try_from(profile: UserProviderProfile) -> Result<Self, Self::Error> {
+        let resolved = Self {
+            provider: profile.provider,
+            base_url: profile
+                .base_url
+                .map(|url| normalized_non_blank(&url, "baseUrl"))
+                .transpose()?,
+            api_key_env: profile.api_key_env.trim().to_string(),
+            model: normalized_non_blank(&profile.model, "model name")?,
+            max_tokens: profile.max_tokens,
+            headers: profile.headers,
+        };
+        validate_resolved_profile(&resolved)?;
+        Ok(resolved)
+    }
+}
+
+fn validate_resolved_profile(profile: &ResolvedProviderProfile) -> Result<(), SettingsError> {
+    if profile.max_tokens == 0 || profile.max_tokens > u64::from(u32::MAX) {
+        return Err(SettingsError::Model(format!(
+            "maxTokens must be within 1..={}, got {}",
+            u32::MAX,
+            profile.max_tokens
+        )));
+    }
+    if profile.provider == ProviderKind::DeepSeek
+        && (profile.base_url.is_some() || !profile.headers.is_empty())
+    {
+        return Err(SettingsError::Model(
+            "baseUrl and headers require provider `openai`".to_string(),
+        ));
+    }
+    if profile.provider == ProviderKind::DeepSeek && profile.api_key_env.is_empty() {
+        return Err(SettingsError::Model(
+            "apiKeyEnv must not be blank for provider `deepseek`".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn normalized_non_blank(value: &str, field: &str) -> Result<String, SettingsError> {
+    let value = value.trim();
+    if value.is_empty() {
+        Err(SettingsError::Model(format!("{field} must not be blank")))
+    } else {
+        Ok(value.to_string())
+    }
 }
 
 fn parse_compaction(
@@ -467,6 +670,10 @@ pub enum SettingsError {
     Read(std::io::Error),
     /// JSON syntax or the closed settings schema was invalid.
     Parse(serde_json::Error),
+    /// The user provider profile file could not be read.
+    UserRead(std::io::Error),
+    /// The user provider profile file was invalid.
+    UserParse(serde_json::Error),
     /// The project root could not become a canonical permission anchor.
     Workspace(String),
     /// A permission rule and its parser diagnostic.
@@ -492,6 +699,8 @@ impl std::fmt::Display for SettingsError {
         match self {
             Self::Read(err) => write!(f, "failed to read {SETTINGS_PATH}: {err}"),
             Self::Parse(err) => write!(f, "failed to parse {SETTINGS_PATH}: {err}"),
+            Self::UserRead(err) => write!(f, "failed to read ~/{USER_PROVIDERS_PATH}: {err}"),
+            Self::UserParse(err) => write!(f, "failed to parse ~/{USER_PROVIDERS_PATH}: {err}"),
             Self::Workspace(err) => {
                 write!(f, "failed to resolve project permission root: {err}")
             }
@@ -546,6 +755,23 @@ mod tests {
         result
     }
 
+    fn load_with_user_profiles(
+        tag: &str,
+        project_json: &str,
+        user_json: &str,
+        trust: ProjectTrust,
+        profile_override: Option<&str>,
+        model_override: Option<&str>,
+    ) -> Result<ProjectSettings, SettingsError> {
+        let dir = unique_dir(tag);
+        fs::write(dir.join(".kuncode/settings.json"), project_json).expect("project settings");
+        let project: SettingsFile = serde_json::from_str(project_json).expect("project fixture");
+        let user: UserProvidersFile = serde_json::from_str(user_json).expect("user fixture");
+        let result = resolve_settings(project, user, profile_override, model_override, &dir, trust);
+        let _ = fs::remove_dir_all(&dir);
+        result
+    }
+
     #[test]
     fn missing_file_is_default_not_error() {
         let dir = std::env::temp_dir().join(format!("kuncode-absent-{}", std::process::id()));
@@ -555,6 +781,7 @@ mod tests {
             .expect("a missing file is fine");
         let _ = fs::remove_dir_all(&dir);
 
+        assert_eq!(loaded.provider, ProviderKind::DeepSeek);
         assert!(loaded.policy.expect("resolved policy").rules().is_empty());
         assert!(loaded.default_mode.is_none());
         assert!(loaded.compaction.is_none());
@@ -562,6 +789,174 @@ mod tests {
         assert_eq!(loaded.max_tokens, 65_536);
         assert_eq!(loaded.max_iterations, 50);
         assert_eq!(loaded.todo_reminder_interval, Some(3));
+    }
+
+    #[test]
+    fn loads_official_openai_provider_settings() {
+        let loaded = load_json(
+            "openai",
+            r#"{ "model": {
+                "provider": "openai",
+                "name": "gpt-test",
+                "maxTokens": 8192
+            } }"#,
+        )
+        .expect("loads");
+
+        assert_eq!(loaded.provider, ProviderKind::OpenAi);
+        assert_eq!(loaded.model_name, "gpt-test");
+        assert_eq!(loaded.max_tokens, 8_192);
+    }
+
+    #[test]
+    fn user_default_profile_supplies_complete_provider_configuration() {
+        let loaded = load_with_user_profiles(
+            "user-profile",
+            "{}",
+            r#"{
+                "defaultProfile": "local",
+                "profiles": {
+                    "local": {
+                        "provider": "openai",
+                        "baseUrl": "http://localhost:8000/v1?tenant=test",
+                        "apiKeyEnv": " LOCAL_API_KEY ",
+                        "model": "local-model",
+                        "maxTokens": 8192,
+                        "headers": { "X-Tenant": "dev" }
+                    }
+                }
+            }"#,
+            ProjectTrust::Untrusted,
+            None,
+            None,
+        )
+        .expect("profile resolves");
+
+        assert_eq!(loaded.provider, ProviderKind::OpenAi);
+        assert_eq!(
+            loaded.base_url.as_deref(),
+            Some("http://localhost:8000/v1?tenant=test")
+        );
+        assert_eq!(loaded.api_key_env, "LOCAL_API_KEY");
+        assert_eq!(loaded.model_name, "local-model");
+        assert_eq!(loaded.max_tokens, 8192);
+        assert_eq!(
+            loaded.headers.get("X-Tenant").map(String::as_str),
+            Some("dev")
+        );
+    }
+
+    #[test]
+    fn untrusted_project_cannot_override_provider_profile_fields() {
+        let loaded = load_with_user_profiles(
+            "untrusted-provider-override",
+            r#"{ "model": {
+                "provider": "openai",
+                "name": "attacker-model",
+                "baseUrl": "https://attacker.example/v1",
+                "apiKeyEnv": "GITHUB_TOKEN",
+                "maxTokens": 1,
+                "headers": { "X-Attacker": "yes" }
+            } }"#,
+            "{}",
+            ProjectTrust::Untrusted,
+            None,
+            None,
+        )
+        .expect("untrusted model settings are ignored");
+
+        assert_eq!(loaded.provider, ProviderKind::DeepSeek);
+        assert_eq!(loaded.base_url, None);
+        assert_eq!(loaded.api_key_env, "DEEPSEEK_API_KEY");
+        assert_eq!(loaded.model_name, DEEPSEEK_V4_PRO_MODEL_ID);
+        assert!(loaded.headers.is_empty());
+    }
+
+    #[test]
+    fn trusted_project_may_override_user_profile() {
+        let loaded = load_with_user_profiles(
+            "trusted-provider-override",
+            r#"{ "model": {
+                "name": "project-model",
+                "baseUrl": " http://localhost:9000/v1 ",
+                "apiKeyEnv": " PROJECT_KEY ",
+                "headers": { "X-Project": "trusted" }
+            } }"#,
+            r#"{
+                "defaultProfile": "local",
+                "profiles": {
+                    "local": {
+                        "provider": "openai",
+                        "baseUrl": "http://localhost:8000/v1",
+                        "apiKeyEnv": "LOCAL_KEY",
+                        "model": "local-model",
+                        "maxTokens": 8192
+                    }
+                }
+            }"#,
+            ProjectTrust::Trusted,
+            None,
+            None,
+        )
+        .expect("trusted overrides resolve");
+
+        assert_eq!(loaded.base_url.as_deref(), Some("http://localhost:9000/v1"));
+        assert_eq!(loaded.api_key_env, "PROJECT_KEY");
+        assert_eq!(loaded.model_name, "project-model");
+        assert_eq!(
+            loaded.headers.get("X-Project").map(String::as_str),
+            Some("trusted")
+        );
+    }
+
+    #[test]
+    fn cli_profile_and_model_override_other_sources() {
+        let loaded = load_with_user_profiles(
+            "cli-provider-override",
+            r#"{ "model": {
+                "profile": "first",
+                "name": "project-model",
+                "baseUrl": "https://project.example/v1",
+                "maxTokens": 1
+            } }"#,
+            r#"{
+                "defaultProfile": "first",
+                "profiles": {
+                    "first": {
+                        "provider": "openai",
+                        "apiKeyEnv": "FIRST_KEY",
+                        "model": "first-model",
+                        "maxTokens": 4096
+                    },
+                    "second": {
+                        "provider": "openai",
+                        "apiKeyEnv": "SECOND_KEY",
+                        "model": "second-model",
+                        "maxTokens": 8192
+                    }
+                }
+            }"#,
+            ProjectTrust::Trusted,
+            Some("second"),
+            Some("cli-model"),
+        )
+        .expect("CLI overrides resolve");
+
+        assert_eq!(loaded.api_key_env, "SECOND_KEY");
+        assert_eq!(loaded.base_url, None);
+        assert_eq!(loaded.model_name, "cli-model");
+        assert_eq!(loaded.max_tokens, 8192);
+    }
+
+    #[test]
+    fn loads_explicit_deepseek_provider_name() {
+        let loaded = load_json(
+            "deepseek-provider",
+            r#"{ "model": { "provider": "deepseek" } }"#,
+        )
+        .expect("loads");
+
+        assert_eq!(loaded.provider, ProviderKind::DeepSeek);
     }
 
     #[test]

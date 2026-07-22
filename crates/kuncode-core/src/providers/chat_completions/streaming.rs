@@ -1,4 +1,4 @@
-//! DeepSeek Server-Sent Events (SSE) streaming: wire chunk DTOs, an incremental
+//! Chat Completions Server-Sent Events (SSE) streaming: wire chunk DTOs, an incremental
 //! SSE frame decoder, and an assembler that folds chunks into [`StreamEvent`]s.
 //!
 //! Split into pure pieces — [`SseDecoder`] (bytes → `data:` payloads) and
@@ -7,22 +7,21 @@
 //! that drives a live [`reqwest::Response`] body through them.
 
 use async_stream::try_stream;
-use serde::Deserialize;
+use serde::{Deserialize, de::DeserializeOwned};
 
-use super::Usage;
 use crate::completion::{
-    AssistantContent, CompletionError, CompletionStream, FinishReason, StreamEvent,
+    AssistantContent, CompletionError, CompletionStream, FinishReason, StreamEvent, Usage,
 };
 use crate::non_empty_vec::NonEmptyVec;
 
 /// One `chat.completion.chunk` frame. The terminal usage-only frame carries an
 /// empty `choices`, so it defaults rather than failing to deserialize.
 #[derive(Debug, Deserialize)]
-struct StreamChunk {
+struct StreamChunk<U> {
     #[serde(default)]
     choices: Vec<ChunkChoice>,
     /// Present only on the final frame when `stream_options.include_usage` is set.
-    usage: Option<Usage>,
+    usage: Option<U>,
     /// Set when the endpoint reports a failure *mid-stream* as a data frame
     /// instead of via HTTP status; see [`StreamErrorBody`].
     error: Option<StreamErrorBody>,
@@ -54,6 +53,7 @@ struct ChunkChoice {
 struct ChunkDelta {
     content: Option<String>,
     reasoning_content: Option<String>,
+    refusal: Option<String>,
     tool_calls: Option<Vec<ToolCallDelta>>,
 }
 
@@ -139,6 +139,7 @@ struct PartialToolCall {
 struct StreamAssembler {
     text: String,
     reasoning: String,
+    refusal: String,
     tool_calls: Vec<PartialToolCall>,
     finish_reason: Option<String>,
     usage: Option<Usage>,
@@ -148,9 +149,12 @@ impl StreamAssembler {
     /// Folds one chunk in, returning the render deltas it produced (text /
     /// reasoning / tool-call-start). The terminal [`StreamEvent::Completed`] is
     /// produced separately by [`finish`](Self::finish).
-    fn ingest(&mut self, chunk: StreamChunk) -> Vec<StreamEvent> {
-        if chunk.usage.is_some() {
-            self.usage = chunk.usage;
+    fn ingest<U>(&mut self, chunk: StreamChunk<U>) -> Vec<StreamEvent>
+    where
+        U: Into<Usage>,
+    {
+        if let Some(usage) = chunk.usage {
+            self.usage = Some(usage.into());
         }
         let mut events = Vec::new();
         for choice in chunk.choices {
@@ -161,6 +165,10 @@ impl StreamAssembler {
             if let Some(reasoning) = choice.delta.reasoning_content.filter(|s| !s.is_empty()) {
                 self.reasoning.push_str(&reasoning);
                 events.push(StreamEvent::ReasoningDelta(reasoning));
+            }
+            if let Some(refusal) = choice.delta.refusal.filter(|s| !s.is_empty()) {
+                self.refusal.push_str(&refusal);
+                events.push(StreamEvent::RefusalDelta(refusal));
             }
             for delta in choice.delta.tool_calls.into_iter().flatten() {
                 self.ingest_tool_call(delta, &mut events);
@@ -244,6 +252,9 @@ impl StreamAssembler {
         if !self.reasoning.is_empty() {
             content.push(AssistantContent::reasoning(self.reasoning));
         }
+        if !self.refusal.is_empty() {
+            content.push(AssistantContent::refusal(self.refusal));
+        }
 
         let content = NonEmptyVec::try_from(content).map_err(|err| {
             CompletionError::ResponseError(format!("stream produced no assistant content: {err}"))
@@ -251,7 +262,7 @@ impl StreamAssembler {
 
         Ok(StreamEvent::Completed {
             content,
-            usage: self.usage.unwrap_or_default().into(),
+            usage: self.usage.unwrap_or_default(),
             finish_reason: map_finish_reason(self.finish_reason.as_deref()),
         })
     }
@@ -266,7 +277,7 @@ fn stream_error(error: StreamErrorBody) -> CompletionError {
     CompletionError::ResponseError(format!("provider reported a mid-stream error: {detail}"))
 }
 
-/// Maps DeepSeek's stop-reason string onto the neutral [`FinishReason`]. A
+/// Maps a Chat Completions stop-reason string onto the neutral [`FinishReason`]. A
 /// missing reason (stream ended without one) reads as a natural stop.
 fn map_finish_reason(reason: Option<&str>) -> FinishReason {
     match reason {
@@ -286,7 +297,10 @@ fn map_finish_reason(reason: Option<&str>) -> FinishReason {
 /// [`StreamAssembler`], yielding render deltas as they arrive and a final
 /// [`StreamEvent::Completed`] once the body ends or `[DONE]` is seen. Dropping
 /// the returned stream closes the HTTP response and halts generation.
-pub(crate) fn stream_events(mut response: reqwest::Response) -> CompletionStream {
+pub(crate) fn stream_events<U>(mut response: reqwest::Response) -> CompletionStream
+where
+    U: DeserializeOwned + Into<Usage> + Send + 'static,
+{
     Box::pin(try_stream! {
         let mut decoder = SseDecoder::new();
         let mut assembler = StreamAssembler::default();
@@ -295,7 +309,7 @@ pub(crate) fn stream_events(mut response: reqwest::Response) -> CompletionStream
                 match event {
                     SseEvent::Done => break 'body,
                     SseEvent::Data(payload) => {
-                        let mut chunk: StreamChunk = serde_json::from_str(&payload)?;
+                        let mut chunk: StreamChunk<U> = serde_json::from_str(&payload)?;
                         // A mid-stream error frame ends the stream with an error;
                         // otherwise the partial answer would be assembled and
                         // reported as a clean completion.
@@ -316,6 +330,7 @@ pub(crate) fn stream_events(mut response: reqwest::Response) -> CompletionStream
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::deepseek::protocol::Usage as TestUsage;
 
     /// Runs `sse` through a fresh decoder + assembler, splitting the input into
     /// `chunk_size`-byte network chunks to exercise cross-chunk buffering.
@@ -329,7 +344,7 @@ mod tests {
                 match ev {
                     SseEvent::Done => done = true,
                     SseEvent::Data(payload) => {
-                        let chunk: StreamChunk =
+                        let chunk: StreamChunk<TestUsage> =
                             serde_json::from_str(&payload).expect("chunk json");
                         events.extend(assembler.ingest(chunk));
                     }
@@ -431,6 +446,33 @@ data: [DONE]
     }
 
     #[test]
+    fn refusal_streams_and_is_preserved_in_completed_content() {
+        let sse = "\
+data: {\"choices\":[{\"delta\":{\"refusal\":\"Cannot \"}}]}
+
+data: {\"choices\":[{\"delta\":{\"refusal\":\"comply\"},\"finish_reason\":\"stop\"}]}
+
+data: [DONE]
+
+";
+        let events = run(sse, 4096);
+        let refusal: String = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::RefusalDelta(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(refusal, "Cannot comply");
+
+        let (content, _) = completed(events);
+        assert!(matches!(
+            content.first(),
+            AssistantContent::Refusal(value) if value.text_ref() == "Cannot comply"
+        ));
+    }
+
+    #[test]
     fn tool_call_arguments_assemble_across_fragments() {
         let sse = "\
 data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"\"}}]}}]}
@@ -480,7 +522,7 @@ data: [DONE]
             Some(SseEvent::Data(p)) => p,
             other => panic!("expected a data line, got {other:?}"),
         };
-        assert!(serde_json::from_str::<StreamChunk>(payload).is_err());
+        assert!(serde_json::from_str::<StreamChunk<TestUsage>>(payload).is_err());
     }
 
     #[test]
@@ -510,7 +552,7 @@ data: {\"error\":{\"message\":\"rate limited\",\"type\":\"server_error\"}}
         'outer: for piece in sse.as_bytes().chunks(4096) {
             for ev in decoder.push(piece) {
                 if let SseEvent::Data(payload) = ev {
-                    let mut chunk: StreamChunk =
+                    let mut chunk: StreamChunk<TestUsage> =
                         serde_json::from_str(&payload).expect("chunk json");
                     if let Some(err) = chunk.error.take() {
                         error = Some(stream_error(err));
@@ -534,10 +576,10 @@ data: {\"error\":{\"message\":\"rate limited\",\"type\":\"server_error\"}}
         // The standard trio is required: a usage object missing one is malformed
         // and must fail the parse, not silently read as zero.
         let bad = r#"{"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":2}}"#;
-        assert!(serde_json::from_str::<StreamChunk>(bad).is_err());
+        assert!(serde_json::from_str::<StreamChunk<TestUsage>>(bad).is_err());
         // The DeepSeek cache extensions, by contrast, may be omitted.
         let ok =
             r#"{"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}"#;
-        assert!(serde_json::from_str::<StreamChunk>(ok).is_ok());
+        assert!(serde_json::from_str::<StreamChunk<TestUsage>>(ok).is_ok());
     }
 }

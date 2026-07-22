@@ -55,6 +55,8 @@ pub enum StreamEvent {
     /// A chunk of reasoning/thinking text, kept separate from the answer
     /// (e.g. DeepSeek's `reasoning_content`). Render in a distinct channel.
     ReasoningDelta(String),
+    /// A chunk of a safety refusal, kept distinct from ordinary answer text.
+    RefusalDelta(String),
     /// A tool call has started: its `id` and `name` are known before the
     /// arguments finish streaming. Useful for an immediate "calling X" hint;
     /// the complete call (with assembled arguments) arrives in

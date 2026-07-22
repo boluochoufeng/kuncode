@@ -205,7 +205,11 @@ impl CompletionModel for DeepSeekCompletionModel {
             });
         }
 
-        Ok(protocol::streaming::stream_events(response))
+        Ok(
+            crate::providers::chat_completions::streaming::stream_events::<protocol::Usage>(
+                response,
+            ),
+        )
     }
 }
 
