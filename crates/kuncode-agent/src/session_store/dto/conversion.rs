@@ -129,6 +129,9 @@ impl StoredAssistantContent {
             AssistantContent::Text(text) => Self::Text {
                 text: text.text_ref().to_string(),
             },
+            AssistantContent::Refusal(refusal) => Self::Refusal {
+                text: refusal.text_ref().to_string(),
+            },
             AssistantContent::ToolCall(call) => Self::ToolCall {
                 id: call.id.clone(),
                 call_id: call.call_id.clone(),
@@ -151,6 +154,7 @@ impl StoredAssistantContent {
     fn into_content(self) -> Result<AssistantContent, SessionStoreError> {
         match self {
             Self::Text { text } => Ok(AssistantContent::Text(Text::from(text))),
+            Self::Refusal { text } => Ok(AssistantContent::refusal(text)),
             Self::ToolCall {
                 id,
                 call_id,

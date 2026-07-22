@@ -4,8 +4,8 @@
 [`learn-claude-code`](https://github.com/shareAI-lab/learn-claude-code) 的 Harness
 Engineering 思路：模型负责判断下一步做什么，Harness 负责提供工具、上下文、权限边界、持久化和用户界面。
 
-当前版本为 `0.1.0`，默认使用 DeepSeek，也支持 OpenAI Chat Completions
-兼容协议，提供一次性命令行执行和交互式 TUI 两种使用方式。
+当前版本为 `0.1.0`，默认使用 DeepSeek，也支持 OpenAI Chat Completions，
+提供一次性命令行执行和交互式 TUI 两种使用方式。
 
 ## 工作区结构
 
@@ -17,14 +17,14 @@ kuncode-cli ──▶ kuncode-agent ──▶ kuncode-core ──▶ LLM API
     └─ 参数、配置、审批、一次性输出与 TUI
 ```
 
-- `kuncode-core`：Provider-neutral 的消息与 Completion 抽象，以及 DeepSeek、OpenAI-compatible Provider。
+- `kuncode-core`：Provider-neutral 的消息与 Completion 抽象，以及 DeepSeek、OpenAI Provider。
 - `kuncode-agent`：Agent 运行时、工具调度、权限、Hook、Todo、会话持久化和上下文压缩。
 - `kuncode-cli`：命令行参数、项目配置、终端审批、普通输出和交互式 TUI。
 
 ## 环境要求
 
 - Rust stable，项目使用 Rust 2024 edition。
-- 所选模型服务的 API Key；本地无鉴权服务可不配置。
+- DeepSeek 或 OpenAI API Key。
 - 支持 ANSI 终端；交互模式需要 stdin 和 stdout 都连接到真实终端。
 
 ## 快速开始
@@ -46,9 +46,8 @@ DEEPSEEK_API_KEY=your-api-key
 ```json
 {
   "model": {
-    "provider": "openai-compatible",
+    "provider": "openai",
     "name": "your-openai-model",
-    "apiKeyEnv": "OPENAI_API_KEY",
     "maxTokens": 16384
   }
 }
@@ -59,23 +58,6 @@ DEEPSEEK_API_KEY=your-api-key
 ```bash
 export OPENAI_API_KEY="your-api-key"
 ```
-
-Kimi、Qwen、智谱、vLLM 等提供 OpenAI Chat Completions 兼容协议的服务，增加
-`baseUrl` 即可。它既可以是服务根地址，也可以是完整 endpoint：
-
-```json
-{
-  "model": {
-    "provider": "openai-compatible",
-    "name": "your-model",
-    "baseUrl": "http://localhost:8000/v1",
-    "apiKeyEnv": "",
-    "maxTokens": 8192
-  }
-}
-```
-
-`apiKeyEnv` 为空表示不发送 `Authorization`，适合无鉴权的本地服务。
 
 一次性执行任务：
 
@@ -103,7 +85,7 @@ cargo build --release -p kuncode-cli
 ```json
 {
   "permissions": {
-    "allow": ["Read(**)", "Bash(cargo *)"],
+    "allow": ["Read", "Bash(cargo *)"],
     "ask": ["Edit(.env)"],
     "deny": ["Bash(curl *)"],
     "defaultMode": "default"
@@ -111,7 +93,6 @@ cargo build --release -p kuncode-cli
   "model": {
     "provider": "deepseek",
     "name": "deepseek-v4-pro",
-    "apiKeyEnv": "DEEPSEEK_API_KEY",
     "maxTokens": 65536
   },
   "agent": {
@@ -130,9 +111,8 @@ cargo build --release -p kuncode-cli
 补充说明：
 
 - `KUNCODE_MODEL` 可以覆盖配置文件中的模型名称；`DEEPSEEK_MODEL` 作为兼容别名保留。
-- `model.provider` 支持 `deepseek` 和 `openai-compatible`。
-- `openai-compatible` 未设置 `baseUrl` 时默认使用 `https://api.openai.com/v1`。
-- `baseUrl` 会自动补全 `/chat/completions`；完整 endpoint 不会重复追加。
+- `model.provider` 支持 `deepseek` 和 `openai`；两者分别使用固定官方 endpoint，
+  并读取 `DEEPSEEK_API_KEY` 或 `OPENAI_API_KEY`。
 - 内置模型配置包括 `deepseek-v4-pro` 和 `deepseek-v4-flash`。
 - 非内置模型启用上下文压缩时，需要显式设置 `compaction.contextLimit`。
 - `compaction.mode` 支持 `disabled`、`shadow` 和 `enabled`，默认是 `disabled`。

@@ -19,8 +19,6 @@ use crate::{
     non_empty_vec::NonEmptyVec,
 };
 
-pub(crate) mod streaming;
-
 /// DeepSeek wire message serialized by `role`.
 ///
 /// This is flatter than the domain-side [`message::Message`]: `content` is a
@@ -159,6 +157,9 @@ impl From<message::Message> for Vec<Message> {
                                     .join("\n")
                                     .as_str(),
                             );
+                        }
+                        message::AssistantContent::Refusal(refusal) => {
+                            text_content.push_str(refusal.text_ref());
                         }
                     }
                 }

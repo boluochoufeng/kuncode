@@ -30,7 +30,7 @@ use kuncode_core::completion::{CompletionModel, RetryModel, RetryPolicy};
 use kuncode_core::providers::{
     any_chat::{AnyChatClient, AnyChatCompletionModel},
     deepseek::DeepSeekClient,
-    openai_compatible::OpenAiCompatibleClient,
+    openai::OpenAiClient,
 };
 
 use crate::config::{PermissionFlags, resolve_permissions};
@@ -81,7 +81,7 @@ impl CliRuntime<RetryModel<AnyChatCompletionModel>> {
     /// Fails if the current directory is not a usable workspace, the project
     /// settings or resolved permissions are invalid, active compaction cannot
     /// be bound to the selected model, or the provider client cannot be built
-    /// from its endpoint and environment. Failure to open the optional session
+    /// from its fixed credential environment. Failure to open the optional session
     /// store is retained as degraded persistence state rather than failing assembly.
     pub async fn assemble(cli: &Cli) -> Result<Self, Box<dyn std::error::Error>> {
         let workspace = Workspace::from_current_dir().await?;
@@ -190,28 +190,9 @@ impl CliRuntime<RetryModel<AnyChatCompletionModel>> {
 }
 
 fn provider_client(project: &ProjectSettings) -> Result<AnyChatClient, Box<dyn std::error::Error>> {
-    let api_key = if project.api_key_env.trim().is_empty() {
-        String::new()
-    } else {
-        std::env::var(&project.api_key_env).map_err(|error| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!(
-                    "provider API key environment variable `{}` is unavailable: {error}",
-                    project.api_key_env
-                ),
-            )
-        })?
-    };
     match project.provider {
-        ProviderKind::DeepSeek => Ok(AnyChatClient::DeepSeek(DeepSeekClient::new(api_key)?)),
-        ProviderKind::OpenAiCompatible => {
-            let client = match project.base_url.as_deref() {
-                Some(base_url) => OpenAiCompatibleClient::new(api_key, base_url)?,
-                None => OpenAiCompatibleClient::openai(api_key)?,
-            };
-            Ok(AnyChatClient::OpenAiCompatible(client))
-        }
+        ProviderKind::DeepSeek => Ok(AnyChatClient::DeepSeek(DeepSeekClient::from_env()?)),
+        ProviderKind::OpenAi => Ok(AnyChatClient::OpenAi(OpenAiClient::from_env()?)),
     }
 }
 

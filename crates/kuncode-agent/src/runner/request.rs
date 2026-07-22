@@ -170,6 +170,7 @@ pub(super) fn assistant_text(content: &NonEmptyVec<AssistantContent>) -> String 
         .iter()
         .filter_map(|content| match content {
             AssistantContent::Text(text) => Some(text.text_ref()),
+            AssistantContent::Refusal(refusal) => Some(refusal.text_ref()),
             _ => None,
         })
         .collect::<Vec<_>>()
