@@ -12,8 +12,8 @@ use kuncode_agent::todo::TodoItem;
 use super::bridge::ApprovalRequest;
 use crate::view::{ToolOutcome, ViewEffect, view};
 
-/// Whether a turn is in flight. Gates input submission (one turn at a time) and
-/// whether the input box / cursor is shown.
+/// Whether a turn is in flight. Gates submission and the composer's editable
+/// cursor while keeping the bottom surface stable between states.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
     Idle,
@@ -98,6 +98,8 @@ pub struct App {
     /// scroll-up clears it; scrolling back to the bottom restores it.
     pub follow: bool,
     pub should_quit: bool,
+    colors_enabled: bool,
+    animation_frame: usize,
 }
 
 impl App {
@@ -118,7 +120,31 @@ impl App {
             scroll: 0,
             follow: true,
             should_quit: false,
+            colors_enabled: std::env::var_os("NO_COLOR").is_none(),
+            animation_frame: 0,
         }
+    }
+
+    /// Whether semantic terminal colors are enabled for this process.
+    pub(super) const fn colors_enabled(&self) -> bool {
+        self.colors_enabled
+    }
+
+    /// Advances the low-frequency activity indicator used while work is active.
+    pub(super) fn advance_animation(&mut self) {
+        self.animation_frame = self.animation_frame.wrapping_add(1);
+    }
+
+    /// Returns the current activity glyph without exposing animation state.
+    pub(super) fn activity_glyph(&self) -> &'static str {
+        const FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+        FRAMES[self.animation_frame % FRAMES.len()]
+    }
+
+    #[cfg(test)]
+    /// Overrides color capability so rendering tests do not depend on process env.
+    pub(super) fn set_colors_enabled(&mut self, enabled: bool) {
+        self.colors_enabled = enabled;
     }
 
     pub fn set_approval(&mut self, req: ApprovalRequest) {
@@ -127,11 +153,14 @@ impl App {
 
     /// Resolves a pending approval and leaves unrelated keys untouched.
     pub fn handle_approval_key(&mut self, key: KeyEvent) {
+        let Some(pending) = self.approval.as_ref() else {
+            return;
+        };
         let choice = match key.code {
             KeyCode::Char('y') => Choice::AllowOnce,
-            KeyCode::Char('a') => Choice::AllowAlways,
+            KeyCode::Char('a') if pending.allow_session.is_some() => Choice::AllowSession,
             KeyCode::Char('n') => Choice::DenyOnce,
-            KeyCode::Char('d') => Choice::DenyAlways,
+            KeyCode::Char('d') if pending.deny_session.is_some() => Choice::DenySession,
             KeyCode::Char('c') | KeyCode::Esc => Choice::Abort,
             _ => return,
         };
@@ -140,11 +169,11 @@ impl App {
         };
         let outcome = match choice {
             Choice::AllowOnce => ApprovalResolution::Approve { persistence: None },
-            Choice::AllowAlways => ApprovalResolution::Approve {
+            Choice::AllowSession => ApprovalResolution::Approve {
                 persistence: req.allow_session,
             },
             Choice::DenyOnce => ApprovalResolution::Deny { persistence: None },
-            Choice::DenyAlways => ApprovalResolution::Deny {
+            Choice::DenySession => ApprovalResolution::Deny {
                 persistence: req.deny_session,
             },
             Choice::Abort => ApprovalResolution::Cancel,
@@ -349,9 +378,9 @@ impl App {
 
 enum Choice {
     AllowOnce,
-    AllowAlways,
+    AllowSession,
     DenyOnce,
-    DenyAlways,
+    DenySession,
     Abort,
 }
 
@@ -394,6 +423,26 @@ mod tests {
             tool: "bash".to_string(),
             summary: "run ls".to_string(),
         }
+    }
+
+    #[test]
+    fn unavailable_session_approval_key_is_ignored() {
+        let mut app = app();
+        let (respond, _receiver) = tokio::sync::oneshot::channel();
+        app.set_approval(ApprovalRequest {
+            summary: "run command".to_string(),
+            targets: vec!["Bash(cargo test)".to_string()],
+            allow_session: None,
+            deny_session: None,
+            respond,
+        });
+
+        app.handle_approval_key(KeyEvent::new(
+            KeyCode::Char('a'),
+            crossterm::event::KeyModifiers::empty(),
+        ));
+
+        assert!(app.approval.is_some());
     }
 
     #[test]
