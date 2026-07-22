@@ -76,6 +76,7 @@ struct PermissionsSection {
 #[derive(Debug, Deserialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 struct ModelSection {
+    provider: ProviderKind,
     name: String,
     max_tokens: Option<u64>,
 }
@@ -83,10 +84,23 @@ struct ModelSection {
 impl Default for ModelSection {
     fn default() -> Self {
         Self {
+            provider: ProviderKind::DeepSeek,
             name: DEEPSEEK_V4_PRO_MODEL_ID.to_string(),
             max_tokens: None,
         }
     }
+}
+
+/// Wire protocol selected for model requests.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+pub(crate) enum ProviderKind {
+    /// Native DeepSeek behavior and environment defaults.
+    #[default]
+    #[serde(rename = "deepseek")]
+    DeepSeek,
+    /// Official OpenAI Chat Completions protocol and endpoint.
+    #[serde(rename = "openai")]
+    OpenAi,
 }
 
 #[derive(Debug, Deserialize)]
@@ -166,6 +180,8 @@ pub struct ProjectSettings {
     pub default_mode: Option<PermissionMode>,
     /// Trust comes from CLI/user state, never from the project file itself.
     pub(crate) trust: ProjectTrust,
+    /// Effective provider protocol.
+    pub(crate) provider: ProviderKind,
     /// Effective model identifier after file and environment precedence.
     pub(crate) model_name: String,
     /// Effective provider output budget for an ordinary turn.
@@ -188,6 +204,7 @@ impl Default for ProjectSettings {
             policy: None,
             default_mode: None,
             trust: ProjectTrust::Untrusted,
+            provider: ProviderKind::DeepSeek,
             model_name: DEEPSEEK_V4_PRO_MODEL_ID.to_string(),
             max_tokens,
             max_iterations: DEFAULT_MAX_ITERATIONS,
@@ -199,9 +216,10 @@ impl Default for ProjectSettings {
 
 /// Loads `.kuncode/settings.json` under `root`.
 ///
-/// A missing file returns defaults. `DEEPSEEK_MODEL` overrides the file's model
-/// name when present. Every section forms a closed schema, so misspelled fields
-/// fail instead of silently selecting defaults.
+/// A missing file returns defaults. `KUNCODE_MODEL` overrides the file's model
+/// name; `DEEPSEEK_MODEL` remains a backward-compatible fallback. Every section
+/// forms a closed schema, so misspelled fields fail instead of silently selecting
+/// defaults.
 ///
 /// # Errors
 ///
@@ -213,7 +231,9 @@ pub(crate) fn load_project_settings(
     root: &Path,
     trust: ProjectTrust,
 ) -> Result<ProjectSettings, SettingsError> {
-    let model_override = std::env::var("DEEPSEEK_MODEL").ok();
+    let model_override = std::env::var("KUNCODE_MODEL")
+        .ok()
+        .or_else(|| std::env::var("DEEPSEEK_MODEL").ok());
     load_project_settings_from(root, model_override.as_deref(), trust)
 }
 
@@ -266,7 +286,11 @@ fn resolve_settings(
             "model name must not be blank".to_string(),
         ));
     }
-    let profile = model_profile(&model_name);
+    let profile = if file.model.provider == ProviderKind::DeepSeek {
+        model_profile(&model_name)
+    } else {
+        None
+    };
     let max_tokens = file.model.max_tokens.unwrap_or_else(|| {
         profile.map_or_else(
             default_agent_max_tokens,
@@ -276,7 +300,6 @@ fn resolve_settings(
     validate_model_max_tokens(max_tokens, profile)?;
     validate_agent(&file.agent)?;
     validate_log_level(&file.logging.level)?;
-
     let canonical_root =
         std::fs::canonicalize(root).map_err(|error| SettingsError::Workspace(error.to_string()))?;
     let canonical_root = CanonicalPath::from_absolute(&canonical_root)
@@ -300,6 +323,7 @@ fn resolve_settings(
         policy: Some(policy),
         default_mode,
         trust,
+        provider: file.model.provider,
         model_name,
         max_tokens,
         max_iterations: file.agent.max_iterations,
@@ -555,6 +579,7 @@ mod tests {
             .expect("a missing file is fine");
         let _ = fs::remove_dir_all(&dir);
 
+        assert_eq!(loaded.provider, ProviderKind::DeepSeek);
         assert!(loaded.policy.expect("resolved policy").rules().is_empty());
         assert!(loaded.default_mode.is_none());
         assert!(loaded.compaction.is_none());
@@ -562,6 +587,34 @@ mod tests {
         assert_eq!(loaded.max_tokens, 65_536);
         assert_eq!(loaded.max_iterations, 50);
         assert_eq!(loaded.todo_reminder_interval, Some(3));
+    }
+
+    #[test]
+    fn loads_official_openai_provider_settings() {
+        let loaded = load_json(
+            "openai",
+            r#"{ "model": {
+                "provider": "openai",
+                "name": "gpt-test",
+                "maxTokens": 8192
+            } }"#,
+        )
+        .expect("loads");
+
+        assert_eq!(loaded.provider, ProviderKind::OpenAi);
+        assert_eq!(loaded.model_name, "gpt-test");
+        assert_eq!(loaded.max_tokens, 8_192);
+    }
+
+    #[test]
+    fn loads_explicit_deepseek_provider_name() {
+        let loaded = load_json(
+            "deepseek-provider",
+            r#"{ "model": { "provider": "deepseek" } }"#,
+        )
+        .expect("loads");
+
+        assert_eq!(loaded.provider, ProviderKind::DeepSeek);
     }
 
     #[test]

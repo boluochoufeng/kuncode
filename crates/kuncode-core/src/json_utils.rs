@@ -65,3 +65,14 @@ where
     let opt = <Option<Vec<T>> as serde::Deserialize>::deserialize(deserializer)?;
     Ok(opt.unwrap_or_default())
 }
+
+/// Deserializes a defaultable value from a field that providers may send as
+/// JSON `null` even though the non-null wire value is required by the schema.
+pub fn null_or_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de> + Default,
+{
+    let opt = <Option<T> as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(opt.unwrap_or_default())
+}

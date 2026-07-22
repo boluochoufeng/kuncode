@@ -150,6 +150,8 @@ pub enum AssistantContent {
     ToolCall(ToolCall),
     /// Reasoning/thinking content returned by reasoning-capable models.
     Reasoning(Reasoning),
+    /// Safety refusal returned instead of ordinary assistant text.
+    Refusal(Refusal),
 }
 
 impl AssistantContent {
@@ -197,6 +199,26 @@ impl AssistantContent {
     /// Wraps a chain-of-thought string as a [`Reasoning`] block.
     pub fn reasoning(reasoning: impl AsRef<str>) -> Self {
         Self::Reasoning(Reasoning::new(reasoning.as_ref()))
+    }
+
+    /// Preserves a provider refusal separately from ordinary assistant text.
+    pub fn refusal(refusal: impl Into<String>) -> Self {
+        Self::Refusal(Refusal {
+            refusal: refusal.into(),
+        })
+    }
+}
+
+/// A safety refusal emitted instead of ordinary assistant content.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct Refusal {
+    refusal: String,
+}
+
+impl Refusal {
+    /// Returns the refusal text.
+    pub fn text_ref(&self) -> &str {
+        &self.refusal
     }
 }
 
@@ -428,6 +450,7 @@ mod tests {
                             Reasoning::summaries(vec!["s1".into(), "s2".into()])
                                 .with_id("r_1".to_string()),
                         ),
+                        AssistantContent::refusal("cannot comply"),
                     ],
                 ),
             },

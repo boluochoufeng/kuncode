@@ -27,10 +27,14 @@ use kuncode_agent::system_prompt::{
 };
 use kuncode_agent::workspace::Workspace;
 use kuncode_core::completion::{CompletionModel, RetryModel, RetryPolicy};
-use kuncode_core::providers::deepseek::{DeepSeekClient, DeepSeekCompletionModel};
+use kuncode_core::providers::{
+    any_chat::{AnyChatClient, AnyChatCompletionModel},
+    deepseek::DeepSeekClient,
+    openai::OpenAiClient,
+};
 
 use crate::config::{PermissionFlags, resolve_permissions};
-use crate::settings::{ProjectSettings, ProjectTrust, load_project_settings};
+use crate::settings::{ProjectSettings, ProjectTrust, ProviderKind, load_project_settings};
 use crate::{Cli, logging::LoggingObserver};
 
 /// Identity and behavioral instructions rendered as the first system-prompt
@@ -46,7 +50,7 @@ Keep working until the task is done, then give a short, direct final answer.";
 /// observer + approver, plus the bits a frontend renders directly
 /// ([`model_name`](Self::model_name), [`mode`](Self::mode)). Generic over the
 /// model so a test or a future provider can supply its own `M`; [`assemble`]
-/// pins it to the CLI's [`DeepSeekCompletionModel`] wrapped in a
+/// pins it to the configured [`AnyChatCompletionModel`] wrapped in a
 /// [`RetryModel`] so transient provider failures are retried transparently.
 ///
 /// [`assemble`]: Self::assemble
@@ -64,21 +68,21 @@ pub struct CliRuntime<M> {
     persistence_error: Option<String>,
 }
 
-impl CliRuntime<RetryModel<DeepSeekCompletionModel>> {
+impl CliRuntime<RetryModel<AnyChatCompletionModel>> {
     /// Builds the runtime from parsed CLI args and the project settings file.
     ///
     /// Resolves permissions from built-in ∪ project file ∪ CLI flags (mode
     /// precedence CLI > project > Default), assembles the system prompt from its
-    /// identity/environment/tools sections, and wires the DeepSeek model + the
-    /// default workspace tool registry.
+    /// identity/environment/tools sections, and wires the configured model +
+    /// the default workspace tool registry.
     ///
     /// # Errors
     ///
     /// Fails if the current directory is not a usable workspace, the project
     /// settings or resolved permissions are invalid, active compaction cannot
-    /// be bound to the selected model, or the DeepSeek client cannot be built
-    /// from the environment. Failure to open the optional session store is
-    /// retained as degraded persistence state rather than failing assembly.
+    /// be bound to the selected model, or the provider client cannot be built
+    /// from its fixed credential environment. Failure to open the optional session
+    /// store is retained as degraded persistence state rather than failing assembly.
     pub async fn assemble(cli: &Cli) -> Result<Self, Box<dyn std::error::Error>> {
         let workspace = Workspace::from_current_dir().await?;
         tracing::debug!(
@@ -97,6 +101,7 @@ impl CliRuntime<RetryModel<DeepSeekCompletionModel>> {
         let project = load_project_settings(workspace.root(), project_trust)?;
         let model_name = project.model_name.clone();
         let config = agent_config(&project)?;
+        let client = provider_client(&project)?;
         let flags = PermissionFlags {
             allow: &cli.allow,
             ask: &cli.ask,
@@ -160,11 +165,10 @@ impl CliRuntime<RetryModel<DeepSeekCompletionModel>> {
                     (None, Some("home directory unavailable".to_string()))
                 }
             };
-        let client = DeepSeekClient::from_env()?;
         // Normal turns inherit the default retry budget. Semantic summaries use
         // a separate one-retry wrapper so their fallback latency is bounded
         // independently of ordinary model calls.
-        let provider = DeepSeekCompletionModel::make(&client, model_name.clone());
+        let provider = AnyChatCompletionModel::make(&client, model_name.clone());
         let model = RetryModel::with_policy(provider.clone(), RetryPolicy::default());
         let summary_model = RetryModel::with_policy(provider, summary_retry_policy());
         let registry = ToolRegistry::with_default_workspace_tools(workspace)?;
@@ -182,6 +186,13 @@ impl CliRuntime<RetryModel<DeepSeekCompletionModel>> {
             session_store,
             persistence_error,
         })
+    }
+}
+
+fn provider_client(project: &ProjectSettings) -> Result<AnyChatClient, Box<dyn std::error::Error>> {
+    match project.provider {
+        ProviderKind::DeepSeek => Ok(AnyChatClient::DeepSeek(DeepSeekClient::from_env()?)),
+        ProviderKind::OpenAi => Ok(AnyChatClient::OpenAi(OpenAiClient::from_env()?)),
     }
 }
 
