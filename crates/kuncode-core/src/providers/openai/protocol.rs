@@ -60,14 +60,10 @@ impl From<message::Message> for Vec<Message> {
             }
             message::Message::Assistant { id: _, content } => {
                 let mut text = String::new();
-                let mut refusal = String::new();
                 let mut tool_calls = Vec::new();
                 for block in content {
                     match block {
                         message::AssistantContent::Text(value) => text.push_str(value.text_ref()),
-                        message::AssistantContent::Refusal(value) => {
-                            refusal.push_str(value.text_ref());
-                        }
                         message::AssistantContent::ToolCall(call) => {
                             tool_calls.push(ToolCall::from(call));
                         }
@@ -77,7 +73,9 @@ impl From<message::Message> for Vec<Message> {
                 }
                 vec![Message::Assistant {
                     content: text,
-                    refusal: (!refusal.is_empty()).then_some(refusal),
+                    // Inbound-only: refusals are flattened to text on receipt,
+                    // so replayed history never carries the field.
+                    refusal: None,
                     tool_calls,
                 }]
             }
@@ -200,11 +198,20 @@ impl TryFrom<completion::CompletionRequest> for OpenAiCompletionRequest {
                 .map(ToolDefinition::from)
                 .collect(),
             tool_choice: request.tool_choice.map(ToolChoice::from),
-            max_completion_tokens: request.max_tokens.map(|value| value as u32),
+            max_completion_tokens: request
+                .max_tokens
+                .map(|value| {
+                    u32::try_from(value).map_err(|_| {
+                        CompletionError::RequestError(format!(
+                            "max_tokens {value} exceeds the OpenAI u32 wire range"
+                        ))
+                    })
+                })
+                .transpose()?,
             temperature: request.temperature,
             top_p: request.top_p,
             stop: request.stop.filter(|value| !value.is_empty()),
-            reasoning_effort: request.reasoning.map(ReasoningEffort::from),
+            reasoning_effort: request.reasoning.and_then(ReasoningEffort::from_domain),
             response_format: request.output_schema.map(ResponseFormat::json_schema),
             stream: None,
             stream_options: None,
@@ -225,7 +232,6 @@ impl OpenAiCompletionRequest {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum ReasoningEffort {
-    None,
     Minimal,
     Low,
     Medium,
@@ -233,15 +239,22 @@ enum ReasoningEffort {
     Xhigh,
 }
 
-impl From<completion::ReasoningEffort> for ReasoningEffort {
-    fn from(value: completion::ReasoningEffort) -> Self {
+impl ReasoningEffort {
+    /// Maps the domain effort onto the wire value; [`Off`] maps to omitting the
+    /// field entirely. Non-reasoning models (gpt-4o family) reject the parameter
+    /// outright, and reasoning models reject `"none"` — leaving the field out is
+    /// the only spelling every Chat Completions model accepts, mirroring the
+    /// DeepSeek mapper's treatment of [`Off`].
+    ///
+    /// [`Off`]: completion::ReasoningEffort::Off
+    fn from_domain(value: completion::ReasoningEffort) -> Option<Self> {
         match value {
-            completion::ReasoningEffort::Off => Self::None,
-            completion::ReasoningEffort::Minimal => Self::Minimal,
-            completion::ReasoningEffort::Low => Self::Low,
-            completion::ReasoningEffort::Medium => Self::Medium,
-            completion::ReasoningEffort::High => Self::High,
-            completion::ReasoningEffort::Xhigh => Self::Xhigh,
+            completion::ReasoningEffort::Off => None,
+            completion::ReasoningEffort::Minimal => Some(Self::Minimal),
+            completion::ReasoningEffort::Low => Some(Self::Low),
+            completion::ReasoningEffort::Medium => Some(Self::Medium),
+            completion::ReasoningEffort::High => Some(Self::High),
+            completion::ReasoningEffort::Xhigh => Some(Self::Xhigh),
         }
     }
 }
@@ -253,12 +266,17 @@ enum ResponseFormat {
 }
 
 impl ResponseFormat {
+    /// `strict: false` deliberately: strict mode accepts only a narrow schema
+    /// subset (every property `required`, no `$schema`/`format`, ...), and the
+    /// schemas callers pass here are plain `schemars` output that violates it —
+    /// OpenAI would 400 on the request. Non-strict still steers generation with
+    /// the schema; callers validate the parsed result themselves.
     fn json_schema(schema: serde_json::Value) -> Self {
         Self::JsonSchema {
             json_schema: JsonSchema {
                 name: "kuncode_output",
                 schema,
-                strict: true,
+                strict: false,
             },
         }
     }
@@ -391,6 +409,12 @@ impl TryFrom<OpenAiCompletionResponse>
         if !content.trim().is_empty() {
             blocks.push(AssistantContent::text(content));
         }
+        // A refusal is OpenAI's wire spelling for "the answer text is a
+        // decline"; the agent has no refusal-aware branching, so it flattens to
+        // ordinary text. The verbatim field survives in `raw_response`.
+        if let Some(refusal) = refusal.as_ref().filter(|value| !value.is_empty()) {
+            blocks.push(AssistantContent::text(refusal));
+        }
         blocks.extend(tool_calls.iter().map(|call| {
             AssistantContent::tool_call(
                 &call.id,
@@ -398,9 +422,6 @@ impl TryFrom<OpenAiCompletionResponse>
                 call.function.arguments.clone(),
             )
         }));
-        if let Some(refusal) = refusal.as_ref().filter(|value| !value.is_empty()) {
-            blocks.push(AssistantContent::refusal(refusal));
-        }
         let blocks = NonEmptyVec::try_from(blocks).map_err(|error| {
             CompletionError::ResponseError(format!(
                 "OpenAI response contained no assistant content: {error}"
@@ -410,6 +431,8 @@ impl TryFrom<OpenAiCompletionResponse>
             choice: blocks,
             usage: response.usage.clone().into(),
             raw_response: response,
+            // `id` is the completion-call id (`chatcmpl-...`), not a message id;
+            // mirror the DeepSeek mapping and leave it in `raw_response` only.
             message_id: None,
         })
     }
@@ -431,7 +454,7 @@ mod tests {
         let request = CompletionRequestBuilder::new(DomainMessage::user("test"))
             .model("gpt-test")
             .max_tokens(Some(512))
-            .reasoning(Some(ReasoningEffort::Off))
+            .reasoning(Some(ReasoningEffort::Medium))
             .output_schema(Some(schema.clone()))
             .build();
         let wire = OpenAiCompletionRequest::try_from(request).expect("wire request");
@@ -439,14 +462,43 @@ mod tests {
 
         assert_eq!(json["max_completion_tokens"], 512);
         assert!(json.get("max_tokens").is_none());
-        assert_eq!(json["reasoning_effort"], "none");
+        assert_eq!(json["reasoning_effort"], "medium");
         assert_eq!(json["response_format"]["type"], "json_schema");
-        assert_eq!(json["response_format"]["json_schema"]["strict"], true);
+        // Strict mode rejects plain schemars output (optional fields, $schema,
+        // integer formats) with a 400 — the request must never opt in.
+        assert_eq!(json["response_format"]["json_schema"]["strict"], false);
         assert_eq!(json["response_format"]["json_schema"]["schema"], schema);
     }
 
     #[test]
-    fn preserves_refusal_as_assistant_content() {
+    fn reasoning_effort_off_omits_the_field_entirely() {
+        // gpt-4o-family models reject the parameter and reasoning models reject
+        // "none"; the only universally-accepted spelling of Off is absence.
+        let request = CompletionRequestBuilder::new(DomainMessage::user("test"))
+            .model("gpt-test")
+            .reasoning(Some(ReasoningEffort::Off))
+            .build();
+        let wire = OpenAiCompletionRequest::try_from(request).expect("wire request");
+        let json = serde_json::to_value(wire).expect("serialize request");
+
+        assert!(json.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn oversized_max_tokens_is_a_request_error_not_a_wrap() {
+        let request = CompletionRequestBuilder::new(DomainMessage::user("test"))
+            .model("gpt-test")
+            .max_tokens(Some(u64::from(u32::MAX) + 1))
+            .build();
+
+        assert!(matches!(
+            OpenAiCompletionRequest::try_from(request),
+            Err(CompletionError::RequestError(_))
+        ));
+    }
+
+    #[test]
+    fn refusal_flattens_to_assistant_text() {
         let response: OpenAiCompletionResponse = serde_json::from_value(serde_json::json!({
             "id": "chatcmpl-test",
             "choices": [{
@@ -464,9 +516,47 @@ mod tests {
         let normalized: completion::CompletionResponse<_> =
             response.try_into().expect("normalize response");
 
+        // The wire refusal reaches the agent as ordinary text — the domain has
+        // no refusal-aware consumer — while `raw_response` keeps the original.
         assert!(matches!(
             normalized.choice.first(),
-            AssistantContent::Refusal(value) if value.text_ref() == "Cannot comply"
+            AssistantContent::Text(value) if value.text_ref() == "Cannot comply"
         ));
+    }
+
+    #[test]
+    fn tool_calls_map_with_ids_names_and_parsed_arguments() {
+        let response: OpenAiCompletionResponse = serde_json::from_value(serde_json::json!({
+            "id": "chatcmpl-test",
+            "choices": [{
+                "finish_reason": "tool_calls",
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_9",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": "{\"city\":\"NYC\"}"}
+                    }]
+                },
+                "logprobs": null
+            }],
+            "created": 1,
+            "model": "gpt-test",
+            "object": "chat.completion",
+            "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}
+        }))
+        .expect("response fixture");
+        let normalized: completion::CompletionResponse<_> =
+            response.try_into().expect("normalize response");
+
+        let call = match normalized.choice.first() {
+            AssistantContent::ToolCall(call) => call,
+            other => panic!("expected a tool call, got {other:?}"),
+        };
+        assert_eq!(call.id, "call_9");
+        assert_eq!(call.function.name, "get_weather");
+        assert_eq!(call.function.arguments, serde_json::json!({"city": "NYC"}));
     }
 }

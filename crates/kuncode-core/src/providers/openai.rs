@@ -3,12 +3,14 @@
 use std::{env::VarError, time::Duration};
 
 use reqwest::header::CONTENT_TYPE;
+use serde::Deserialize;
 use serde_json::Value;
 use thiserror::Error;
 
 use crate::{
     completion::{CompletionError, CompletionModel, CompletionRequest, CompletionResponse},
     json_utils,
+    providers::chat_completions::streaming,
 };
 
 use self::protocol::{OpenAiCompletionRequest, OpenAiCompletionResponse, Usage};
@@ -139,18 +141,21 @@ impl CompletionModel for OpenAiCompletionModel {
                 message: response.text().await.unwrap_or_default(),
             });
         }
-        validate_stream_content_type(
+        streaming::validate_stream_content_type(
             response
                 .headers()
                 .get(CONTENT_TYPE)
                 .and_then(|value| value.to_str().ok()),
         )?;
-        Ok(crate::providers::chat_completions::streaming::stream_events::<Usage>(response))
+        Ok(streaming::stream_events::<Usage>(response))
     }
 }
 
+/// Projects the server's JSON into the domain response while handing the
+/// untouched original through as `raw_response`. Deserializes by reference so
+/// the projection does not deep-copy the body.
 fn normalize_response(raw: Value) -> Result<CompletionResponse<Value>, CompletionError> {
-    let response: OpenAiCompletionResponse = serde_json::from_value(raw.clone())?;
+    let response = OpenAiCompletionResponse::deserialize(&raw)?;
     let normalized: CompletionResponse<OpenAiCompletionResponse> = response.try_into()?;
     Ok(CompletionResponse {
         choice: normalized.choice,
@@ -160,16 +165,49 @@ fn normalize_response(raw: Value) -> Result<CompletionResponse<Value>, Completio
     })
 }
 
-fn validate_stream_content_type(content_type: Option<&str>) -> Result<(), CompletionError> {
-    let Some(content_type) = content_type else {
-        return Ok(());
-    };
-    let media_type = content_type.split(';').next().unwrap_or_default().trim();
-    if media_type.eq_ignore_ascii_case("text/event-stream") {
-        Ok(())
-    } else {
-        Err(CompletionError::ResponseError(format!(
-            "expected an OpenAI SSE response, but received `{media_type}`"
-        )))
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::completion::AssistantContent;
+
+    #[test]
+    fn normalize_response_projects_content_and_keeps_the_original_json() {
+        let raw = serde_json::json!({
+            "id": "chatcmpl-test",
+            "choices": [{
+                "finish_reason": "stop",
+                "index": 0,
+                "message": {"role": "assistant", "content": "hello"},
+                "logprobs": null
+            }],
+            "created": 1,
+            "model": "gpt-test",
+            "object": "chat.completion",
+            "system_fingerprint": "fp_1",
+            "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6,
+                      "unmodeled_extension": {"depth": 3}}
+        });
+
+        let normalized = normalize_response(raw.clone()).expect("normalize");
+
+        assert!(matches!(
+            normalized.choice.first(),
+            AssistantContent::Text(text) if text.text_ref() == "hello"
+        ));
+        assert_eq!(normalized.usage.input_tokens, 4);
+        // The raw side is the *server's* JSON verbatim — unmodeled fields
+        // included — not a re-serialization of the typed DTO.
+        assert_eq!(normalized.raw_response, raw);
+        assert_eq!(
+            normalized.raw_response["usage"]["unmodeled_extension"]["depth"],
+            3
+        );
+    }
+
+    #[test]
+    fn normalize_response_rejects_a_non_completion_body() {
+        let error = normalize_response(serde_json::json!({"error": "nope"}))
+            .expect_err("not a completion body");
+        assert!(matches!(error, CompletionError::JsonError(_)));
     }
 }

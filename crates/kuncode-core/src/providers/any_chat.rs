@@ -46,6 +46,11 @@ impl CompletionModel for AnyChatCompletionModel {
         }
     }
 
+    /// `raw_response` semantics differ by branch and are best-effort only: the
+    /// OpenAI branch passes the server's original JSON through verbatim, while
+    /// the DeepSeek branch re-serializes its typed DTO (unmodeled fields are
+    /// dropped). Callers may rely on it being valid JSON, not on it being
+    /// byte-faithful; nothing in the runtime consumes it today.
     async fn completion(
         &self,
         request: CompletionRequest,

@@ -205,6 +205,13 @@ impl CompletionModel for DeepSeekCompletionModel {
             });
         }
 
+        crate::providers::chat_completions::streaming::validate_stream_content_type(
+            response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+        )?;
+
         Ok(
             crate::providers::chat_completions::streaming::stream_events::<protocol::Usage>(
                 response,
