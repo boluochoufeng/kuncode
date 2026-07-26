@@ -664,8 +664,17 @@ mod tests {
 
     use super::*;
 
+    /// `tracing`'s callsite interest cache is process-global: creating a
+    /// `Dispatch` triggers a rebuild, and a concurrently running test that
+    /// installed a *different* filter via `with_default` can observe the
+    /// rebuild window and flake. Tests that swap subscribers hold this lock.
+    static SUBSCRIBER_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn settings_level_builds_filter() {
+        let _gate = SUBSCRIBER_GATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let settings = LoggingSettings {
             level: "debug".to_string(),
         };
@@ -690,6 +699,9 @@ mod tests {
 
     #[test]
     fn padded_off_level_remains_disabled() {
+        let _gate = SUBSCRIBER_GATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let settings = LoggingSettings {
             level: " off ".to_string(),
         };
