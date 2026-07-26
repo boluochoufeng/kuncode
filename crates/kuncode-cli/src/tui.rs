@@ -395,7 +395,10 @@ fn handle_idle_key(app: &mut App, key: KeyEvent) -> Option<String> {
             app.backspace();
             None
         }
-        (_, KeyCode::Char(c)) => {
+        // Ctrl-chords the app doesn't bind must not leak their letter into the
+        // buffer (Ctrl+K typing a literal 'k'). Shift/Alt still insert: many
+        // terminals report them alongside ordinary composed characters.
+        (m, KeyCode::Char(c)) if !m.contains(KeyModifiers::CONTROL) => {
             app.insert_char(c);
             None
         }
@@ -404,17 +407,21 @@ fn handle_idle_key(app: &mut App, key: KeyEvent) -> Option<String> {
 }
 
 /// Handles a key while a turn runs: answer the approval modal if one is open,
-/// else let Ctrl-C cancel the turn.
+/// else let Ctrl-C cancel the turn. Scrolling stays available either way —
+/// deciding an approval often means checking the conversation above it, and
+/// the mouse wheel already scrolls during a modal.
 fn handle_running_key(app: &mut App, key: KeyEvent, cancel: &CancellationToken) {
+    match key.code {
+        KeyCode::PageUp => return app.scroll_up(SCROLL_STEP),
+        KeyCode::PageDown => return app.scroll_down(SCROLL_STEP),
+        _ => {}
+    }
     if app.approval.is_some() {
         app.handle_approval_key(key);
         return;
     }
-    match (key.modifiers, key.code) {
-        (KeyModifiers::CONTROL, KeyCode::Char('c')) => cancel.cancel(),
-        (_, KeyCode::PageUp) => app.scroll_up(SCROLL_STEP),
-        (_, KeyCode::PageDown) => app.scroll_down(SCROLL_STEP),
-        _ => {}
+    if (key.modifiers, key.code) == (KeyModifiers::CONTROL, KeyCode::Char('c')) {
+        cancel.cancel();
     }
 }
 
@@ -461,6 +468,43 @@ mod tests {
             Some("exit now")
         );
         assert!(!app.should_quit, "a prompt containing exit must not quit");
+    }
+
+    #[test]
+    fn page_keys_scroll_even_while_an_approval_is_pending() {
+        let mut app = App::new("m", PermissionMode::Default);
+        let (respond, _rx) = tokio::sync::oneshot::channel();
+        app.set_approval(crate::tui::bridge::ApprovalRequest {
+            summary: "run command".to_string(),
+            targets: vec!["Bash(date)".to_string()],
+            allow_session: None,
+            deny_session: None,
+            respond,
+        });
+        let cancel = CancellationToken::new();
+
+        handle_running_key(
+            &mut app,
+            KeyEvent::new(KeyCode::PageUp, KeyModifiers::empty()),
+            &cancel,
+        );
+
+        assert!(!app.follow, "PageUp scrolls instead of being swallowed");
+        assert!(app.approval.is_some(), "the modal stays pending");
+        assert!(!cancel.is_cancelled());
+    }
+
+    #[test]
+    fn unbound_control_chords_do_not_insert_their_letter() {
+        let mut app = App::new("m", PermissionMode::Default);
+        assert!(
+            handle_idle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+            )
+            .is_none()
+        );
+        assert!(app.input.is_empty(), "Ctrl+K must not type a literal 'k'");
     }
 
     #[test]
