@@ -4,7 +4,7 @@ mod input;
 
 use std::time::Duration;
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use kuncode_agent::observer::EventKind;
 use kuncode_agent::permission::{ApprovalResolution, PermissionMode};
 use kuncode_agent::todo::TodoItem;
@@ -161,7 +161,11 @@ impl App {
             KeyCode::Char('a') if pending.allow_session.is_some() => Choice::AllowSession,
             KeyCode::Char('n') => Choice::DenyOnce,
             KeyCode::Char('d') if pending.deny_session.is_some() => Choice::DenySession,
-            KeyCode::Char('c') | KeyCode::Esc => Choice::Abort,
+            // Esc as advertised, plus the global Ctrl+C cancel (the modal takes
+            // over all keys, so Ctrl+C must be honored here). A bare 'c' stays
+            // an ordinary keypress — the UI never advertises it.
+            KeyCode::Esc => Choice::Abort,
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => Choice::Abort,
             _ => return,
         };
         let Some(req) = self.approval.take() else {
@@ -443,6 +447,29 @@ mod tests {
         ));
 
         assert!(app.approval.is_some());
+    }
+
+    #[test]
+    fn bare_c_is_ignored_but_ctrl_c_cancels_the_approval() {
+        let mut app = app();
+        let (respond, _receiver) = tokio::sync::oneshot::channel();
+        app.set_approval(ApprovalRequest {
+            summary: "run command".to_string(),
+            targets: vec!["Bash(cargo test)".to_string()],
+            allow_session: None,
+            deny_session: None,
+            respond,
+        });
+
+        // The UI only advertises Esc; a stray 'c' must not abort the task.
+        app.handle_approval_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::empty()));
+        assert!(app.approval.is_some(), "bare 'c' is not an approval action");
+
+        app.handle_approval_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(
+            app.approval.is_none(),
+            "Ctrl+C cancels like everywhere else"
+        );
     }
 
     #[test]

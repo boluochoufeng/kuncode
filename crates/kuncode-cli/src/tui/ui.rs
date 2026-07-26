@@ -171,7 +171,8 @@ fn draw_plan(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
         .iter()
         .filter(|task| task.status == TodoStatus::Completed)
         .count();
-    let inner_width = area.width.saturating_sub(2).max(1);
+    // Only the top border is drawn, so rows get the panel's full width.
+    let inner_width = area.width.max(1);
     let rows: Vec<Line> = visible
         .into_iter()
         .map(|task| plan_item_line(task, inner_width, theme))
@@ -225,7 +226,12 @@ fn input_height(app: &App, width: u16) -> u16 {
         .map(|segment| Line::raw(segment.to_string()))
         .collect();
     let rows = wrap_lines(logical, content_width).len() as u16;
-    rows.clamp(1, INPUT_MAX_ROWS).saturating_add(2)
+    // The caret may sit one row past the wrapped text (exact-width fill); give
+    // that row real height so the composer never scrolls the text out to show it.
+    let (caret_row, _) = caret_position(&app.input[..app.cursor], content_width);
+    rows.max(caret_row.saturating_add(1))
+        .clamp(1, INPUT_MAX_ROWS)
+        .saturating_add(2)
 }
 
 fn draw_input(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
@@ -314,6 +320,12 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
 /// char-boundary rule as [`wrap_lines`] (greedy, breaking before a char that
 /// would overflow; `'\n'` starts a new row). Returns 0-based (row, column) in
 /// display cells so the cursor lands exactly where the rendered text wraps.
+///
+/// A caret that lands exactly on `inner_width` advances to the start of the
+/// next visual row — that is where the next typed char will render, and it
+/// keeps the cursor from covering the row's last cell. [`input_height`] and the
+/// composer's scroll both count that row via `caret_position`, so it is always
+/// on screen even when it is past the wrapped text.
 fn caret_position(input: &str, inner_width: u16) -> (u16, u16) {
     let inner_width = inner_width.max(1);
     let mut row = 0u16;
@@ -330,6 +342,10 @@ fn caret_position(input: &str, inner_width: u16) -> (u16, u16) {
             col = 0;
         }
         col += cw;
+    }
+    if col >= inner_width {
+        row = row.saturating_add(1);
+        col = 0;
     }
     (row, col)
 }
@@ -658,8 +674,9 @@ mod tests {
 
     #[test]
     fn caret_position_agrees_with_char_wrap() {
-        // Exact fill stays on row 0 — no phantom next row that would blank the box.
-        assert_eq!(caret_position("abcd", 4), (0, 4));
+        // Exact fill advances to the next visual row — where the next char will
+        // render — instead of parking the cursor on the last cell.
+        assert_eq!(caret_position("abcd", 4), (1, 0));
         // Overflow advances a row.
         assert_eq!(caret_position("abcde", 4), (1, 1));
         // Spaces don't get special word-break treatment: char-wrap, same as render.
@@ -668,22 +685,26 @@ mod tests {
         assert_eq!(caret_position("你你你", 3), (2, 2));
         // Explicit newline starts a fresh row.
         assert_eq!(caret_position("ab\nc", 4), (1, 1));
+        // An exact fill followed by '\n' must not double-advance: the newline
+        // itself is the row break.
+        assert_eq!(caret_position("abcd\n", 4), (1, 0));
     }
 
     #[test]
-    fn caret_row_never_exceeds_rendered_rows() {
-        // The caret's row must stay within the wrapped line count, or scroll would
-        // blank the box. Check against the actual `wrap_lines` output.
+    fn caret_row_stays_within_rows_the_composer_reserves() {
+        // The caret may exceed the wrapped line count by at most one phantom row
+        // (exact-width fill, caret at column 0). `input_height` reserves that row,
+        // so anything beyond it would scroll the box blank.
         for input in ["", "abcd", "abcde", "word word", "你你你", "a\nbb\nccc"] {
-            let (row, _) = caret_position(input, 4);
+            let (row, col) = caret_position(input, 4);
             let logical: Vec<Line> = input
                 .split('\n')
                 .map(|s| Line::raw(s.to_string()))
                 .collect();
             let rendered = wrap_lines(logical, 4).len() as u16;
             assert!(
-                row < rendered,
-                "{input:?}: caret row {row} >= {rendered} rows"
+                row < rendered || (row == rendered && col == 0),
+                "{input:?}: caret ({row}, {col}) outside {rendered} rendered rows + 1"
             );
         }
     }
@@ -705,6 +726,53 @@ mod tests {
         assert_eq!(
             pos.x, 6,
             "cursor sits at the edit column, not the input end"
+        );
+    }
+
+    #[test]
+    fn exact_width_input_puts_the_cursor_past_the_last_char_not_on_it() {
+        // Terminal width 10 → composer text width is 10 - 2 (border) - 2 (prompt)
+        // = 6, so "abcdef" fills its first visual row exactly.
+        let mut app = App::new("m", PermissionMode::Default);
+        for c in "abcdef".chars() {
+            app.insert_char(c);
+        }
+
+        let mut terminal = Terminal::new(TestBackend::new(10, 12)).expect("terminal");
+        terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
+
+        let cursor = terminal.get_cursor_position().expect("cursor position");
+        let buffer = terminal.backend().buffer();
+        let f_cell = (0..12u16)
+            .flat_map(|y| (0..10u16).map(move |x| (x, y)))
+            .find(|&(x, y)| buffer.cell((x, y)).expect("cell").symbol() == "f")
+            .expect("'f' should be rendered");
+        assert_eq!(
+            (cursor.x, cursor.y),
+            (f_cell.0 - 5, f_cell.1 + 1),
+            "caret starts the next visual row instead of covering 'f'"
+        );
+    }
+
+    #[test]
+    fn plan_rows_use_the_full_panel_width() {
+        // The plan panel draws only a top border, so a row of exactly
+        // panel-width cells (" ▸ " prefix + 21 chars on a 24-wide frame) must
+        // render untruncated. The old `width - 2` maths would ellipsize it.
+        let mut app = App::new("m", PermissionMode::Default);
+        let task = "ABCDEFGHIJKLMNOPQRSTU";
+        app.plan = vec![TodoItem {
+            content: task.to_string(),
+            active_form: task.to_string(),
+            status: TodoStatus::InProgress,
+        }];
+
+        let mut terminal = Terminal::new(TestBackend::new(24, 14)).expect("terminal");
+        terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
+        let rendered = format!("{}", terminal.backend());
+        assert!(
+            rendered.contains(task),
+            "an exactly-full-width plan row renders untruncated"
         );
     }
 
