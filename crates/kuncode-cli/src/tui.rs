@@ -397,8 +397,13 @@ fn handle_idle_key(app: &mut App, key: KeyEvent) -> Option<String> {
         }
         // Ctrl-chords the app doesn't bind must not leak their letter into the
         // buffer (Ctrl+K typing a literal 'k'). Shift/Alt still insert: many
-        // terminals report them alongside ordinary composed characters.
-        (m, KeyCode::Char(c)) if !m.contains(KeyModifiers::CONTROL) => {
+        // terminals report them alongside ordinary composed characters. And
+        // CONTROL+ALT passes through as well — Windows reports AltGr as
+        // LEFT_CTRL+RIGHT_ALT, so European layouts type @ { [ € with exactly
+        // that pairing; blocking it would make those chars unenterable.
+        (m, KeyCode::Char(c))
+            if !m.contains(KeyModifiers::CONTROL) || m.contains(KeyModifiers::ALT) =>
+        {
             app.insert_char(c);
             None
         }
@@ -505,6 +510,24 @@ mod tests {
             .is_none()
         );
         assert!(app.input.is_empty(), "Ctrl+K must not type a literal 'k'");
+    }
+
+    #[test]
+    fn altgr_composed_characters_still_insert() {
+        // Windows reports AltGr as CONTROL|ALT; the composed char must insert
+        // or European layouts lose @ { [ € entirely.
+        let mut app = App::new("m", PermissionMode::Default);
+        assert!(
+            handle_idle_key(
+                &mut app,
+                KeyEvent::new(
+                    KeyCode::Char('@'),
+                    KeyModifiers::CONTROL | KeyModifiers::ALT,
+                ),
+            )
+            .is_none()
+        );
+        assert_eq!(app.input, "@", "AltGr-composed '@' must be typed");
     }
 
     #[test]
