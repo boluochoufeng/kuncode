@@ -57,7 +57,9 @@ const MAX_DRAIN: Duration = Duration::from_millis(3000);
 /// Wraps the assembled runner pieces with the TUI's own observer + approver,
 /// then enters raw mode + the alternate screen via [`ratatui::init()`] (which also
 /// installs a panic hook that restores the terminal before unwinding) and
-/// guarantees [`ratatui::restore`] on every exit path.
+/// guarantees [`ratatui::restore`] on every exit path. Mouse capture and
+/// bracketed paste ride a [`TerminalFeatures`] guard so a panic can't leave
+/// them enabled in the user's shell.
 pub async fn run<M>(runtime: CliRuntime<M>) -> io::Result<()>
 where
     M: CompletionModel,
@@ -78,15 +80,7 @@ where
     let mut app = App::new(model_name, mode);
 
     let mut terminal = ratatui::init();
-    // Capture the mouse so the wheel scrolls the conversation instead of the
-    // terminal's own scrollback. Best-effort: a terminal that refuses it just
-    // loses wheel scrolling, and PageUp/PageDown still work.
-    if let Err(error) = execute!(io::stdout(), EnableMouseCapture) {
-        log_tui_io("enable_mouse_capture", &error, false);
-    }
-    if let Err(error) = execute!(io::stdout(), EnableBracketedPaste) {
-        log_tui_io("enable_bracketed_paste", &error, false);
-    }
+    let features = TerminalFeatures::enable();
     let result = event_loop(
         &mut terminal,
         &runner,
@@ -96,12 +90,7 @@ where
         &mut approval_rx,
     )
     .await;
-    if let Err(error) = execute!(io::stdout(), DisableBracketedPaste) {
-        log_tui_io("disable_bracketed_paste", &error, false);
-    }
-    if let Err(error) = execute!(io::stdout(), DisableMouseCapture) {
-        log_tui_io("disable_mouse_capture", &error, false);
-    }
+    drop(features);
     let restore_result = ratatui::try_restore();
     if let Err(error) = &restore_result {
         log_tui_io("restore_terminal", error, true);
@@ -109,6 +98,40 @@ where
     match (result, restore_result) {
         (Err(error), _) | (Ok(()), Err(error)) => Err(error),
         (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+/// RAII for the optional terminal features (mouse capture + bracketed paste):
+/// enabled on construction, disabled on drop, so *every* exit path restores
+/// them — including a panic unwinding through [`run`]. The ratatui panic hook
+/// only restores raw mode and the alternate screen; without this guard a panic
+/// would leave the shell emitting `ESC[200~` paste markers and mouse sequences.
+///
+/// Best-effort on both sides: a terminal that refuses mouse capture just loses
+/// wheel scrolling (PageUp/PageDown still work), and disable failures are
+/// logged rather than escalated because drop runs on the error path too.
+struct TerminalFeatures;
+
+impl TerminalFeatures {
+    fn enable() -> Self {
+        if let Err(error) = execute!(io::stdout(), EnableMouseCapture) {
+            log_tui_io("enable_mouse_capture", &error, false);
+        }
+        if let Err(error) = execute!(io::stdout(), EnableBracketedPaste) {
+            log_tui_io("enable_bracketed_paste", &error, false);
+        }
+        Self
+    }
+}
+
+impl Drop for TerminalFeatures {
+    fn drop(&mut self) {
+        if let Err(error) = execute!(io::stdout(), DisableBracketedPaste) {
+            log_tui_io("disable_bracketed_paste", &error, false);
+        }
+        if let Err(error) = execute!(io::stdout(), DisableMouseCapture) {
+            log_tui_io("disable_mouse_capture", &error, false);
+        }
     }
 }
 
