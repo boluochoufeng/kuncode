@@ -293,7 +293,7 @@ impl<M: CompletionModel> CliRuntime<M> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::settings::{ProjectSettings, load_project_settings_from};
+    use crate::settings::{ModelOverrides, ProjectSettings, load_project_settings_from};
     use std::fs;
 
     fn compaction_settings(tag: &str) -> ProjectSettings {
@@ -312,7 +312,8 @@ mod tests {
         )
         .expect("write settings");
         let settings =
-            load_project_settings_from(&dir, None, ProjectTrust::Untrusted).expect("load settings");
+            load_project_settings_from(&dir, ModelOverrides::default(), ProjectTrust::Untrusted)
+                .expect("load settings");
         let _ = fs::remove_dir_all(&dir);
         settings
     }
