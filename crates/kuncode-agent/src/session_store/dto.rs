@@ -72,9 +72,6 @@ enum StoredAssistantContent {
     Text {
         text: String,
     },
-    Refusal {
-        text: String,
-    },
     ToolCall {
         id: String,
         #[serde(skip_serializing_if = "Option::is_none")]

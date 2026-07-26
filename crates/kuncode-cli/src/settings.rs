@@ -9,7 +9,7 @@ use std::{num::NonZeroU32, path::Path};
 use kuncode_agent::{
     compaction::budget::{CompactionConfig, CompactionMode},
     permission::{CanonicalPath, PermissionMode, PolicyEffect, PolicyOrigin, PolicySet},
-    runner::{AgentCompactionConfig, AgentCompactionConfigError, AgentConfig},
+    runner::{AgentCompactionConfig, AgentCompactionConfigError},
 };
 use kuncode_core::providers::deepseek::{
     DEEPSEEK_V4_PRO_MODEL_ID, DeepSeekModelProfile, model_profile,
@@ -73,22 +73,15 @@ struct PermissionsSection {
     default_mode: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 struct ModelSection {
     provider: ProviderKind,
-    name: String,
+    /// Model identifier. Only DeepSeek has a built-in default; other providers
+    /// must name a model explicitly — silently sending the DeepSeek default
+    /// model id to a different provider would fail at the first request.
+    name: Option<String>,
     max_tokens: Option<u64>,
-}
-
-impl Default for ModelSection {
-    fn default() -> Self {
-        Self {
-            provider: ProviderKind::DeepSeek,
-            name: DEEPSEEK_V4_PRO_MODEL_ID.to_string(),
-            max_tokens: None,
-        }
-    }
 }
 
 /// Wire protocol selected for model requests.
@@ -196,8 +189,8 @@ pub struct ProjectSettings {
 
 impl Default for ProjectSettings {
     fn default() -> Self {
-        let max_tokens = model_profile(DEEPSEEK_V4_PRO_MODEL_ID).map_or_else(
-            default_agent_max_tokens,
+        let max_tokens = model_profile(DEEPSEEK_V4_PRO_MODEL_ID).map_or(
+            CONSERVATIVE_DEFAULT_MAX_TOKENS,
             DeepSeekModelProfile::default_max_tokens,
         );
         Self {
@@ -280,7 +273,18 @@ fn resolve_settings(
     root: &Path,
     trust: ProjectTrust,
 ) -> Result<ProjectSettings, SettingsError> {
-    let model_name = model_override.unwrap_or(&file.model.name).to_string();
+    let model_name = match (model_override, &file.model.name, file.model.provider) {
+        (Some(name), _, _) => name.to_string(),
+        (None, Some(name), _) => name.clone(),
+        (None, None, ProviderKind::DeepSeek) => DEEPSEEK_V4_PRO_MODEL_ID.to_string(),
+        // No cross-provider default exists: falling back to the DeepSeek model
+        // id would send it to the other provider and fail at the first request.
+        (None, None, ProviderKind::OpenAi) => {
+            return Err(SettingsError::Model(
+                "provider \"openai\" requires an explicit model name".to_string(),
+            ));
+        }
+    };
     if model_name.trim().is_empty() {
         return Err(SettingsError::Model(
             "model name must not be blank".to_string(),
@@ -292,8 +296,12 @@ fn resolve_settings(
         None
     };
     let max_tokens = file.model.max_tokens.unwrap_or_else(|| {
-        profile.map_or_else(
-            default_agent_max_tokens,
+        profile.map_or(
+            // No capability profile to consult (an unknown DeepSeek id or a
+            // non-DeepSeek provider): default conservatively — every current
+            // OpenAI model accepts 16k output, while the agent default of 32k
+            // exceeds several of them and 400s the first request.
+            CONSERVATIVE_DEFAULT_MAX_TOKENS,
             DeepSeekModelProfile::default_max_tokens,
         )
     });
@@ -467,9 +475,12 @@ fn normalized_log_level(level: &str) -> Option<&'static str> {
     }
 }
 
-fn default_agent_max_tokens() -> u64 {
-    AgentConfig::default().max_tokens.unwrap_or(32_768)
-}
+/// Output budget when no capability profile is available (unknown DeepSeek ids
+/// and every non-DeepSeek model). Deliberately below the agent's own default:
+/// several current OpenAI models cap output at 16k, and a budget the provider
+/// rejects fails every request outright — a smaller turn budget merely finishes
+/// a long answer over more turns.
+const CONSERVATIVE_DEFAULT_MAX_TOKENS: u64 = 16_384;
 
 fn push_rules(
     policy: &mut PolicySet,
@@ -604,6 +615,35 @@ mod tests {
         assert_eq!(loaded.provider, ProviderKind::OpenAi);
         assert_eq!(loaded.model_name, "gpt-test");
         assert_eq!(loaded.max_tokens, 8_192);
+    }
+
+    #[test]
+    fn openai_provider_without_a_model_name_is_an_error() {
+        // There is no cross-provider default: silently sending the DeepSeek
+        // default model id to api.openai.com would 404 on the first request.
+        let error = load_json("openai-unnamed", r#"{ "model": { "provider": "openai" } }"#)
+            .expect_err("provider openai must require an explicit model name");
+
+        assert!(matches!(error, SettingsError::Model(_)));
+    }
+
+    #[test]
+    fn non_builtin_model_defaults_to_a_conservative_output_budget() {
+        // No capability profile → 16k, not the 32k agent default that several
+        // OpenAI models reject outright.
+        let loaded = load_json(
+            "openai-budget",
+            r#"{ "model": { "provider": "openai", "name": "gpt-test" } }"#,
+        )
+        .expect("loads");
+        assert_eq!(loaded.max_tokens, CONSERVATIVE_DEFAULT_MAX_TOKENS);
+
+        let unknown_deepseek = load_json(
+            "deepseek-unknown-budget",
+            r#"{ "model": { "name": "deepseek-custom" } }"#,
+        )
+        .expect("loads");
+        assert_eq!(unknown_deepseek.max_tokens, CONSERVATIVE_DEFAULT_MAX_TOKENS);
     }
 
     #[test]

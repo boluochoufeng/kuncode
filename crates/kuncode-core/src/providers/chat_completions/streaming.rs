@@ -53,6 +53,9 @@ struct ChunkChoice {
 struct ChunkDelta {
     content: Option<String>,
     reasoning_content: Option<String>,
+    /// OpenAI's wire spelling for "the answer text is a decline". Folded into
+    /// ordinary text on ingest, matching the non-streaming projection; no other
+    /// Chat Completions provider populates it.
     refusal: Option<String>,
     tool_calls: Option<Vec<ToolCallDelta>>,
 }
@@ -139,7 +142,6 @@ struct PartialToolCall {
 struct StreamAssembler {
     text: String,
     reasoning: String,
-    refusal: String,
     tool_calls: Vec<PartialToolCall>,
     finish_reason: Option<String>,
     usage: Option<Usage>,
@@ -167,8 +169,8 @@ impl StreamAssembler {
                 events.push(StreamEvent::ReasoningDelta(reasoning));
             }
             if let Some(refusal) = choice.delta.refusal.filter(|s| !s.is_empty()) {
-                self.refusal.push_str(&refusal);
-                events.push(StreamEvent::RefusalDelta(refusal));
+                self.text.push_str(&refusal);
+                events.push(StreamEvent::TextDelta(refusal));
             }
             for delta in choice.delta.tool_calls.into_iter().flatten() {
                 self.ingest_tool_call(delta, &mut events);
@@ -252,9 +254,6 @@ impl StreamAssembler {
         if !self.reasoning.is_empty() {
             content.push(AssistantContent::reasoning(self.reasoning));
         }
-        if !self.refusal.is_empty() {
-            content.push(AssistantContent::refusal(self.refusal));
-        }
 
         let content = NonEmptyVec::try_from(content).map_err(|err| {
             CompletionError::ResponseError(format!("stream produced no assistant content: {err}"))
@@ -286,6 +285,27 @@ fn map_finish_reason(reason: Option<&str>) -> FinishReason {
         Some("tool_calls") => FinishReason::ToolCalls,
         Some("content_filter") => FinishReason::ContentFilter,
         Some(other) => FinishReason::Other(other.to_string()),
+    }
+}
+
+/// Rejects a 2xx streaming response whose body is not SSE (e.g. a proxy or
+/// gateway answering with an HTML or JSON page): fail with one clear error up
+/// front instead of letting the SSE decoder grind through a non-SSE body and
+/// report a confusing "no assistant content". A missing header passes — some
+/// proxies strip it, and the decoder handles genuine SSE fine without it.
+pub(crate) fn validate_stream_content_type(
+    content_type: Option<&str>,
+) -> Result<(), CompletionError> {
+    let Some(content_type) = content_type else {
+        return Ok(());
+    };
+    let media_type = content_type.split(';').next().unwrap_or_default().trim();
+    if media_type.eq_ignore_ascii_case("text/event-stream") {
+        Ok(())
+    } else {
+        Err(CompletionError::ResponseError(format!(
+            "expected an SSE response, but received `{media_type}`"
+        )))
     }
 }
 
@@ -446,7 +466,9 @@ data: [DONE]
     }
 
     #[test]
-    fn refusal_streams_and_is_preserved_in_completed_content() {
+    fn refusal_deltas_flatten_into_the_text_channel() {
+        // OpenAI streams refusals on a dedicated wire field; the assembler folds
+        // them into ordinary text so streaming and non-streaming agree.
         let sse = "\
 data: {\"choices\":[{\"delta\":{\"refusal\":\"Cannot \"}}]}
 
@@ -456,19 +478,19 @@ data: [DONE]
 
 ";
         let events = run(sse, 4096);
-        let refusal: String = events
+        let text: String = events
             .iter()
             .filter_map(|event| match event {
-                StreamEvent::RefusalDelta(text) => Some(text.clone()),
+                StreamEvent::TextDelta(text) => Some(text.clone()),
                 _ => None,
             })
             .collect();
-        assert_eq!(refusal, "Cannot comply");
+        assert_eq!(text, "Cannot comply");
 
         let (content, _) = completed(events);
         assert!(matches!(
             content.first(),
-            AssistantContent::Refusal(value) if value.text_ref() == "Cannot comply"
+            AssistantContent::Text(value) if value.text_ref() == "Cannot comply"
         ));
     }
 
@@ -568,6 +590,22 @@ data: {\"error\":{\"message\":\"rate limited\",\"type\":\"server_error\"}}
         assert!(matches!(
             error,
             Some(CompletionError::ResponseError(m)) if m.contains("rate limited")
+        ));
+    }
+
+    #[test]
+    fn stream_content_type_accepts_sse_and_absence_only() {
+        assert!(validate_stream_content_type(None).is_ok());
+        assert!(validate_stream_content_type(Some("text/event-stream")).is_ok());
+        assert!(validate_stream_content_type(Some("Text/Event-Stream; charset=utf-8")).is_ok());
+        // A proxy answering with a page instead of a stream fails up front.
+        assert!(matches!(
+            validate_stream_content_type(Some("text/html")),
+            Err(CompletionError::ResponseError(_))
+        ));
+        assert!(matches!(
+            validate_stream_content_type(Some("application/json")),
+            Err(CompletionError::ResponseError(_))
         ));
     }
 
