@@ -4,7 +4,7 @@ use serde::Serialize;
 use thiserror::Error;
 use url::Host;
 
-use crate::glob::{command_match, glob_match, normalize_pattern};
+use crate::glob::{command_match, glob_match};
 
 use super::{
     CanonicalPath, CommandKind, PermissionCauseId, PermissionCheck, PermissionTarget,
@@ -201,12 +201,16 @@ impl PathMatcher {
             }
             None => path.as_str(),
         };
-        let candidate = normalize_pattern(candidate);
-        glob_match(&normalize_pattern(&self.pattern), &candidate)
+        // Neither side is normalized here. The rule's own `\` folding happened
+        // once at compile time, and a canonical path keeps `\` as the ordinary
+        // file-name character it is on Unix — folding it now would let a rule
+        // written about `weird/name.rs` decide a different file named
+        // `weird\name.rs`.
+        glob_match(&self.pattern, candidate)
             || self
                 .nested_pattern
                 .as_ref()
-                .is_some_and(|pattern| glob_match(&normalize_pattern(pattern), &candidate))
+                .is_some_and(|pattern| glob_match(pattern, candidate))
     }
 }
 
@@ -577,6 +581,23 @@ mod permission_rule_tests {
         let allow = read_rule("Read(secrets/**)", PolicyEffect::Allow);
         assert!(allow.contribution(&top_level).is_some());
         assert!(allow.contribution(&nested).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_backslash_in_a_name_is_not_a_separator_to_a_rule() {
+        // Both files can exist side by side on Unix. Folding `\` into `/` at
+        // match time would let one rule decide both, and the permissive
+        // direction is where that actually hands something out.
+        let rule = read_rule("Read(weird/*)", PolicyEffect::Allow);
+        assert!(
+            rule.contribution(&read_check("/workspace/weird/name.rs"))
+                .is_some()
+        );
+        assert!(
+            rule.contribution(&read_check("/workspace/weird\\name.rs"))
+                .is_none()
+        );
     }
 
     #[test]

@@ -130,11 +130,12 @@ impl TypedTool for Glob {
                 .map_err(|error| ToolOutput::failure("invalid_arguments", error.to_string()))?;
             checks.push(PermissionCheckSpec::new(target));
         }
+        let summary = search_summary(&pattern, args.include_ignored);
         Ok(TypedPreparation::new(
             args,
             canonical_input,
             checks,
-            ToolDisplay::new("Search workspace paths"),
+            ToolDisplay::new(summary),
         ))
     }
 
@@ -190,6 +191,21 @@ impl TypedTool for Glob {
             output
         }
     }
+}
+
+/// Builds the approval-facing summary.
+///
+/// The pattern is named because the authorized target is only the directory the
+/// search cannot leave — "Search workspace paths" alone would leave an approver
+/// guessing what is being looked for inside it. `include_ignored` is named for
+/// the same reason `ls` names it: the bypass rides on a separate `ExactTool`
+/// check that reads as nothing in particular.
+fn search_summary(pattern: &str, include_ignored: bool) -> String {
+    let mut summary = format!("Search workspace paths: {pattern}");
+    if include_ignored {
+        summary.push_str(" (including ignored and hidden entries)");
+    }
+    summary
 }
 
 /// Returns the leading wildcard-free segments of a pattern: the directory the
@@ -429,6 +445,27 @@ mod tests {
             };
             assert_eq!(path.as_str(), expected, "{pattern}");
         }
+    }
+
+    #[tokio::test]
+    async fn approval_summary_names_the_pattern_and_the_escape_hatch() {
+        let tmp = TestDir::new();
+        let preparation = Tool::prepare(
+            Arc::new(Glob::new(tmp.workspace().await)),
+            serde_json::json!({ "pattern": "src/**/*.rs", "include_ignored": true }),
+            &PreparationContext::new(),
+        )
+        .await
+        .expect("glob preparation succeeds");
+
+        // The authorized target is only the directory the search cannot leave,
+        // so what is being looked for inside it has to come from the summary.
+        let summary = preparation.display().summary();
+        assert!(summary.contains("src/**/*.rs"), "summary was: {summary}");
+        assert!(
+            summary.contains("ignored and hidden"),
+            "summary was: {summary}"
+        );
     }
 
     #[tokio::test]
