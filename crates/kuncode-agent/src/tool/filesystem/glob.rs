@@ -1,17 +1,14 @@
 //! The `glob` tool: list workspace paths matching a glob pattern.
 
-use std::{
-    ffi::OsStr,
-    path::{Component, Path},
-};
+use std::path::{Component, Path};
 
 use async_trait::async_trait;
-use ignore::WalkBuilder;
 use kuncode_core::completion::ToolDefinition;
 use kuncode_core::non_empty_vec::NonEmptyVec;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use super::helpers::{SymlinkTarget, symlink_target, workspace_walk_builder};
 use crate::{
     glob::{glob_match, normalize_pattern},
     permission::{
@@ -198,34 +195,18 @@ fn validate_glob_pattern(pattern: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Walks the workspace with ripgrep's `ignore` crate, returning every entry as
-/// a workspace-relative, slash-separated path.
+/// Walks the whole workspace, returning every entry as a workspace-relative,
+/// slash-separated path.
 ///
-/// Which paths are "noise" is delegated to the project itself rather than a
-/// hardcoded name list: by default `.gitignore` / `.ignore` / `.git/info/exclude`
-/// inside the workspace are honored and hidden dotfiles are skipped. The VCS
-/// store (`.git`) is never traversed. Ignore files *above* the workspace and
-/// the user's global gitignore are deliberately not consulted, so behavior is
-/// reproducible and scoped to the workspace.
+/// Ignore handling and the `.git` skip come from
+/// [`workspace_walk_builder`](super::helpers::workspace_walk_builder).
 ///
 /// Synchronous and thread-based; callers run it on the blocking pool.
 fn walk_workspace(workspace: &Workspace, include_ignored: bool) -> Vec<String> {
     let root = workspace.root();
-    let enabled = !include_ignored;
-
-    let mut builder = WalkBuilder::new(root);
-    builder
-        .hidden(enabled)
-        .git_ignore(enabled)
-        .git_exclude(enabled)
-        .ignore(enabled)
-        .git_global(false)
-        .parents(false)
-        .require_git(false)
-        .filter_entry(|entry| entry.file_name() != OsStr::new(".git"));
 
     let mut entries = Vec::new();
-    for result in builder.build() {
+    for result in workspace_walk_builder(workspace, root, include_ignored).build() {
         // Skip unreadable entries (permissions, races) rather than aborting the
         // whole search, matching ripgrep's resilience.
         let Ok(entry) = result else { continue };
@@ -234,15 +215,13 @@ fn walk_workspace(workspace: &Workspace, include_ignored: bool) -> Vec<String> {
             continue;
         }
 
-        // Symlinks are listed but not followed. Only advertise a link whose
-        // target stays inside the workspace, so glob's visible set matches what
-        // `read_file`/`write_file` will actually act on; escaping and dangling
-        // links are dropped. The `canonicalize` cost lands only on links, which
-        // are rare, and we are already on the blocking pool.
+        // A search advertises only links it could actually hand to
+        // `read_file`/`write_file`, so anything that does not resolve inside the
+        // workspace — escaping or dangling — is dropped.
         if entry
             .file_type()
             .is_some_and(|file_type| file_type.is_symlink())
-            && !std::fs::canonicalize(path).is_ok_and(|target| target.starts_with(root))
+            && symlink_target(path, workspace) != SymlinkTarget::Inside
         {
             continue;
         }

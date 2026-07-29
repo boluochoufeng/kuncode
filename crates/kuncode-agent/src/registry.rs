@@ -19,7 +19,7 @@ use crate::{
     tool::{
         Tool,
         bash::Bash,
-        filesystem::{EditFile, Glob, ReadFile, WriteFile},
+        filesystem::{EditFile, Glob, Ls, ReadFile, WriteFile},
         todo_write::TodoWrite,
     },
     workspace::Workspace,
@@ -149,7 +149,7 @@ impl ToolRegistry {
             .constrain_paths_to(workspace_root.clone())?,
         )?;
         self.register_with_profile(
-            Glob::new(workspace),
+            Glob::new(workspace.clone()),
             ToolPermissionProfile::new(
                 "glob",
                 [
@@ -161,7 +161,7 @@ impl ToolRegistry {
                 ],
                 true,
             )?
-            .constrain_paths_to(workspace_root)?,
+            .constrain_paths_to(workspace_root.clone())?,
         )?;
         self.register_with_profile(
             TodoWrite::new(),
@@ -170,6 +170,24 @@ impl ToolRegistry {
                 [(PermissionNamespace::TodoWrite, ProfileDefault::Allow)],
                 false,
             )?,
+        )?;
+        // Appended after `todo_write` rather than grouped with the other file
+        // tools: the definition list is a provider cache prefix, so a new tool
+        // goes at the end instead of shifting the tools already there.
+        self.register_with_profile(
+            Ls::new(workspace),
+            ToolPermissionProfile::new(
+                "ls",
+                [
+                    (PermissionNamespace::Read, ProfileDefault::Allow),
+                    (
+                        PermissionNamespace::ExactTool,
+                        ProfileDefault::RequireApproval,
+                    ),
+                ],
+                true,
+            )?
+            .constrain_paths_to(workspace_root)?,
         )?;
         Ok(())
     }
@@ -442,7 +460,8 @@ mod tests {
                 "write_file",
                 "edit_file",
                 "glob",
-                "todo_write"
+                "todo_write",
+                "ls"
             ]
         );
     }

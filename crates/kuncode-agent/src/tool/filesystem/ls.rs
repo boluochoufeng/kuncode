@@ -1,0 +1,788 @@
+//! The `ls` tool: list the entries of one workspace directory.
+
+use std::path::{Path, PathBuf};
+
+use async_trait::async_trait;
+use kuncode_core::completion::ToolDefinition;
+use kuncode_core::non_empty_vec::NonEmptyVec;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+use super::helpers::{
+    SymlinkTarget, io_error, is_inside_vcs_store, non_empty_path, symlink_target, workspace_error,
+    workspace_walk_builder,
+};
+use crate::{
+    permission::{
+        CanonicalPath, CanonicalToolInput, PathSelector, PermissionCheckSpec, PermissionTarget,
+        ToolDisplay,
+    },
+    tool::{
+        PreparationContext, PreparedInvocationState, ToolContext, ToolError, ToolOutput,
+        TypedPreparation, TypedTool, definition_for,
+    },
+    workspace::Workspace,
+};
+
+/// Context-safety cap on returned entries.
+///
+/// Deliberately a constant rather than an argument: there is no offset to
+/// resume from, so a caller-supplied limit could only shrink the answer, never
+/// reach the rest of it. [`LsOutput::total_entries`] is what a caller acts on
+/// instead — it reports how much was left out, so a truncated listing can be
+/// narrowed (list a subdirectory) or handed to `glob` with a pattern.
+const LS_ENTRY_CAP: usize = 200;
+
+/// Arguments accepted by the [`Ls`] tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct LsArgs {
+    /// Workspace-relative or absolute directory path. Defaults to the workspace
+    /// root.
+    #[serde(default)]
+    path: Option<String>,
+    /// Walk nested directories instead of listing a single level. Names are then
+    /// relative to the listed directory. Defaults to `false`.
+    #[serde(default)]
+    recursive: bool,
+    /// Also list entries hidden or excluded by `.gitignore`. The VCS store
+    /// (`.git`) is never listed and cannot be listed directly. Defaults to
+    /// `false`.
+    #[serde(default)]
+    include_ignored: bool,
+}
+
+/// Kind of one listed filesystem entry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LsEntryKind {
+    /// A directory. Descended into only when `recursive` is set.
+    Directory,
+    /// A regular file.
+    File,
+    /// A symbolic link, never followed. Links resolving outside the workspace
+    /// are omitted from the listing entirely, since the file tools refuse to
+    /// act on them; a link that resolves nowhere (dangling, a cycle) is still
+    /// listed, because its absence would read as "no such entry" and `ls` is
+    /// the tool used to diagnose exactly that.
+    Symlink,
+}
+
+/// One entry of a listed directory.
+#[derive(Debug, Serialize)]
+pub struct LsEntry {
+    /// Entry name, or the slash-separated path relative to the listed directory
+    /// when the listing is recursive.
+    pub name: String,
+    /// What the entry is.
+    pub kind: LsEntryKind,
+    /// Size in bytes of a regular file, omitted whenever metadata is
+    /// unreadable. Also omitted for directories, and for symlinks — where the
+    /// only cheap answer is the length of the link itself, which a reader would
+    /// almost certainly mistake for the size of its target.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+}
+
+/// Entries found under one workspace directory.
+#[derive(Debug, Serialize)]
+pub struct LsOutput {
+    /// Directory listed, shown relative to the workspace when possible.
+    pub path: String,
+    /// Matching entries sorted by name, capped for context safety.
+    pub entries: Vec<LsEntry>,
+    /// Total entries found before the cap was applied. Compare against
+    /// [`Self::entries`] to see how much the listing left out.
+    pub total_entries: usize,
+}
+
+/// Canonical directory paired with validated listing arguments.
+#[derive(Debug)]
+pub struct PreparedLs {
+    path: PathBuf,
+    display_path: String,
+    recursive: bool,
+    include_ignored: bool,
+}
+
+/// Lists workspace directories.
+#[derive(Clone, Debug)]
+pub struct Ls {
+    definition: ToolDefinition,
+    workspace: Workspace,
+}
+
+impl Ls {
+    /// Creates a directory listing tool bound to a workspace.
+    pub fn new(workspace: Workspace) -> Self {
+        Self {
+            definition: definition_for::<LsArgs>("ls", "List the entries of a workspace directory"),
+            workspace,
+        }
+    }
+}
+
+#[async_trait]
+impl TypedTool for Ls {
+    type Args = LsArgs;
+    type Prepared = PreparedLs;
+    type Output = LsOutput;
+
+    fn definition(&self) -> &ToolDefinition {
+        &self.definition
+    }
+
+    async fn prepare_typed(
+        &self,
+        args: LsArgs,
+        _canonical_input: CanonicalToolInput,
+        _ctx: &PreparationContext,
+    ) -> Result<TypedPreparation<Self::Prepared>, ToolOutput> {
+        let path = non_empty_path(args.path.as_deref().unwrap_or("."))?;
+        let resolved = self
+            .workspace
+            .resolve_target(path)
+            .await
+            .map_err(workspace_error)?;
+
+        // The walk filter drops `.git` entries but never the walk root itself,
+        // so without this a listing rooted inside the VCS store would enumerate
+        // it — the one thing every tool here promises never to traverse.
+        if is_inside_vcs_store(&self.workspace, &resolved) {
+            return Err(ToolOutput::failure(
+                "invalid_arguments",
+                "`.git` and its contents are not listable",
+            ));
+        }
+
+        let canonical_path = CanonicalPath::from_absolute(&resolved)
+            .map_err(|error| ToolOutput::failure("invalid_arguments", error.to_string()))?;
+        let display_path = self.workspace.relative_display(&resolved);
+        let canonical_input = CanonicalToolInput::new(serde_json::json!({
+            "path": canonical_path.as_str(),
+            "recursive": args.recursive,
+            "include_ignored": args.include_ignored,
+        }));
+        // The directory itself is the resource being read; its entries are
+        // metadata, so one Read check covers both listing modes.
+        let mut checks = NonEmptyVec::new(PermissionCheckSpec::new(PermissionTarget::Read(
+            PathSelector::exact(canonical_path),
+        )));
+        // Reaching past the project's own ignore rules can surface files it
+        // deliberately keeps out of sight (`.env`, credentials), so the escape
+        // hatch is authorized separately from the directory read.
+        if args.include_ignored {
+            let target = PermissionTarget::exact_tool("ls")
+                .map_err(|error| ToolOutput::failure("invalid_arguments", error.to_string()))?;
+            checks.push(PermissionCheckSpec::new(target));
+        }
+        Ok(TypedPreparation::new(
+            PreparedLs {
+                path: resolved,
+                display_path: display_path.clone(),
+                recursive: args.recursive,
+                include_ignored: args.include_ignored,
+            },
+            canonical_input,
+            checks,
+            ToolDisplay::new(listing_summary(
+                &display_path,
+                args.recursive,
+                args.include_ignored,
+            )),
+        ))
+    }
+
+    async fn run_prepared(&self, prepared: PreparedLs, _ctx: &ToolContext) -> ToolOutput<LsOutput> {
+        let PreparedLs {
+            path,
+            display_path,
+            recursive,
+            include_ignored,
+        } = prepared;
+
+        // Existence and type are diagnosed here rather than during preparation,
+        // so an unauthorized path cannot reveal metadata by failing early.
+        match tokio::fs::metadata(&path).await {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                return ToolOutput::failure(
+                    "not_a_directory",
+                    format!("`{display_path}` is not a directory"),
+                );
+            }
+            Err(err) => return io_error("list", &path, err, &self.workspace),
+        }
+
+        // A directory can be stat-able yet unopenable (mode 0700 owned by
+        // another user). The walker reports that as a per-entry error, which the
+        // walk loop skips like any other unreadable entry — leaving a result
+        // byte-for-byte identical to a genuinely empty directory. Opening it
+        // here turns that silence into a diagnostic.
+        if let Err(err) = tokio::fs::read_dir(&path).await {
+            return io_error("list", &path, err, &self.workspace);
+        }
+
+        // The `ignore` walker is synchronous and thread-based, so the walk runs
+        // on the blocking pool to keep the async runtime free.
+        let workspace = self.workspace.clone();
+        let directory = path.clone();
+        let (entries, total_entries) = match tokio::task::spawn_blocking(move || {
+            walk_directory(&workspace, &directory, recursive, include_ignored)
+        })
+        .await
+        {
+            Ok(listing) => listing,
+            Err(err) => {
+                return ToolOutput::failure(
+                    "internal",
+                    format!("directory walk did not complete: {err}"),
+                );
+            }
+        };
+
+        let truncated = total_entries > entries.len();
+        let output = ToolOutput::success(LsOutput {
+            path: display_path,
+            entries,
+            total_entries,
+        });
+
+        if truncated {
+            output.truncated()
+        } else {
+            output
+        }
+    }
+
+    async fn revalidate_prepared(
+        &self,
+        prepared: &mut PreparedLs,
+        _ctx: &ToolContext,
+    ) -> Result<PreparedInvocationState, ToolError> {
+        Ok(
+            if self
+                .workspace
+                .revalidate_target(&prepared.path)
+                .await
+                .is_ok()
+            {
+                PreparedInvocationState::Current
+            } else {
+                // Re-preparation produces the model-safe path diagnostic against
+                // current metadata without executing the stale payload.
+                PreparedInvocationState::Stale
+            },
+        )
+    }
+}
+
+/// Collects the entries under `directory`, one level deep unless `recursive`,
+/// returning the capped listing together with the total found.
+///
+/// The walk is rooted at `directory` rather than at the workspace root, so an
+/// explicit listing of a hidden or ignored directory (`ls target`) still
+/// returns its contents; [`workspace_walk_builder`] supplies the ignore rules
+/// declared above `directory` separately, so everything *inside* stays filtered
+/// exactly as it would be when seen from the workspace root.
+///
+/// Synchronous and thread-based; callers run it on the blocking pool.
+fn walk_directory(
+    workspace: &Workspace,
+    directory: &Path,
+    recursive: bool,
+    include_ignored: bool,
+) -> (Vec<LsEntry>, usize) {
+    let mut builder = workspace_walk_builder(workspace, directory, include_ignored);
+    if !recursive {
+        builder.max_depth(Some(1));
+    }
+
+    let mut walked = Vec::new();
+    for result in builder.build() {
+        // Skip unreadable entries (permissions, races) rather than aborting the
+        // whole listing, matching ripgrep's resilience. The root's own error is
+        // not among them: the caller opens `directory` before walking it.
+        let Ok(entry) = result else { continue };
+        let path = entry.path();
+        if path == directory {
+            continue;
+        }
+        let Some(file_type) = entry.file_type() else {
+            continue;
+        };
+
+        let kind = if file_type.is_dir() {
+            LsEntryKind::Directory
+        } else if file_type.is_symlink() {
+            // Only a link that resolves *outside* is dropped; see
+            // [`LsEntryKind::Symlink`] for why a dangling one is kept.
+            if symlink_target(path, workspace) == SymlinkTarget::Outside {
+                continue;
+            }
+            LsEntryKind::Symlink
+        } else {
+            LsEntryKind::File
+        };
+
+        walked.push((relative_slash(directory, path), kind, path.to_path_buf()));
+    }
+
+    walked.sort_by(|left, right| left.0.cmp(&right.0));
+    let total = walked.len();
+    walked.truncate(LS_ENTRY_CAP);
+
+    // `stat` runs only on entries that survive the cap: `DirEntry::metadata` is
+    // an uncached syscall per entry on Unix, and a recursive walk discards
+    // nearly all of them.
+    let entries = walked
+        .into_iter()
+        .map(|(name, kind, path)| LsEntry {
+            name,
+            size: match kind {
+                LsEntryKind::File => std::fs::metadata(&path).ok().map(|meta| meta.len()),
+                LsEntryKind::Directory | LsEntryKind::Symlink => None,
+            },
+            kind,
+        })
+        .collect();
+
+    (entries, total)
+}
+
+/// Builds the approval-facing summary.
+///
+/// Both flags are named: the escape hatch is authorized through a separate
+/// `ExactTool` check, and an approver shown only "List directory: src" would be
+/// granting the ignore/hidden bypass — persistently, if they choose "always" —
+/// without ever seeing it.
+fn listing_summary(display_path: &str, recursive: bool, include_ignored: bool) -> String {
+    let mut summary = format!("List directory: {display_path}");
+    if recursive {
+        summary.push_str(" (recursive)");
+    }
+    if include_ignored {
+        summary.push_str(" (including ignored and hidden entries)");
+    }
+    summary
+}
+
+fn relative_slash(directory: &Path, path: &Path) -> String {
+    path.strip_prefix(directory)
+        .unwrap_or(path)
+        .display()
+        .to_string()
+        .replace('\\', "/")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, sync::Arc};
+
+    use super::{LS_ENTRY_CAP, Ls};
+    use crate::test_support::TestDir;
+    use crate::{
+        permission::PermissionNamespace,
+        tool::{PreparationContext, Tool, ToolContext, ToolOutput, execute_for_test},
+    };
+
+    async fn call(tool: Ls, args: serde_json::Value) -> ToolOutput {
+        execute_for_test(Arc::new(tool), args, &ToolContext::new())
+            .await
+            .expect("no harness-level error")
+    }
+
+    #[tokio::test]
+    async fn ls_lists_one_level_with_kinds_and_sizes() {
+        let tmp = TestDir::new();
+        fs::create_dir_all(tmp.path().join("src/bin")).expect("directory should be created");
+        fs::write(tmp.path().join("src/lib.rs"), "pub fn ok() {}").expect("file should be written");
+        fs::write(tmp.path().join("src/bin/main.rs"), "").expect("file should be written");
+        let tool = Ls::new(tmp.workspace().await);
+
+        let output = call(tool, serde_json::json!({ "path": "src" })).await;
+
+        assert!(output.ok);
+        let data = output.data.expect("data present");
+        assert_eq!(data["path"], "src");
+        assert_eq!(
+            data["entries"],
+            serde_json::json!([
+                { "name": "bin", "kind": "directory" },
+                { "name": "lib.rs", "kind": "file", "size": 14 },
+            ])
+        );
+        assert_eq!(data["total_entries"], 2);
+    }
+
+    #[tokio::test]
+    async fn ls_defaults_to_the_workspace_root() {
+        let tmp = TestDir::new();
+        fs::write(tmp.path().join("README.md"), "").expect("file should be written");
+        let tool = Ls::new(tmp.workspace().await);
+
+        let output = call(tool, serde_json::json!({})).await;
+
+        assert!(output.ok);
+        let data = output.data.expect("data present");
+        assert_eq!(data["path"], ".");
+        assert_eq!(data["entries"][0]["name"], "README.md");
+    }
+
+    #[tokio::test]
+    async fn ls_recursive_returns_paths_relative_to_the_listed_directory() {
+        let tmp = TestDir::new();
+        fs::create_dir_all(tmp.path().join("src/bin")).expect("directory should be created");
+        fs::write(tmp.path().join("src/bin/main.rs"), "").expect("file should be written");
+        fs::write(tmp.path().join("README.md"), "").expect("file should be written");
+        let tool = Ls::new(tmp.workspace().await);
+
+        let output = call(
+            tool,
+            serde_json::json!({ "path": "src", "recursive": true }),
+        )
+        .await;
+
+        assert!(output.ok);
+        let data = output.data.expect("data present");
+        let names = data["entries"]
+            .as_array()
+            .expect("entries is an array")
+            .iter()
+            .map(|entry| entry["name"].as_str().expect("name is a string"))
+            .collect::<Vec<_>>();
+        // Nested paths are joined with `/` and the sibling outside `src` is not
+        // reachable from this listing.
+        assert_eq!(names, ["bin", "bin/main.rs"]);
+    }
+
+    #[tokio::test]
+    async fn ls_hides_ignored_and_hidden_entries_by_default() {
+        let tmp = TestDir::new();
+        fs::write(tmp.path().join(".gitignore"), "build/\n").expect("gitignore should be written");
+        fs::create_dir_all(tmp.path().join("build")).expect("directory should be created");
+        fs::write(tmp.path().join("build/out.rs"), "").expect("file should be written");
+        fs::write(tmp.path().join("keep.rs"), "").expect("file should be written");
+        let tool = Ls::new(tmp.workspace().await);
+
+        let output = call(tool, serde_json::json!({})).await;
+
+        assert!(output.ok);
+        let data = output.data.expect("data present");
+        // `build/` is ignored by the project and `.gitignore` itself is hidden.
+        assert_eq!(
+            data["entries"],
+            serde_json::json!([{ "name": "keep.rs", "kind": "file", "size": 0 }])
+        );
+    }
+
+    #[tokio::test]
+    async fn ls_include_ignored_surfaces_ignored_and_hidden_entries() {
+        let tmp = TestDir::new();
+        fs::write(tmp.path().join(".gitignore"), "build/\n").expect("gitignore should be written");
+        fs::create_dir_all(tmp.path().join("build")).expect("directory should be created");
+        fs::write(tmp.path().join("keep.rs"), "").expect("file should be written");
+        let tool = Ls::new(tmp.workspace().await);
+
+        let output = call(tool, serde_json::json!({ "include_ignored": true })).await;
+
+        assert!(output.ok);
+        let data = output.data.expect("data present");
+        let names = data["entries"]
+            .as_array()
+            .expect("entries is an array")
+            .iter()
+            .map(|entry| entry["name"].as_str().expect("name is a string"))
+            .collect::<Vec<_>>();
+        assert_eq!(names, [".gitignore", "build", "keep.rs"]);
+    }
+
+    #[tokio::test]
+    async fn ls_lists_an_explicitly_named_ignored_directory() {
+        let tmp = TestDir::new();
+        fs::write(tmp.path().join(".gitignore"), "build/\n").expect("gitignore should be written");
+        fs::create_dir_all(tmp.path().join("build")).expect("directory should be created");
+        fs::write(tmp.path().join("build/out.rs"), "").expect("file should be written");
+        let tool = Ls::new(tmp.workspace().await);
+
+        let output = call(tool, serde_json::json!({ "path": "build" })).await;
+
+        // Asking for an ignored directory by name is an explicit request, so the
+        // listing is rooted there and its contents are returned.
+        assert!(output.ok);
+        let data = output.data.expect("data present");
+        assert_eq!(data["entries"][0]["name"], "out.rs");
+    }
+
+    #[tokio::test]
+    async fn ls_refuses_to_list_the_vcs_store() {
+        let tmp = TestDir::new();
+        fs::create_dir_all(tmp.path().join(".git/refs/heads"))
+            .expect("directory should be created");
+        fs::write(tmp.path().join(".git/HEAD"), "ref: refs/heads/main")
+            .expect("file should be written");
+        let workspace = tmp.workspace().await;
+
+        // The walker never applies its `.git` filter to its own root, so naming
+        // the store directly would otherwise enumerate it.
+        for path in [".git", ".git/refs"] {
+            let output = call(
+                Ls::new(workspace.clone()),
+                serde_json::json!({ "path": path }),
+            )
+            .await;
+
+            assert!(!output.ok, "listing `{path}` must be refused");
+            assert_eq!(
+                output.error.expect("error present").kind.as_str(),
+                "invalid_arguments"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ls_applies_ignore_rules_declared_above_the_listed_directory() {
+        let tmp = TestDir::new();
+        fs::write(tmp.path().join(".gitignore"), "*.key\nsrc/generated/\n")
+            .expect("gitignore should be written");
+        fs::create_dir_all(tmp.path().join("src/generated")).expect("directory should be created");
+        fs::write(tmp.path().join("src/lib.rs"), "").expect("file should be written");
+        fs::write(tmp.path().join("src/api.key"), "").expect("file should be written");
+        fs::write(tmp.path().join("src/generated/out.rs"), "").expect("file should be written");
+        let workspace = tmp.workspace().await;
+
+        let output = call(
+            Ls::new(workspace.clone()),
+            serde_json::json!({ "path": "src", "recursive": true }),
+        )
+        .await;
+
+        assert!(output.ok);
+        let data = output.data.expect("data present");
+        // Rooting the walk at `src` must not escape the rules the project
+        // declares at its root — that is what `include_ignored` is gated for.
+        assert_eq!(
+            data["entries"],
+            serde_json::json!([{ "name": "lib.rs", "kind": "file", "size": 0 }])
+        );
+
+        let escaped = call(
+            Ls::new(workspace),
+            serde_json::json!({ "path": "src", "recursive": true, "include_ignored": true }),
+        )
+        .await;
+
+        let data = escaped.data.expect("data present");
+        let names = data["entries"]
+            .as_array()
+            .expect("entries is an array")
+            .iter()
+            .map(|entry| entry["name"].as_str().expect("name is a string"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            ["api.key", "generated", "generated/out.rs", "lib.rs"]
+        );
+    }
+
+    #[tokio::test]
+    async fn ls_always_skips_the_git_directory() {
+        let tmp = TestDir::new();
+        fs::create_dir_all(tmp.path().join(".git")).expect("directory should be created");
+        fs::write(tmp.path().join(".git/packed.rs"), "").expect("file should be written");
+        fs::write(tmp.path().join("keep.rs"), "").expect("file should be written");
+        let tool = Ls::new(tmp.workspace().await);
+
+        // Even with `include_ignored`, the VCS store must never be traversed.
+        let output = call(tool, serde_json::json!({ "include_ignored": true })).await;
+
+        assert!(output.ok);
+        let data = output.data.expect("data present");
+        assert_eq!(
+            data["entries"],
+            serde_json::json!([{ "name": "keep.rs", "kind": "file", "size": 0 }])
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ls_drops_escaping_symlinks_but_keeps_internal_ones() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TestDir::new();
+        let outside = tmp
+            .path()
+            .parent()
+            .expect("temp root has parent")
+            .join(format!("kuncode-ls-outside-{}.rs", std::process::id()));
+        fs::write(&outside, "").expect("outside file should be written");
+        fs::write(tmp.path().join("keep.rs"), "").expect("file should be written");
+        symlink(&outside, tmp.path().join("escape_link.rs")).expect("symlink should be created");
+        symlink(
+            tmp.path().join("keep.rs"),
+            tmp.path().join("inside_link.rs"),
+        )
+        .expect("symlink should be created");
+        let tool = Ls::new(tmp.workspace().await);
+
+        let output = call(tool, serde_json::json!({})).await;
+
+        let _ = fs::remove_file(outside);
+        assert!(output.ok);
+        let data = output.data.expect("data present");
+        let entries = data["entries"].as_array().expect("entries is an array");
+        // The escaping link is dropped; the internal one stays, matching the set
+        // `read_file` would actually allow.
+        let names = entries
+            .iter()
+            .map(|entry| entry["name"].as_str().expect("name is a string"))
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["inside_link.rs", "keep.rs"]);
+        assert_eq!(entries[0]["kind"], "symlink");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ls_keeps_a_dangling_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TestDir::new();
+        symlink(tmp.path().join("gone.toml"), tmp.path().join("config.toml"))
+            .expect("symlink should be created");
+        let tool = Ls::new(tmp.workspace().await);
+
+        let output = call(tool, serde_json::json!({})).await;
+
+        assert!(output.ok);
+        let data = output.data.expect("data present");
+        // A link that resolves nowhere cannot escape the workspace either, and
+        // dropping it would answer "no such entry" to the very question `ls` is
+        // used to settle.
+        assert_eq!(
+            data["entries"],
+            serde_json::json!([{ "name": "config.toml", "kind": "symlink" }])
+        );
+        assert_eq!(data["total_entries"], 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ls_reports_an_unreadable_directory_instead_of_an_empty_one() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TestDir::new();
+        let locked = tmp.path().join("locked");
+        fs::create_dir(&locked).expect("directory should be created");
+        fs::write(locked.join("secret.rs"), "").expect("file should be written");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000))
+            .expect("permissions should be set");
+        // Running as root defeats the mode bits, and this test is about what the
+        // kernel refuses, not about what the tool computes.
+        let enforced = fs::read_dir(&locked).is_err();
+        let tool = Ls::new(tmp.workspace().await);
+
+        let output = call(tool, serde_json::json!({ "path": "locked" })).await;
+
+        let _ = fs::set_permissions(&locked, fs::Permissions::from_mode(0o700));
+        if !enforced {
+            return;
+        }
+        // An empty success here is indistinguishable from a genuinely empty
+        // directory, and reads as "this module has nothing in it".
+        assert!(!output.ok);
+        assert_eq!(output.error.expect("error present").kind.as_str(), "list");
+    }
+
+    #[tokio::test]
+    async fn approval_summary_names_the_escape_hatch() {
+        let tmp = TestDir::new();
+        let preparation = Tool::prepare(
+            Arc::new(Ls::new(tmp.workspace().await)),
+            serde_json::json!({ "recursive": true, "include_ignored": true }),
+            &PreparationContext::new(),
+        )
+        .await
+        .expect("ls preparation succeeds");
+
+        // The summary is the only free text an approver sees; granting the
+        // bypass must not look like an ordinary listing.
+        let summary = preparation.display().summary();
+        assert!(summary.contains("recursive"), "summary was: {summary}");
+        assert!(
+            summary.contains("ignored and hidden"),
+            "summary was: {summary}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ls_caps_entries_but_still_reports_the_total() {
+        let tmp = TestDir::new();
+        let total = LS_ENTRY_CAP + 3;
+        for index in 0..total {
+            fs::write(tmp.path().join(format!("file{index:04}.rs")), "")
+                .expect("file should be written");
+        }
+        let tool = Ls::new(tmp.workspace().await);
+
+        let output = call(tool, serde_json::json!({})).await;
+
+        assert!(output.ok);
+        assert!(output.truncated);
+        let data = output.data.expect("data present");
+        // What was left out stays visible through the total, which is how a
+        // caller decides to narrow the listing.
+        assert_eq!(
+            data["entries"].as_array().expect("array").len(),
+            LS_ENTRY_CAP
+        );
+        assert_eq!(data["total_entries"], total);
+    }
+
+    #[tokio::test]
+    async fn ls_rejects_a_file_target() {
+        let tmp = TestDir::new();
+        fs::write(tmp.path().join("notes.md"), "").expect("file should be written");
+        let tool = Ls::new(tmp.workspace().await);
+
+        let output = call(tool, serde_json::json!({ "path": "notes.md" })).await;
+
+        assert!(!output.ok);
+        assert_eq!(
+            output.error.expect("error present").kind.as_str(),
+            "not_a_directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn ls_rejects_paths_that_escape_the_workspace() {
+        let tmp = TestDir::new();
+        let tool = Ls::new(tmp.workspace().await);
+
+        let output = call(tool, serde_json::json!({ "path": ".." })).await;
+
+        assert!(!output.ok);
+        assert_eq!(
+            output.error.expect("error present").kind.as_str(),
+            "workspace_path"
+        );
+    }
+
+    #[tokio::test]
+    async fn include_ignored_adds_a_separate_approval_check() {
+        let tmp = TestDir::new();
+        let preparation = Tool::prepare(
+            Arc::new(Ls::new(tmp.workspace().await)),
+            serde_json::json!({ "include_ignored": true }),
+            &PreparationContext::new(),
+        )
+        .await
+        .expect("ls preparation succeeds");
+
+        assert_eq!(preparation.checks().len(), 2);
+        assert!(
+            preparation
+                .checks()
+                .iter()
+                .any(|check| check.target().namespace() == PermissionNamespace::ExactTool)
+        );
+    }
+}
