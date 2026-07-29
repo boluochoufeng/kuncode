@@ -162,11 +162,25 @@ impl TypedTool for Ls {
             "recursive": args.recursive,
             "include_ignored": args.include_ignored,
         }));
-        // The directory itself is the resource being read; its entries are
-        // metadata, so one Read check covers both listing modes.
+        // Two Read checks, because the two selector kinds reach different rules:
+        // an exact path is glob-matched against rule patterns, while a pattern
+        // selector is compared by equality. Naming only the directory would let
+        // `deny: [Read(secrets/**)]` pass a listing of `secrets` — the disclosure
+        // that rule exists to prevent.
         let mut checks = NonEmptyVec::new(PermissionCheckSpec::new(PermissionTarget::Read(
             PathSelector::exact(canonical_path),
         )));
+        let workspace_root = CanonicalPath::from_absolute(self.workspace.root())
+            .map_err(|error| ToolOutput::failure("invalid_arguments", error.to_string()))?;
+        // `<dir>/**` covers a recursive listing exactly and a single-level one
+        // conservatively: asking for authorization over a superset of what is
+        // read can never under-authorize, and it keeps one rule spelling working
+        // for both modes. It does not make a rule about a *deeper* path apply to
+        // a listing rooted above it — `glob` has the same limit, since neither
+        // knows what a walk will contain until it runs.
+        let subtree = PathSelector::pattern(workspace_root, format!("{display_path}/**"))
+            .map_err(|error| ToolOutput::failure("invalid_arguments", error.to_string()))?;
+        checks.push(PermissionCheckSpec::new(PermissionTarget::Read(subtree)));
         // Reaching past the project's own ignore rules can surface files it
         // deliberately keeps out of sight (`.env`, credentials), so the escape
         // hatch is authorized separately from the directory read.
@@ -378,10 +392,10 @@ fn relative_slash(directory: &Path, path: &Path) -> String {
 mod tests {
     use std::{fs, sync::Arc};
 
-    use super::{LS_ENTRY_CAP, Ls};
+    use super::{LS_ENTRY_CAP, Ls, Workspace};
     use crate::test_support::TestDir;
     use crate::{
-        permission::PermissionNamespace,
+        permission::{PathSelector, PermissionNamespace, PermissionTarget},
         tool::{PreparationContext, Tool, ToolContext, ToolOutput, execute_for_test},
     };
 
@@ -777,12 +791,64 @@ mod tests {
         .await
         .expect("ls preparation succeeds");
 
-        assert_eq!(preparation.checks().len(), 2);
+        // Two Read selectors plus the escape hatch.
+        assert_eq!(preparation.checks().len(), 3);
         assert!(
             preparation
                 .checks()
                 .iter()
                 .any(|check| check.target().namespace() == PermissionNamespace::ExactTool)
+        );
+    }
+
+    /// The subtree pattern a preparation authorizes, for rule-matching tests.
+    async fn subtree_pattern(workspace: Workspace, args: serde_json::Value) -> String {
+        let preparation = Tool::prepare(
+            Arc::new(Ls::new(workspace)),
+            args,
+            &PreparationContext::new(),
+        )
+        .await
+        .expect("ls preparation succeeds");
+
+        preparation
+            .checks()
+            .iter()
+            .find_map(|check| match check.target() {
+                PermissionTarget::Read(PathSelector::Pattern { pattern, .. }) => {
+                    Some(pattern.clone())
+                }
+                _ => None,
+            })
+            .expect("a subtree pattern check is emitted")
+    }
+
+    #[tokio::test]
+    async fn listing_authorizes_the_subtree_a_prefix_rule_would_name() {
+        let tmp = TestDir::new();
+        fs::create_dir_all(tmp.path().join("secrets")).expect("directory should be created");
+        let workspace = tmp.workspace().await;
+
+        // `deny: [Read(secrets/**)]` is compared to this string verbatim, so a
+        // single-level listing has to claim the same subtree a recursive one
+        // does — otherwise naming the directory outright escapes the rule.
+        for args in [
+            serde_json::json!({ "path": "secrets" }),
+            serde_json::json!({ "path": "secrets", "recursive": true }),
+        ] {
+            assert_eq!(subtree_pattern(workspace.clone(), args).await, "secrets/**");
+        }
+    }
+
+    #[tokio::test]
+    async fn listing_the_workspace_root_authorizes_the_whole_tree() {
+        let tmp = TestDir::new();
+
+        // `relative_display` renders the root as ".", which has to normalize to
+        // a root-relative pattern rather than a rejected `./**`.
+        assert_eq!(
+            subtree_pattern(tmp.workspace().await, serde_json::json!({})).await,
+            "**"
         );
     }
 }
