@@ -9,8 +9,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::helpers::{
-    SymlinkTarget, io_error, is_inside_vcs_store, non_empty_path, symlink_target, workspace_error,
-    workspace_walk_builder,
+    SymlinkTarget, io_error, is_inside_vcs_store, non_empty_path, relative_slash, symlink_target,
+    workspace_error, workspace_walk_builder,
 };
 use crate::{
     permission::{
@@ -40,8 +40,8 @@ pub struct LsArgs {
     /// root.
     #[serde(default)]
     path: Option<String>,
-    /// Walk nested directories instead of listing a single level. Names are then
-    /// relative to the listed directory. Defaults to `false`.
+    /// Walk nested directories instead of listing a single level. Defaults to
+    /// `false`.
     #[serde(default)]
     recursive: bool,
     /// Also list entries hidden or excluded by `.gitignore`. The VCS store
@@ -70,9 +70,14 @@ pub enum LsEntryKind {
 /// One entry of a listed directory.
 #[derive(Debug, Serialize)]
 pub struct LsEntry {
-    /// Entry name, or the slash-separated path relative to the listed directory
-    /// when the listing is recursive.
-    pub name: String,
+    /// Workspace-relative, slash-separated path, in the same vocabulary `glob`
+    /// reports and the file tools accept.
+    ///
+    /// Deliberately not a bare entry name: the value a caller has in hand is the
+    /// value it will pass to `read_file`, and a name that first has to be joined
+    /// with [`LsOutput::directory`] is a trap — the join is invisible in the
+    /// output, and the output schema never reaches the model at all.
+    pub path: String,
     /// What the entry is.
     pub kind: LsEntryKind,
     /// Size in bytes of a regular file, omitted whenever metadata is
@@ -86,9 +91,9 @@ pub struct LsEntry {
 /// Entries found under one workspace directory.
 #[derive(Debug, Serialize)]
 pub struct LsOutput {
-    /// Directory listed, shown relative to the workspace when possible.
-    pub path: String,
-    /// Matching entries sorted by name, capped for context safety.
+    /// Directory that was listed, workspace-relative (`.` for the root).
+    pub directory: String,
+    /// Matching entries sorted by path, capped for context safety.
     pub entries: Vec<LsEntry>,
     /// Total entries found before the cap was applied. Compare against
     /// [`Self::entries`] to see how much the listing left out.
@@ -115,7 +120,15 @@ impl Ls {
     /// Creates a directory listing tool bound to a workspace.
     pub fn new(workspace: Workspace) -> Self {
         Self {
-            definition: definition_for::<LsArgs>("ls", "List the entries of a workspace directory"),
+            // The output schema is never sent — `definition_for` ships only the
+            // argument schema — so the shape of what comes back has to be said
+            // here or not at all.
+            definition: definition_for::<LsArgs>(
+                "ls",
+                "List the entries of a workspace directory. \
+                 Each entry reports a workspace-relative path usable as-is with \
+                 read_file, edit_file, and glob.",
+            ),
             workspace,
         }
     }
@@ -256,7 +269,7 @@ impl TypedTool for Ls {
 
         let truncated = total_entries > entries.len();
         let output = ToolOutput::success(LsOutput {
-            path: display_path,
+            directory: display_path,
             entries,
             total_entries,
         });
@@ -338,7 +351,7 @@ fn walk_directory(
             LsEntryKind::File
         };
 
-        walked.push((relative_slash(directory, path), kind, path.to_path_buf()));
+        walked.push((relative_slash(workspace, path), kind, path.to_path_buf()));
     }
 
     walked.sort_by(|left, right| left.0.cmp(&right.0));
@@ -350,12 +363,12 @@ fn walk_directory(
     // nearly all of them.
     let entries = walked
         .into_iter()
-        .map(|(name, kind, path)| LsEntry {
-            name,
+        .map(|(relative, kind, path)| LsEntry {
             size: match kind {
                 LsEntryKind::File => std::fs::metadata(&path).ok().map(|meta| meta.len()),
                 LsEntryKind::Directory | LsEntryKind::Symlink => None,
             },
+            path: relative,
             kind,
         })
         .collect();
@@ -378,14 +391,6 @@ fn listing_summary(display_path: &str, recursive: bool, include_ignored: bool) -
         summary.push_str(" (including ignored and hidden entries)");
     }
     summary
-}
-
-fn relative_slash(directory: &Path, path: &Path) -> String {
-    path.strip_prefix(directory)
-        .unwrap_or(path)
-        .display()
-        .to_string()
-        .replace('\\', "/")
 }
 
 #[cfg(test)]
@@ -417,12 +422,12 @@ mod tests {
 
         assert!(output.ok);
         let data = output.data.expect("data present");
-        assert_eq!(data["path"], "src");
+        assert_eq!(data["directory"], "src");
         assert_eq!(
             data["entries"],
             serde_json::json!([
-                { "name": "bin", "kind": "directory" },
-                { "name": "lib.rs", "kind": "file", "size": 14 },
+                { "path": "src/bin", "kind": "directory" },
+                { "path": "src/lib.rs", "kind": "file", "size": 14 },
             ])
         );
         assert_eq!(data["total_entries"], 2);
@@ -438,12 +443,12 @@ mod tests {
 
         assert!(output.ok);
         let data = output.data.expect("data present");
-        assert_eq!(data["path"], ".");
-        assert_eq!(data["entries"][0]["name"], "README.md");
+        assert_eq!(data["directory"], ".");
+        assert_eq!(data["entries"][0]["path"], "README.md");
     }
 
     #[tokio::test]
-    async fn ls_recursive_returns_paths_relative_to_the_listed_directory() {
+    async fn ls_recursive_returns_workspace_relative_paths() {
         let tmp = TestDir::new();
         fs::create_dir_all(tmp.path().join("src/bin")).expect("directory should be created");
         fs::write(tmp.path().join("src/bin/main.rs"), "").expect("file should be written");
@@ -462,11 +467,11 @@ mod tests {
             .as_array()
             .expect("entries is an array")
             .iter()
-            .map(|entry| entry["name"].as_str().expect("name is a string"))
+            .map(|entry| entry["path"].as_str().expect("path is a string"))
             .collect::<Vec<_>>();
-        // Nested paths are joined with `/` and the sibling outside `src` is not
-        // reachable from this listing.
-        assert_eq!(names, ["bin", "bin/main.rs"]);
+        // Nested entries carry the same path `read_file` and `glob` would use,
+        // and the sibling outside `src` is not reachable from this listing.
+        assert_eq!(names, ["src/bin", "src/bin/main.rs"]);
     }
 
     #[tokio::test]
@@ -485,7 +490,7 @@ mod tests {
         // `build/` is ignored by the project and `.gitignore` itself is hidden.
         assert_eq!(
             data["entries"],
-            serde_json::json!([{ "name": "keep.rs", "kind": "file", "size": 0 }])
+            serde_json::json!([{ "path": "keep.rs", "kind": "file", "size": 0 }])
         );
     }
 
@@ -505,7 +510,7 @@ mod tests {
             .as_array()
             .expect("entries is an array")
             .iter()
-            .map(|entry| entry["name"].as_str().expect("name is a string"))
+            .map(|entry| entry["path"].as_str().expect("path is a string"))
             .collect::<Vec<_>>();
         assert_eq!(names, [".gitignore", "build", "keep.rs"]);
     }
@@ -524,7 +529,7 @@ mod tests {
         // listing is rooted there and its contents are returned.
         assert!(output.ok);
         let data = output.data.expect("data present");
-        assert_eq!(data["entries"][0]["name"], "out.rs");
+        assert_eq!(data["entries"][0]["path"], "build/out.rs");
     }
 
     #[tokio::test]
@@ -576,7 +581,7 @@ mod tests {
         // declares at its root — that is what `include_ignored` is gated for.
         assert_eq!(
             data["entries"],
-            serde_json::json!([{ "name": "lib.rs", "kind": "file", "size": 0 }])
+            serde_json::json!([{ "path": "src/lib.rs", "kind": "file", "size": 0 }])
         );
 
         let escaped = call(
@@ -590,11 +595,16 @@ mod tests {
             .as_array()
             .expect("entries is an array")
             .iter()
-            .map(|entry| entry["name"].as_str().expect("name is a string"))
+            .map(|entry| entry["path"].as_str().expect("path is a string"))
             .collect::<Vec<_>>();
         assert_eq!(
             names,
-            ["api.key", "generated", "generated/out.rs", "lib.rs"]
+            [
+                "src/api.key",
+                "src/generated",
+                "src/generated/out.rs",
+                "src/lib.rs"
+            ]
         );
     }
 
@@ -613,7 +623,7 @@ mod tests {
         let data = output.data.expect("data present");
         assert_eq!(
             data["entries"],
-            serde_json::json!([{ "name": "keep.rs", "kind": "file", "size": 0 }])
+            serde_json::json!([{ "path": "keep.rs", "kind": "file", "size": 0 }])
         );
     }
 
@@ -648,7 +658,7 @@ mod tests {
         // `read_file` would actually allow.
         let names = entries
             .iter()
-            .map(|entry| entry["name"].as_str().expect("name is a string"))
+            .map(|entry| entry["path"].as_str().expect("path is a string"))
             .collect::<Vec<_>>();
         assert_eq!(names, ["inside_link.rs", "keep.rs"]);
         assert_eq!(entries[0]["kind"], "symlink");
@@ -673,7 +683,7 @@ mod tests {
         // used to settle.
         assert_eq!(
             data["entries"],
-            serde_json::json!([{ "name": "config.toml", "kind": "symlink" }])
+            serde_json::json!([{ "path": "config.toml", "kind": "symlink" }])
         );
         assert_eq!(data["total_entries"], 1);
     }

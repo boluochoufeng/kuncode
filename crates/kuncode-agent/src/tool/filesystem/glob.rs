@@ -8,7 +8,7 @@ use kuncode_core::non_empty_vec::NonEmptyVec;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::helpers::{SymlinkTarget, symlink_target, workspace_walk_builder};
+use super::helpers::{SymlinkTarget, relative_slash, symlink_target, workspace_walk_builder};
 use crate::{
     glob::{glob_match, normalize_pattern},
     permission::{
@@ -231,10 +231,6 @@ fn walk_workspace(workspace: &Workspace, include_ignored: bool) -> Vec<String> {
 
     // Traversal order is irrelevant: the caller sorts matches before returning.
     entries
-}
-
-fn relative_slash(workspace: &Workspace, path: &Path) -> String {
-    workspace.relative_display(path).replace('\\', "/")
 }
 
 #[cfg(test)]

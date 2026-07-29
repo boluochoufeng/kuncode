@@ -162,6 +162,13 @@ fn ignore_files_in(directory: &Path, is_workspace_root: bool) -> Option<Gitignor
     builder.build().ok().filter(|matcher| !matcher.is_empty())
 }
 
+/// Renders `path` as the workspace-relative, slash-separated form every tool
+/// speaks: what a discovery tool reports here can be handed straight back to
+/// `read_file` / `write_file` / `edit_file` as their `path` argument.
+pub(super) fn relative_slash(workspace: &Workspace, path: &Path) -> String {
+    workspace.relative_display(path).replace('\\', "/")
+}
+
 /// Where a symlink inside the workspace points.
 ///
 /// Symlinks are listed but never followed, so a tool decides for itself what to
