@@ -16,8 +16,7 @@ use super::helpers::{
 };
 use crate::{
     permission::{
-        CanonicalPath, CanonicalToolInput, PathSelector, PermissionCheckSpec, PermissionTarget,
-        ToolDisplay,
+        CanonicalPath, CanonicalToolInput, PermissionCheckSpec, PermissionTarget, ToolDisplay,
     },
     tool::{
         PreparationContext, PreparedInvocationState, ToolContext, ToolError, ToolOutput,
@@ -120,7 +119,7 @@ impl TypedTool for EditFile {
             },
             canonical_input,
             NonEmptyVec::new(PermissionCheckSpec::new(PermissionTarget::Edit(
-                PathSelector::exact(canonical_path),
+                canonical_path,
             ))),
             ToolDisplay::new(format!("Edit file: {display_path}")),
         ))

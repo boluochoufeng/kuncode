@@ -1,6 +1,6 @@
 //! The `glob` tool: list workspace paths matching a glob pattern.
 
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 use async_trait::async_trait;
 use kuncode_core::completion::ToolDefinition;
@@ -8,11 +8,11 @@ use kuncode_core::non_empty_vec::NonEmptyVec;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::helpers::{SymlinkTarget, symlink_target, walk_entries};
+use super::helpers::{SymlinkTarget, Walked, symlink_target, walk_entries};
 use crate::{
     glob::{glob_match, normalize_pattern},
     permission::{
-        CanonicalPath, CanonicalToolInput, PathSelector, PermissionCheckSpec, PermissionTarget,
+        CanonicalPath, CanonicalToolInput, PathVisibility, PermissionCheckSpec, PermissionTarget,
         ToolDisplay,
     },
     tool::{
@@ -51,6 +51,12 @@ pub struct GlobOutput {
     /// workspace-relative text form.
     #[serde(skip_serializing_if = "super::helpers::is_zero")]
     pub unrepresentable_paths: usize,
+    /// Paths the permission policy withheld from the search. Reported as a
+    /// count rather than by name, and not as a failure: unlike a listing, a
+    /// search returning nothing is an ordinary answer, and these entries need
+    /// not have matched the pattern in the first place.
+    #[serde(skip_serializing_if = "super::helpers::is_zero")]
+    pub hidden_by_policy: usize,
 }
 
 /// Finds workspace paths using a small glob matcher.
@@ -108,17 +114,17 @@ impl TypedTool for Glob {
         let pattern = normalize_pattern(pattern);
         args.pattern = pattern.clone();
         args.limit = Some(limit);
-        let root = CanonicalPath::from_absolute(self.workspace.root())
-            .map_err(|error| ToolOutput::failure("invalid_arguments", error.to_string()))?;
-        let selector = PathSelector::pattern(root, pattern.clone())
+        // A search names the deepest directory it cannot leave, not the pattern
+        // it expands: rules decide paths, and the walk's own output is filtered
+        // entry by entry, so a broad pattern cannot surface a denied path.
+        let anchor = CanonicalPath::from_absolute(&self.workspace.root().join(anchor(&pattern)))
             .map_err(|error| ToolOutput::failure("invalid_arguments", error.to_string()))?;
         let canonical_input = CanonicalToolInput::new(serde_json::json!({
             "pattern": pattern,
             "limit": limit,
             "include_ignored": args.include_ignored,
         }));
-        let mut checks =
-            NonEmptyVec::new(PermissionCheckSpec::new(PermissionTarget::Read(selector)));
+        let mut checks = NonEmptyVec::new(PermissionCheckSpec::new(PermissionTarget::Read(anchor)));
         if args.include_ignored {
             let target = PermissionTarget::exact_tool("glob")
                 .map_err(|error| ToolOutput::failure("invalid_arguments", error.to_string()))?;
@@ -132,7 +138,7 @@ impl TypedTool for Glob {
         ))
     }
 
-    async fn run_prepared(&self, prepared: GlobArgs, _ctx: &ToolContext) -> ToolOutput<GlobOutput> {
+    async fn run_prepared(&self, prepared: GlobArgs, ctx: &ToolContext) -> ToolOutput<GlobOutput> {
         let pattern = prepared.pattern;
         let limit = prepared
             .limit
@@ -143,21 +149,24 @@ impl TypedTool for Glob {
         // tree walk runs on the blocking pool to keep the async runtime free.
         let workspace = self.workspace.clone();
         let include_ignored = prepared.include_ignored;
-        let (entries, unrepresentable_paths) =
-            match tokio::task::spawn_blocking(move || walk_workspace(&workspace, include_ignored))
-                .await
-            {
-                Ok(walked) => walked,
-                Err(err) => {
-                    return ToolOutput::failure(
-                        "internal",
-                        format!("workspace walk did not complete: {err}"),
-                    );
-                }
-            };
+        let visibility = ctx.visibility.clone();
+        let walked = match tokio::task::spawn_blocking(move || {
+            walk_workspace(&workspace, include_ignored, &visibility)
+        })
+        .await
+        {
+            Ok(walked) => walked,
+            Err(err) => {
+                return ToolOutput::failure(
+                    "internal",
+                    format!("workspace walk did not complete: {err}"),
+                );
+            }
+        };
 
         let normalized_pattern = pattern.clone();
-        let mut matches = entries
+        let mut matches = walked
+            .kept
             .into_iter()
             .filter(|entry| glob_match(&normalized_pattern, entry))
             .collect::<Vec<_>>();
@@ -171,7 +180,8 @@ impl TypedTool for Glob {
             pattern,
             matches,
             total_matches,
-            unrepresentable_paths,
+            unrepresentable_paths: walked.unnameable,
+            hidden_by_policy: walked.hidden,
         });
 
         if truncated {
@@ -180,6 +190,23 @@ impl TypedTool for Glob {
             output
         }
     }
+}
+
+/// Returns the leading wildcard-free segments of a pattern: the directory the
+/// search is confined to, and therefore the path a rule gets to decide.
+///
+/// `secrets/*.key` yields `secrets`, `src/**/*.rs` yields `src`, and a pattern
+/// that starts with a wildcard yields the workspace root itself.
+fn anchor(pattern: &str) -> PathBuf {
+    let segments = pattern.split('/').collect::<Vec<_>>();
+    let literal = segments
+        .iter()
+        .take_while(|segment| !segment.contains(['*', '?']))
+        .count();
+    // A pattern with no wildcard at all names one file, and its last segment is
+    // that name rather than a directory the search stays inside.
+    let directories = literal.min(segments.len().saturating_sub(1));
+    segments[..directories].iter().collect()
 }
 
 fn validate_glob_pattern(pattern: &str) -> Result<(), String> {
@@ -209,12 +236,17 @@ fn validate_glob_pattern(pattern: &str) -> Result<(), String> {
 ///
 /// Traversal order is irrelevant: the caller sorts matches before returning.
 /// Synchronous and thread-based; callers run it on the blocking pool.
-fn walk_workspace(workspace: &Workspace, include_ignored: bool) -> (Vec<String>, usize) {
+fn walk_workspace(
+    workspace: &Workspace,
+    include_ignored: bool,
+    visibility: &PathVisibility,
+) -> Walked<String> {
     walk_entries(
         workspace,
         workspace.root(),
         None,
         include_ignored,
+        visibility,
         |entry| {
             // A search advertises only links it could actually hand to
             // `read_file`/`write_file`, so anything that does not resolve inside the
@@ -236,7 +268,10 @@ mod tests {
     use super::Glob;
     use crate::test_support::TestDir;
     use crate::{
-        permission::PermissionNamespace,
+        permission::{
+            CanonicalPath, PermissionNamespace, PermissionTarget, PolicyEffect, PolicyOrigin,
+            PolicySet, SessionPolicyOverlay,
+        },
         tool::{PreparationContext, Tool, ToolContext, ToolOutput, execute_for_test},
     };
 
@@ -332,6 +367,68 @@ mod tests {
             serde_json::json!(["build/out.rs", "keep.rs"])
         );
         assert_eq!(data["total_matches"], 2);
+    }
+
+    #[tokio::test]
+    async fn denied_paths_are_withheld_from_a_search_that_spans_them() {
+        let tmp = TestDir::new();
+        fs::create_dir_all(tmp.path().join("secrets")).expect("directory should be created");
+        fs::write(tmp.path().join("secrets/prod.key"), "").expect("file should be written");
+        fs::write(tmp.path().join("local.key"), "").expect("file should be written");
+        let workspace = tmp.workspace().await;
+        let root = CanonicalPath::from_absolute(workspace.root()).expect("absolute root");
+        let mut policy = PolicySet::new(root);
+        policy
+            .compile_and_push("Read(secrets/**)", PolicyEffect::Deny, PolicyOrigin::User)
+            .expect("rule compiles");
+        let ctx = ToolContext::new()
+            .with_visibility(policy.read_visibility(&SessionPolicyOverlay::default()));
+
+        let output = execute_for_test(
+            Arc::new(Glob::new(workspace)),
+            serde_json::json!({ "pattern": "**/*.key" }),
+            &ctx,
+        )
+        .await
+        .expect("no harness-level error");
+
+        let data = output.data.expect("data present");
+        assert_eq!(data["matches"], serde_json::json!(["local.key"]));
+        assert_eq!(data["hidden_by_policy"], 1);
+    }
+
+    #[tokio::test]
+    async fn a_search_authorizes_the_directory_it_cannot_leave() {
+        let tmp = TestDir::new();
+        let workspace = tmp.workspace().await;
+        let root = workspace.root().to_string_lossy().to_string();
+
+        for (pattern, expected) in [
+            ("secrets/*.key", format!("{root}/secrets")),
+            ("src/**/*.rs", format!("{root}/src")),
+            ("docs/api/*.md", format!("{root}/docs/api")),
+            // Nothing constrains a leading wildcard, so the search is only
+            // bounded by the workspace itself.
+            ("**/*.key", root.clone()),
+            ("*.rs", root.clone()),
+            // A wildcard-free pattern names one file; the directory holding it
+            // is what a rule gets to decide.
+            ("src/lib.rs", format!("{root}/src")),
+        ] {
+            let preparation = Tool::prepare(
+                Arc::new(Glob::new(workspace.clone())),
+                serde_json::json!({ "pattern": pattern }),
+                &PreparationContext::new(),
+            )
+            .await
+            .expect("glob preparation succeeds");
+
+            let target = preparation.checks().first().target();
+            let PermissionTarget::Read(path) = target else {
+                panic!("{pattern} should authorize a read path, got {target}");
+            };
+            assert_eq!(path.as_str(), expected, "{pattern}");
+        }
     }
 
     #[tokio::test]

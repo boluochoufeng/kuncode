@@ -1,6 +1,9 @@
 //! Resolves typed checks against immutable, session, mode, and Hook policy.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 use super::rule::{
     PermissionRule, PermissionRuleError, RuleCompileContext, compile_permission_rule,
@@ -82,8 +85,9 @@ impl PolicySet {
             (PolicyEffect::Deny, "Bash(reboot)"),
             (PolicyEffect::Deny, "Bash(reboot *)"),
             (PolicyEffect::Deny, "Bash(* > /dev/*)"),
+            // No `**/.env` companion: a restrictive rule naming a single file
+            // already matches it at any depth.
             (PolicyEffect::RequireApproval, "Read(.env)"),
-            (PolicyEffect::RequireApproval, "Read(**/.env)"),
             (PolicyEffect::RequireApproval, "Read(**/*.pem)"),
             (PolicyEffect::RequireApproval, "Read(**/id_rsa)"),
         ] {
@@ -204,10 +208,56 @@ impl PolicySet {
         &self.rules
     }
 
+    /// Compiles the entry-level Read filter a walking tool must honor.
+    ///
+    /// Authorization decides the directory a search or listing may walk; this
+    /// decides what that walk is allowed to surface. The two are separate
+    /// because a walk rooted above a denied subtree is a legitimate call whose
+    /// *output* still must not name it.
+    ///
+    /// Only `Deny` contributes. An approval rule hiding names would leave the
+    /// caller reading an empty directory as "nothing here", and reading the
+    /// content of those paths is gated on its own.
+    pub fn read_visibility(&self, overlay: &SessionPolicyOverlay) -> PathVisibility {
+        let denied = self
+            .rules
+            .iter()
+            .filter(|rule| self.static_rule_is_effective(rule))
+            .chain(overlay.rules())
+            .filter(|rule| rule.effect() == PolicyEffect::Deny)
+            .cloned()
+            .collect::<Vec<_>>();
+        PathVisibility {
+            denied: Arc::new(denied),
+        }
+    }
+
     fn static_rule_is_effective(&self, rule: &PermissionRule) -> bool {
         self.workspace_trust == WorkspaceTrust::Trusted
             || rule.origin() != &PolicyOrigin::Project
             || rule.effect() != PolicyEffect::Allow
+    }
+}
+
+/// Paths the effective policy hides from a walk's own output.
+///
+/// Cheap to clone and shared with the walker thread: a walk asks it once per
+/// produced entry, and it is compiled by the authorization engine rather than
+/// by the tool, so a tool can consult it but never widen it.
+#[derive(Clone, Debug, Default)]
+pub struct PathVisibility {
+    denied: Arc<Vec<PermissionRule>>,
+}
+
+impl PathVisibility {
+    /// Returns whether this path must not be surfaced.
+    pub fn hides(&self, path: &CanonicalPath) -> bool {
+        self.denied.iter().any(|rule| rule.denies_read_path(path))
+    }
+
+    /// Returns whether no rule can hide anything, letting a walk skip the check.
+    pub fn is_unrestricted(&self) -> bool {
+        self.denied.is_empty()
     }
 }
 
@@ -236,9 +286,7 @@ fn mode_contribution(
     let effect = match mode {
         PermissionMode::Default | PermissionMode::DontAsk => return Ok(None),
         PermissionMode::AcceptEdits => match check.target() {
-            PermissionTarget::Edit(super::PathSelector::Exact { path })
-                if path_is_inside(path, workspace_root) =>
-            {
+            PermissionTarget::Edit(path) if path_is_inside(path, workspace_root) => {
                 PolicyEffect::Allow
             }
             _ => return Ok(None),
@@ -352,10 +400,10 @@ mod tests {
 
     #[test]
     fn plan_denies_edits_while_accept_edits_allows_workspace_paths() {
-        let target = PermissionTarget::Edit(super::super::PathSelector::exact(
+        let target = PermissionTarget::Edit(
             CanonicalPath::from_absolute(std::path::Path::new("/workspace/src/lib.rs"))
                 .expect("absolute path"),
-        ));
+        );
         let request = typed_request(target, super::super::ProfileDefault::RequireApproval);
         let policy = PolicySet::new(root());
 
@@ -372,10 +420,10 @@ mod tests {
     #[test]
     fn builtin_sensitive_read_overrides_read_default() {
         let request = typed_request(
-            PermissionTarget::Read(super::super::PathSelector::exact(
+            PermissionTarget::Read(
                 CanonicalPath::from_absolute(std::path::Path::new("/workspace/.env"))
                     .expect("absolute path"),
-            )),
+            ),
             super::super::ProfileDefault::Allow,
         );
         let policy = PolicySet::builtin(root()).expect("builtins compile");
@@ -386,6 +434,47 @@ mod tests {
         assert_eq!(
             resolution.effect(),
             super::super::AuthorizationEffect::RequireApproval
+        );
+    }
+
+    #[test]
+    fn only_deny_rules_hide_paths_and_no_mode_turns_that_off() {
+        let path =
+            CanonicalPath::from_absolute(std::path::Path::new("/workspace/secrets/prod.key"))
+                .expect("absolute path");
+        let mut policy = PolicySet::new(root());
+        policy
+            .compile_and_push(
+                "Read(secrets/**)",
+                PolicyEffect::RequireApproval,
+                PolicyOrigin::User,
+            )
+            .expect("ask rule compiles");
+
+        // An approval rule guards reading content; hiding the name instead would
+        // leave the caller reading an empty directory as "nothing here".
+        let asking = policy.read_visibility(&SessionPolicyOverlay::default());
+        assert!(asking.is_unrestricted());
+        assert!(!asking.hides(&path));
+
+        policy
+            .compile_and_push("Read(secrets/**)", PolicyEffect::Deny, PolicyOrigin::User)
+            .expect("deny rule compiles");
+        for mode in [
+            PermissionMode::Default,
+            PermissionMode::BypassPermissions,
+            PermissionMode::AcceptEdits,
+        ] {
+            let visibility = policy.read_visibility(&SessionPolicyOverlay::new(mode));
+            assert!(visibility.hides(&path), "{mode:?}");
+        }
+        assert!(
+            !policy
+                .read_visibility(&SessionPolicyOverlay::default())
+                .hides(
+                    &CanonicalPath::from_absolute(std::path::Path::new("/workspace/src/lib.rs"))
+                        .expect("absolute path")
+                )
         );
     }
 

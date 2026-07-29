@@ -17,8 +17,7 @@ use super::helpers::{
 };
 use crate::{
     permission::{
-        CanonicalPath, CanonicalToolInput, PathSelector, PermissionCheckSpec, PermissionTarget,
-        ToolDisplay,
+        CanonicalPath, CanonicalToolInput, PermissionCheckSpec, PermissionTarget, ToolDisplay,
     },
     tool::{
         PreparationContext, PreparedInvocationState, ToolContext, ToolError, ToolOutput,
@@ -155,7 +154,7 @@ impl TypedTool for ReadFile {
             },
             canonical_input,
             NonEmptyVec::new(PermissionCheckSpec::new(PermissionTarget::Read(
-                PathSelector::exact(canonical_path),
+                canonical_path,
             ))),
             ToolDisplay::new(format!("Read file: {display_path}")),
         ))

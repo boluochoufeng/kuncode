@@ -10,7 +10,6 @@ use crate::path_text::{PathTextError, absolute_slash};
 
 const MAX_COMMAND_CHARS: usize = 4_096;
 const MAX_ORIGIN_CHARS: usize = 4_096;
-const MAX_PATH_PATTERN_CHARS: usize = 4_096;
 const MAX_IDENTITY_CHARS: usize = 256;
 const MAX_MCP_FIELD_NAME_CHARS: usize = 128;
 const MAX_MCP_FIELD_VALUE_CHARS: usize = 1_024;
@@ -73,48 +72,6 @@ impl CanonicalPath {
     /// Returns the canonical path text used by namespace matchers.
     pub fn as_str(&self) -> &str {
         &self.0
-    }
-}
-
-/// A concrete path or a workspace-rooted path pattern.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum PathSelector {
-    /// One resolved filesystem path.
-    Exact {
-        /// Canonical path shared with the prepared invocation.
-        path: CanonicalPath,
-    },
-    /// A normalized pattern evaluated under one canonical root.
-    Pattern {
-        /// Root that bounds pattern expansion.
-        root: CanonicalPath,
-        /// Slash-form pattern with no parent traversal.
-        pattern: String,
-    },
-}
-
-impl PathSelector {
-    /// Creates a selector for one resolved path.
-    pub fn exact(path: CanonicalPath) -> Self {
-        Self::Exact { path }
-    }
-
-    /// Creates a root-bounded pattern selector.
-    ///
-    /// # Errors
-    /// Returns an error when the pattern is blank, absolute, or contains a
-    /// parent-traversal segment.
-    pub fn pattern(
-        root: CanonicalPath,
-        pattern: impl Into<String>,
-    ) -> Result<Self, PermissionTargetError> {
-        let pattern = normalize_relative_pattern(&pattern.into())?;
-        if pattern.trim().is_empty() {
-            return Err(PermissionTargetError::BlankSelector("path pattern"));
-        }
-        ensure_bounded(&pattern, "path pattern", MAX_PATH_PATTERN_CHARS)?;
-        Ok(Self::Pattern { root, pattern })
     }
 }
 
@@ -262,9 +219,13 @@ impl McpSelector {
 #[serde(tag = "namespace", content = "selector", rename_all = "snake_case")]
 pub enum PermissionTarget {
     /// Filesystem read target.
-    Read(PathSelector),
+    ///
+    /// Search and listing tools name the directory they walk rather than the
+    /// pattern they expand: a rule decides a path, and what a walk actually
+    /// produces is filtered entry by entry as it runs.
+    Read(CanonicalPath),
     /// Filesystem edit target.
-    Edit(PathSelector),
+    Edit(CanonicalPath),
     /// Local shell target.
     Bash(CanonicalCommand),
     /// Network origin target.
@@ -332,8 +293,8 @@ impl PermissionTarget {
 impl std::fmt::Display for PermissionTarget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Read(selector) => write!(f, "Read({})", path_selector_display(selector)),
-            Self::Edit(selector) => write!(f, "Edit({})", path_selector_display(selector)),
+            Self::Read(path) => write!(f, "Read({})", safe_ui_text(path.as_str())),
+            Self::Edit(path) => write!(f, "Edit({})", safe_ui_text(path.as_str())),
             Self::Bash(command) => match command.kind() {
                 CommandKind::Simple => write!(f, "Bash({})", safe_ui_text(command.as_str())),
                 CommandKind::Opaque => {
@@ -356,16 +317,6 @@ impl std::fmt::Display for PermissionTarget {
             Self::TodoWrite => f.write_str("TodoWrite"),
             Self::ExactTool(tool) => write!(f, "ExactTool({})", safe_ui_text(tool)),
         }
-    }
-}
-
-fn path_selector_display(selector: &PathSelector) -> String {
-    match selector {
-        PathSelector::Exact { path } => safe_ui_text(path.as_str()),
-        PathSelector::Pattern { root, pattern } => safe_ui_text(&format!(
-            "{}/{pattern}",
-            root.as_str().trim_end_matches('/')
-        )),
     }
 }
 
@@ -403,9 +354,6 @@ pub enum PermissionTargetError {
         /// Rejected display form.
         path: String,
     },
-    /// A pattern could escape its registered root.
-    #[error("path pattern `{0}` is absolute or contains parent traversal")]
-    UnsafePathPattern(String),
     /// A value was not a canonicalizable HTTP(S) origin.
     #[error("value is not a valid credential-free HTTP(S) origin")]
     InvalidOrigin,
@@ -428,22 +376,6 @@ pub enum PermissionTargetError {
         /// Trusted product limit.
         maximum: usize,
     },
-}
-
-fn normalize_relative_pattern(pattern: &str) -> Result<String, PermissionTargetError> {
-    let pattern = pattern.replace('\\', "/");
-    if pattern.starts_with('/') {
-        return Err(PermissionTargetError::UnsafePathPattern(pattern));
-    }
-    let mut segments = Vec::new();
-    for segment in pattern.split('/') {
-        match segment {
-            "" | "." => {}
-            ".." => return Err(PermissionTargetError::UnsafePathPattern(pattern)),
-            segment => segments.push(segment),
-        }
-    }
-    Ok(segments.join("/"))
 }
 
 fn non_blank(value: String, label: &'static str) -> Result<String, PermissionTargetError> {
@@ -479,18 +411,6 @@ mod tests {
         let root = std::env::current_dir().expect("current directory exists");
         let path = CanonicalPath::from_absolute(&root).expect("absolute UTF-8 path");
         assert!(!path.as_str().is_empty());
-    }
-
-    #[test]
-    fn patterns_reject_parent_traversal() {
-        let root = CanonicalPath::from_absolute(
-            &std::env::current_dir().expect("current directory exists"),
-        )
-        .expect("root is canonical");
-        assert!(matches!(
-            PathSelector::pattern(root, "src/../secrets/**"),
-            Err(PermissionTargetError::UnsafePathPattern(_))
-        ));
     }
 
     #[test]
@@ -592,19 +512,11 @@ mod tests {
     }
 
     #[test]
-    fn command_and_pattern_selectors_are_bounded() {
+    fn command_selectors_are_bounded() {
         assert!(matches!(
             CanonicalCommand::new("x".repeat(MAX_COMMAND_CHARS + 1), CommandKind::Opaque),
             Err(PermissionTargetError::SelectorTooLong {
                 label: "command",
-                ..
-            })
-        ));
-        let root = CanonicalPath::from_absolute(Path::new("/workspace")).expect("valid root");
-        assert!(matches!(
-            PathSelector::pattern(root, "x".repeat(MAX_PATH_PATTERN_CHARS + 1)),
-            Err(PermissionTargetError::SelectorTooLong {
-                label: "path pattern",
                 ..
             })
         ));

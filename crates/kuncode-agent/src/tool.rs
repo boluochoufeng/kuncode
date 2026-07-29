@@ -9,7 +9,9 @@ use schemars::JsonSchema;
 use serde::{Serialize, de::DeserializeOwned};
 use tokio_util::sync::CancellationToken;
 
-use crate::permission::{CanonicalToolInput, PermissionCheckSpec, PermissionTarget, ToolDisplay};
+use crate::permission::{
+    CanonicalToolInput, PathVisibility, PermissionCheckSpec, PermissionTarget, ToolDisplay,
+};
 use crate::todo::TodoHandle;
 
 pub mod bash;
@@ -195,6 +197,15 @@ pub struct ToolContext {
     /// empty handle, so a tool that ignores the plan — and tests — still gets a
     /// valid (if unobserved) target.
     pub todos: TodoHandle,
+    /// Read paths a walking tool must not surface, compiled from the effective
+    /// policy by [`AuthorizationEngine::execute`] rather than by the tool.
+    ///
+    /// A tool consults it; nothing here lets a tool widen it. The default hides
+    /// nothing, which is why the engine attaches the real one itself instead of
+    /// trusting its caller to pass a context that has it.
+    ///
+    /// [`AuthorizationEngine::execute`]: crate::permission::AuthorizationEngine::execute
+    pub visibility: PathVisibility,
 }
 
 impl ToolContext {
@@ -216,6 +227,11 @@ impl ToolContext {
     /// plan rather than the standalone default.
     pub fn with_todos(mut self, todos: TodoHandle) -> Self {
         self.todos = todos;
+        self
+    }
+
+    pub(crate) fn with_visibility(mut self, visibility: PathVisibility) -> Self {
+        self.visibility = visibility;
         self
     }
 }

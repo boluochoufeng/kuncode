@@ -5,7 +5,16 @@
 //! ls). A helper used by a single tool lives beside that tool instead, so this
 //! module stays the genuinely shared base.
 
-use std::{ffi::OsStr, fs::FileType, io, path::Path};
+use std::{
+    ffi::OsStr,
+    fs::FileType,
+    io,
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use ignore::{
     Match, WalkBuilder,
@@ -17,6 +26,7 @@ use tokio::{
 };
 
 use crate::{
+    permission::{CanonicalPath, PathVisibility},
     tool::{PreparedInvocationState, ToolError, ToolOutput},
     workspace::{Workspace, WorkspaceError},
 };
@@ -167,12 +177,29 @@ pub(super) struct WalkedEntry<'a> {
     pub file_type: FileType,
 }
 
+/// What a walk produced, alongside what it could not report.
+pub(super) struct Walked<T> {
+    /// Whatever `visit` kept.
+    pub kept: Vec<T>,
+    /// Entries dropped for having no workspace-relative name.
+    pub unnameable: usize,
+    /// Entries the permission policy hid, counted so an emptied listing does
+    /// not read as an empty directory.
+    pub hidden: usize,
+}
+
 /// Walks below `root`, handing each nameable entry to `visit` and collecting
 /// whatever `visit` keeps.
 ///
-/// The second return value counts the entries dropped for having no
-/// workspace-relative name. Reporting it is the caller's job: an entry that
-/// cannot be described must not read as an entry that is not there.
+/// Entries denied by `visibility` never reach `visit`, and a denied directory
+/// is not descended into. This is the single seam where both walking tools
+/// enforce Read deny rules on their own output: authorization decides the
+/// directory the walk starts from, and a walk rooted above a denied subtree is
+/// a legitimate call whose results still must not name it.
+///
+/// Reporting [`Walked::unnameable`] and [`Walked::hidden`] is the caller's job:
+/// an entry that cannot be described, or may not be shown, must not read as an
+/// entry that is not there.
 ///
 /// `max_depth` of `Some(1)` restricts the walk to the root's own children;
 /// `None` walks the whole tree. The root itself is never visited, and an
@@ -188,10 +215,37 @@ pub(super) fn walk_entries<T>(
     root: &Path,
     max_depth: Option<usize>,
     include_ignored: bool,
+    visibility: &PathVisibility,
     mut visit: impl FnMut(WalkedEntry<'_>) -> Option<T>,
-) -> (Vec<T>, usize) {
+) -> Walked<T> {
     let mut builder = workspace_walk_builder(workspace, root, include_ignored);
     builder.max_depth(max_depth);
+
+    let hidden = Arc::new(AtomicUsize::new(0));
+    if !visibility.is_unrestricted() {
+        let visibility = visibility.clone();
+        let counter = Arc::clone(&hidden);
+        let walk_root = root.to_path_buf();
+        builder.filter_entry(move |entry| {
+            // The root's own authorization was decided before the call ran;
+            // re-deciding it here would only turn a rejection into an empty
+            // listing.
+            if entry.path() == walk_root {
+                return true;
+            }
+            // A path with no canonical form cannot be matched against a rule at
+            // all. It is dropped below and counted as unnameable, which says
+            // more than counting it as hidden would.
+            let Ok(path) = CanonicalPath::from_absolute(entry.path()) else {
+                return true;
+            };
+            if visibility.hides(&path) {
+                counter.fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+            true
+        });
+    }
 
     let mut kept = Vec::new();
     let mut unnameable = 0;
@@ -218,7 +272,23 @@ pub(super) fn walk_entries<T>(
         }
     }
 
-    (kept, unnameable)
+    let hidden = hidden.load(Ordering::Relaxed);
+    if hidden > 0 {
+        // The execution receipt records an authorized call; without this the
+        // audit trail would never show that its output was cut down. Counted,
+        // never named — the log must not restate what the rule withheld.
+        tracing::info!(
+            target: "kuncode::authorization",
+            hidden,
+            "walk output filtered by permission policy",
+        );
+    }
+
+    Walked {
+        kept,
+        unnameable,
+        hidden,
+    }
 }
 
 /// Builds a walker over `walk_root` honoring the project's own notion of noise.

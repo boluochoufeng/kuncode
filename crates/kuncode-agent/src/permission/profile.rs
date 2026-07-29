@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use super::check::{PermissionCheck, PermissionCheckSpec, ProfileDefault, hex_digest};
-use super::target::{CanonicalPath, PathSelector, PermissionNamespace, PermissionTarget};
+use super::target::{CanonicalPath, PermissionNamespace, PermissionTarget};
 
 const PROFILE_REVISION_DOMAIN: &[u8] = b"kuncode.tool-permission-profile.v1\0";
 const MAX_PERMISSION_CHECKS: usize = 64;
@@ -194,17 +194,11 @@ impl ToolPermissionProfile {
 
     fn validate_selector(&self, target: &PermissionTarget) -> Result<(), ToolProfileError> {
         if let Some(root) = &self.path_root {
-            let selector = match target {
-                PermissionTarget::Read(selector) | PermissionTarget::Edit(selector) => selector,
+            let path = match target {
+                PermissionTarget::Read(path) | PermissionTarget::Edit(path) => path,
                 _ => return Ok(()),
             };
-            let inside = match selector {
-                PathSelector::Exact { path } => path_is_inside(path, root),
-                PathSelector::Pattern {
-                    root: pattern_root, ..
-                } => pattern_root == root,
-            };
-            if !inside {
+            if !path_is_inside(path, root) {
                 return Err(ToolProfileError::PathOutsideRoot {
                     tool: self.tool.clone(),
                 });
@@ -433,7 +427,7 @@ mod tests {
         .expect("path schema");
         let outside =
             CanonicalPath::from_absolute(Path::new("/outside/secret")).expect("valid path");
-        let spec = PermissionCheckSpec::new(PermissionTarget::Read(PathSelector::exact(outside)));
+        let spec = PermissionCheckSpec::new(PermissionTarget::Read(outside));
 
         assert!(matches!(
             profile.validate([spec]),

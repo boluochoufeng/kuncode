@@ -13,8 +13,7 @@ use super::helpers::{
 };
 use crate::{
     permission::{
-        CanonicalPath, CanonicalToolInput, PathSelector, PermissionCheckSpec, PermissionTarget,
-        ToolDisplay,
+        CanonicalPath, CanonicalToolInput, PermissionCheckSpec, PermissionTarget, ToolDisplay,
     },
     tool::{
         PreparationContext, PreparedInvocationState, ToolContext, ToolError, ToolOutput,
@@ -106,7 +105,7 @@ impl TypedTool for WriteFile {
             },
             canonical_input,
             NonEmptyVec::new(PermissionCheckSpec::new(PermissionTarget::Edit(
-                PathSelector::exact(canonical_path),
+                canonical_path,
             ))),
             ToolDisplay::new(format!("Write file: {display_path}")),
         ))

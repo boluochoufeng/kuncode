@@ -9,12 +9,12 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::helpers::{
-    SymlinkTarget, io_error, is_inside_vcs_store, non_empty_path, revalidate_path, symlink_target,
-    walk_entries, workspace_error,
+    SymlinkTarget, Walked, io_error, is_inside_vcs_store, non_empty_path, revalidate_path,
+    symlink_target, walk_entries, workspace_error,
 };
 use crate::{
     permission::{
-        CanonicalPath, CanonicalToolInput, PathSelector, PermissionCheckSpec, PermissionTarget,
+        CanonicalPath, CanonicalToolInput, PathVisibility, PermissionCheckSpec, PermissionTarget,
         ToolDisplay,
     },
     tool::{
@@ -102,6 +102,11 @@ pub struct LsOutput {
     /// because their file names have no workspace-relative text form.
     #[serde(skip_serializing_if = "super::helpers::is_zero")]
     pub unrepresentable_entries: usize,
+    /// Entries the permission policy withheld, by count rather than by name.
+    /// Left out of [`Self::total_entries`]: what a caller can act on is what it
+    /// can see, and this says how much of the directory it is not seeing.
+    #[serde(skip_serializing_if = "super::helpers::is_zero")]
+    pub hidden_by_policy: usize,
 }
 
 /// Canonical directory paired with validated listing arguments.
@@ -173,9 +178,9 @@ impl TypedTool for Ls {
 
         let canonical_path = CanonicalPath::from_absolute(&resolved)
             .map_err(|error| ToolOutput::failure("invalid_arguments", error.to_string()))?;
-        // Not `relative_display`: this string becomes the subtree permission
-        // pattern below, so a lossy rendering would have the check authorize a
-        // directory other than the one about to be read.
+        // Not `relative_display`: this string is reported back as the listed
+        // directory and prefixes every entry path, so a lossy rendering would
+        // hand the caller names that resolve somewhere else.
         let Some(display_path) = self.workspace.relative_path(&resolved) else {
             return Err(ToolOutput::failure(
                 "invalid_arguments",
@@ -187,25 +192,13 @@ impl TypedTool for Ls {
             "recursive": args.recursive,
             "include_ignored": args.include_ignored,
         }));
-        // Two Read checks, because the two selector kinds reach different rules:
-        // an exact path is glob-matched against rule patterns, while a pattern
-        // selector is compared by equality. Naming only the directory would let
-        // `deny: [Read(secrets/**)]` pass a listing of `secrets` — the disclosure
-        // that rule exists to prevent.
+        // The listed directory is the whole authorization surface: a rule
+        // decides this path, and what the walk then produces is filtered entry
+        // by entry, so a listing rooted above a denied subtree cannot surface
+        // it. A second check naming the subtree would only restate this one.
         let mut checks = NonEmptyVec::new(PermissionCheckSpec::new(PermissionTarget::Read(
-            PathSelector::exact(canonical_path),
+            canonical_path,
         )));
-        let workspace_root = CanonicalPath::from_absolute(self.workspace.root())
-            .map_err(|error| ToolOutput::failure("invalid_arguments", error.to_string()))?;
-        // `<dir>/**` covers a recursive listing exactly and a single-level one
-        // conservatively: asking for authorization over a superset of what is
-        // read can never under-authorize, and it keeps one rule spelling working
-        // for both modes. It does not make a rule about a *deeper* path apply to
-        // a listing rooted above it — `glob` has the same limit, since neither
-        // knows what a walk will contain until it runs.
-        let subtree = PathSelector::pattern(workspace_root, format!("{display_path}/**"))
-            .map_err(|error| ToolOutput::failure("invalid_arguments", error.to_string()))?;
-        checks.push(PermissionCheckSpec::new(PermissionTarget::Read(subtree)));
         // Reaching past the project's own ignore rules can surface files it
         // deliberately keeps out of sight (`.env`, credentials), so the escape
         // hatch is authorized separately from the directory read.
@@ -231,7 +224,7 @@ impl TypedTool for Ls {
         ))
     }
 
-    async fn run_prepared(&self, prepared: PreparedLs, _ctx: &ToolContext) -> ToolOutput<LsOutput> {
+    async fn run_prepared(&self, prepared: PreparedLs, ctx: &ToolContext) -> ToolOutput<LsOutput> {
         let PreparedLs {
             path,
             display_path,
@@ -271,8 +264,15 @@ impl TypedTool for Ls {
         // on the blocking pool to keep the async runtime free.
         let workspace = self.workspace.clone();
         let directory = path.clone();
+        let visibility = ctx.visibility.clone();
         let listing = match tokio::task::spawn_blocking(move || {
-            walk_directory(&workspace, &directory, recursive, include_ignored)
+            walk_directory(
+                &workspace,
+                &directory,
+                recursive,
+                include_ignored,
+                &visibility,
+            )
         })
         .await
         {
@@ -288,12 +288,22 @@ impl TypedTool for Ls {
         // The cap is not the only reason the listing can be short of the total:
         // an unnameable entry is counted and then left out too, and either way
         // the result is incomplete.
+        // Everything here being withheld is a permission answer, not an empty
+        // directory, and saying so keeps a caller from concluding the directory
+        // holds nothing and moving on.
+        if listing.entries.is_empty() && listing.hidden > 0 {
+            return ToolOutput::failure(
+                "permission_denied",
+                format!("every entry of `{display_path}` is withheld by permission policy"),
+            );
+        }
         let truncated = listing.total > listing.entries.len();
         let output = ToolOutput::success(LsOutput {
             directory: display_path,
             entries: listing.entries,
             total_entries: listing.total,
             unrepresentable_entries: listing.unrepresentable,
+            hidden_by_policy: listing.hidden,
         });
 
         if truncated {
@@ -327,12 +337,14 @@ fn walk_directory(
     directory: &Path,
     recursive: bool,
     include_ignored: bool,
+    visibility: &PathVisibility,
 ) -> Listing {
-    let (mut walked, unrepresentable) = walk_entries(
+    let walked = walk_entries(
         workspace,
         directory,
         (!recursive).then_some(1),
         include_ignored,
+        visibility,
         |entry| {
             let kind = if entry.file_type.is_dir() {
                 LsEntryKind::Directory
@@ -350,14 +362,19 @@ fn walk_directory(
         },
     );
 
-    walked.sort_by(|left, right| left.0.cmp(&right.0));
-    let total = walked.len() + unrepresentable;
-    walked.truncate(LS_ENTRY_CAP);
+    let Walked {
+        mut kept,
+        unnameable,
+        hidden,
+    } = walked;
+    kept.sort_by(|left, right| left.0.cmp(&right.0));
+    let total = kept.len() + unnameable;
+    kept.truncate(LS_ENTRY_CAP);
 
     // `stat` runs only on entries that survive the cap: `DirEntry::metadata` is
     // an uncached syscall per entry on Unix, and a recursive walk discards
     // nearly all of them.
-    let entries = walked
+    let entries = kept
         .into_iter()
         .map(|(relative, kind, path)| LsEntry {
             size: match kind {
@@ -372,7 +389,8 @@ fn walk_directory(
     Listing {
         entries,
         total,
-        unrepresentable,
+        unrepresentable: unnameable,
+        hidden,
     }
 }
 
@@ -381,6 +399,7 @@ struct Listing {
     entries: Vec<LsEntry>,
     total: usize,
     unrepresentable: usize,
+    hidden: usize,
 }
 
 /// Builds the approval-facing summary.
@@ -407,9 +426,83 @@ mod tests {
     use super::{LS_ENTRY_CAP, Ls, Workspace};
     use crate::test_support::TestDir;
     use crate::{
-        permission::{PathSelector, PermissionNamespace, PermissionTarget},
+        permission::{
+            CanonicalPath, PermissionNamespace, PermissionTarget, PolicyEffect, PolicyOrigin,
+            PolicySet, SessionPolicyOverlay,
+        },
         tool::{PreparationContext, Tool, ToolContext, ToolOutput, execute_for_test},
     };
+
+    /// A context carrying the entry filter one Read deny rule compiles to.
+    fn denying(workspace: &Workspace, selector: &str) -> ToolContext {
+        let root = CanonicalPath::from_absolute(workspace.root()).expect("absolute root");
+        let mut policy = PolicySet::new(root);
+        policy
+            .compile_and_push(selector, PolicyEffect::Deny, PolicyOrigin::User)
+            .expect("rule compiles");
+        ToolContext::new().with_visibility(policy.read_visibility(&SessionPolicyOverlay::default()))
+    }
+
+    async fn call_with(tool: Ls, args: serde_json::Value, ctx: &ToolContext) -> ToolOutput {
+        execute_for_test(Arc::new(tool), args, ctx)
+            .await
+            .expect("no harness-level error")
+    }
+
+    #[tokio::test]
+    async fn denied_entries_are_withheld_from_a_listing_rooted_above_them() {
+        let tmp = TestDir::new();
+        fs::create_dir_all(tmp.path().join("secrets")).expect("directory should be created");
+        fs::write(tmp.path().join("secrets/prod.key"), "").expect("file should be written");
+        fs::create_dir_all(tmp.path().join("src")).expect("directory should be created");
+        fs::write(tmp.path().join("src/lib.rs"), "").expect("file should be written");
+        let workspace = tmp.workspace().await;
+        let ctx = denying(&workspace, "Read(secrets/**)");
+
+        let output = call_with(
+            Ls::new(workspace),
+            serde_json::json!({ "recursive": true }),
+            &ctx,
+        )
+        .await;
+
+        let data = output.data.expect("data present");
+        let paths = data["entries"]
+            .as_array()
+            .expect("entries present")
+            .iter()
+            .map(|entry| entry["path"].as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>();
+        assert!(paths.contains(&"src/lib.rs".to_string()));
+        assert!(
+            !paths.iter().any(|path| path.starts_with("secrets")),
+            "{paths:?}"
+        );
+        // One: the denied directory is pruned rather than walked and dropped
+        // entry by entry.
+        assert_eq!(data["hidden_by_policy"], 1);
+    }
+
+    #[tokio::test]
+    async fn a_wholly_withheld_directory_is_denied_rather_than_reported_empty() {
+        let tmp = TestDir::new();
+        fs::create_dir_all(tmp.path().join("secrets")).expect("directory should be created");
+        fs::write(tmp.path().join("secrets/prod.key"), "").expect("file should be written");
+        let workspace = tmp.workspace().await;
+        let ctx = denying(&workspace, "Read(**/*.key)");
+
+        let output = call_with(
+            Ls::new(workspace),
+            serde_json::json!({ "path": "secrets" }),
+            &ctx,
+        )
+        .await;
+
+        assert_eq!(
+            output.error.expect("error present").kind.as_str(),
+            "permission_denied"
+        );
+    }
 
     async fn call(tool: Ls, args: serde_json::Value) -> ToolOutput {
         execute_for_test(Arc::new(tool), args, &ToolContext::new())
@@ -808,8 +901,8 @@ mod tests {
         .await
         .expect("ls preparation succeeds");
 
-        // Two Read selectors plus the escape hatch.
-        assert_eq!(preparation.checks().len(), 3);
+        // The listed directory plus the escape hatch.
+        assert_eq!(preparation.checks().len(), 2);
         assert!(
             preparation
                 .checks()
@@ -818,8 +911,8 @@ mod tests {
         );
     }
 
-    /// The subtree pattern a preparation authorizes, for rule-matching tests.
-    async fn subtree_pattern(workspace: Workspace, args: serde_json::Value) -> String {
+    /// The path a preparation authorizes, for rule-matching tests.
+    async fn authorized_path(workspace: Workspace, args: serde_json::Value) -> String {
         let preparation = Tool::prepare(
             Arc::new(Ls::new(workspace)),
             args,
@@ -832,40 +925,34 @@ mod tests {
             .checks()
             .iter()
             .find_map(|check| match check.target() {
-                PermissionTarget::Read(PathSelector::Pattern { pattern, .. }) => {
-                    Some(pattern.clone())
-                }
+                PermissionTarget::Read(path) => Some(path.as_str().to_string()),
                 _ => None,
             })
-            .expect("a subtree pattern check is emitted")
+            .expect("a read check is emitted")
     }
 
     #[tokio::test]
-    async fn listing_authorizes_the_subtree_a_prefix_rule_would_name() {
+    async fn listing_authorizes_the_directory_it_walks() {
         let tmp = TestDir::new();
         fs::create_dir_all(tmp.path().join("secrets")).expect("directory should be created");
         let workspace = tmp.workspace().await;
+        let root = workspace.root().to_string_lossy().to_string();
 
-        // `deny: [Read(secrets/**)]` is compared to this string verbatim, so a
-        // single-level listing has to claim the same subtree a recursive one
-        // does — otherwise naming the directory outright escapes the rule.
+        // `deny: [Read(secrets/**)]` matches the directory itself, so naming it
+        // is enough to stop the listing; entries a walk rooted higher up would
+        // reach are filtered as they are produced.
         for args in [
             serde_json::json!({ "path": "secrets" }),
             serde_json::json!({ "path": "secrets", "recursive": true }),
         ] {
-            assert_eq!(subtree_pattern(workspace.clone(), args).await, "secrets/**");
+            assert_eq!(
+                authorized_path(workspace.clone(), args).await,
+                format!("{root}/secrets")
+            );
         }
-    }
-
-    #[tokio::test]
-    async fn listing_the_workspace_root_authorizes_the_whole_tree() {
-        let tmp = TestDir::new();
-
-        // The root's relative form is ".", which has to normalize to a
-        // root-relative pattern rather than a rejected `./**`.
         assert_eq!(
-            subtree_pattern(tmp.workspace().await, serde_json::json!({})).await,
-            "**"
+            authorized_path(workspace, serde_json::json!({})).await,
+            root
         );
     }
 

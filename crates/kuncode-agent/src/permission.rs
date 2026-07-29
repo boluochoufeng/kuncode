@@ -33,7 +33,7 @@ pub use engine::{
     AuthorizationEngine, AuthorizationError, AuthorizationOutcome, ExecutedToolCall,
     ExecutionOutcome, PendingToolCall as PendingAuthorizationCall, RejectedToolCall,
 };
-pub use policy::{PolicySet, PolicySetError, PolicySetRevision, WorkspaceTrust};
+pub use policy::{PathVisibility, PolicySet, PolicySetError, PolicySetRevision, WorkspaceTrust};
 pub use profile::{ToolPermissionProfile, ToolProfileError, ToolProfileRevision};
 pub use receipt::{
     ApprovalReceipt, AuthorizationContextRevision, AuthorizedToolCall, CheckResolutionReceipt,
@@ -46,6 +46,6 @@ pub use request::{
 pub use rule::{PermissionRule, PermissionRuleError, RuleCompileContext, compile_permission_rule};
 pub use state::{PermissionMode, SessionOverlayRevision, SessionPolicyOverlay};
 pub use target::{
-    CanonicalCommand, CanonicalOrigin, CanonicalPath, CommandKind, McpSelector, PathSelector,
+    CanonicalCommand, CanonicalOrigin, CanonicalPath, CommandKind, McpSelector,
     PermissionNamespace, PermissionTarget, PermissionTargetError,
 };

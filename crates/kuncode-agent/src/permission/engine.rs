@@ -511,6 +511,13 @@ impl<'a> AuthorizationEngine<'a> {
             )));
         }
 
+        // Attached here rather than taken from the caller: the default hides
+        // nothing, so a context assembled anywhere else would silently execute
+        // walking tools with no filter at all.
+        let context = &context
+            .clone()
+            .with_visibility(self.policy.read_visibility(overlay));
+
         let validity = tokio::select! {
             result = invocation.revalidate(context) => result?,
             _ = context.cancel.cancelled() => return Ok(ExecutionOutcome::Cancelled),

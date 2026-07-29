@@ -7,7 +7,7 @@ use url::Host;
 use crate::glob::{command_match, glob_match, normalize_pattern};
 
 use super::{
-    CanonicalPath, CommandKind, PathSelector, PermissionCauseId, PermissionCheck, PermissionTarget,
+    CanonicalPath, CommandKind, PermissionCauseId, PermissionCheck, PermissionTarget,
     PolicyContribution, PolicyEffect, PolicyOrigin, SafeExplanation,
 };
 
@@ -101,6 +101,15 @@ impl PermissionRule {
         &self.cause_id
     }
 
+    /// Returns whether this rule forbids reading `path`.
+    ///
+    /// Deliberately narrower than [`Self::contribution`]: a walk asks this of
+    /// every entry it produces, so it takes a path rather than a check and
+    /// avoids the per-check identity hashing that authorization needs.
+    pub(crate) fn denies_read_path(&self, path: &CanonicalPath) -> bool {
+        self.effect == PolicyEffect::Deny && self.matcher.denies_read_path(path)
+    }
+
     /// Produces a contribution when this rule matches `check`.
     pub fn contribution(&self, check: &PermissionCheck) -> Option<PolicyContribution> {
         self.matcher.matches(check.target(), self.effect).then(|| {
@@ -155,26 +164,34 @@ impl PermissionMatcher {
             _ => false,
         }
     }
+
+    fn denies_read_path(&self, path: &CanonicalPath) -> bool {
+        match self {
+            // The fail-closed matcher stands in for a policy that never loaded,
+            // so a walk under it surfaces nothing.
+            Self::All => true,
+            Self::Read(rule) => rule.matches(path),
+            Self::Exact {
+                target: PermissionTarget::Read(target),
+            } => target == path,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 struct PathMatcher {
     anchor: Option<CanonicalPath>,
     pattern: String,
+    /// Second pattern compiled for restrictive rules that name a single
+    /// directory or file, so `Read(secrets/**)` also covers a nested `secrets`.
+    /// A permissive rule never gets one: widening where an Allow applies would
+    /// hand out access the author anchored on purpose.
+    nested_pattern: Option<String>,
 }
 
 impl PathMatcher {
-    fn matches(&self, target: &PathSelector) -> bool {
-        match target {
-            PathSelector::Exact { path } => self.matches_path(path),
-            PathSelector::Pattern { root, pattern } => {
-                self.anchor.as_ref() == Some(root)
-                    && (self.pattern == "**" || self.pattern == *pattern)
-            }
-        }
-    }
-
-    fn matches_path(&self, path: &CanonicalPath) -> bool {
+    fn matches(&self, path: &CanonicalPath) -> bool {
         let candidate = match &self.anchor {
             Some(anchor) => {
                 let Some(relative) = strip_path_prefix(path.as_str(), anchor.as_str()) else {
@@ -184,10 +201,12 @@ impl PathMatcher {
             }
             None => path.as_str(),
         };
-        glob_match(
-            &normalize_pattern(&self.pattern),
-            &normalize_pattern(candidate),
-        )
+        let candidate = normalize_pattern(candidate);
+        glob_match(&normalize_pattern(&self.pattern), &candidate)
+            || self
+                .nested_pattern
+                .as_ref()
+                .is_some_and(|pattern| glob_match(&normalize_pattern(pattern), &candidate))
     }
 }
 
@@ -227,8 +246,8 @@ pub fn compile_permission_rule(
     } else {
         let (namespace, selector) = parse_call_syntax(raw)?;
         match namespace {
-            "Read" => PermissionMatcher::Read(compile_path_matcher(selector, context)?),
-            "Edit" => PermissionMatcher::Edit(compile_path_matcher(selector, context)?),
+            "Read" => PermissionMatcher::Read(compile_path_matcher(selector, effect, context)?),
+            "Edit" => PermissionMatcher::Edit(compile_path_matcher(selector, effect, context)?),
             "Bash" => PermissionMatcher::Bash {
                 pattern: non_blank_selector(namespace, selector)?.to_string(),
             },
@@ -348,6 +367,7 @@ fn parse_call_syntax(raw: &str) -> Result<(&str, &str), PermissionRuleError> {
 
 fn compile_path_matcher(
     selector: &str,
+    effect: PolicyEffect,
     context: &RuleCompileContext,
 ) -> Result<PathMatcher, PermissionRuleError> {
     let selector = normalize_path_rule(non_blank_selector("path", selector)?)?;
@@ -355,13 +375,35 @@ fn compile_path_matcher(
         Ok(PathMatcher {
             anchor: None,
             pattern: selector,
+            nested_pattern: None,
         })
     } else {
+        let nested_pattern = (effect != PolicyEffect::Allow)
+            .then(|| nested_form(&selector))
+            .flatten();
         Ok(PathMatcher {
             anchor: Some(context.workspace_root.clone()),
             pattern: selector,
+            nested_pattern,
         })
     }
+}
+
+/// Returns the any-depth form of a relative rule pattern that names a single
+/// directory (`secrets/**`) or a single file (`.env`), and `None` for every
+/// other shape.
+///
+/// Multi-segment patterns like `src/components/**` keep their anchored depth in
+/// every rule type, matching how a reader parses them: the leading segments are
+/// a location, not a name to hunt for. A first segment carrying a wildcard is
+/// left alone too, since `*.env` already describes what it matches.
+fn nested_form(pattern: &str) -> Option<String> {
+    let mut segments = pattern.split('/').collect::<Vec<_>>();
+    if segments.last() == Some(&"**") {
+        segments.pop();
+    }
+    let [name] = segments[..] else { return None };
+    (!name.contains(['*', '?'])).then(|| format!("**/{pattern}"))
 }
 
 fn normalize_path_rule(selector: &str) -> Result<String, PermissionRuleError> {
@@ -495,22 +537,95 @@ mod permission_rule_tests {
             &context(),
         )
         .expect("valid rule");
-        let inside = check(
-            PermissionTarget::Read(PathSelector::exact(
-                CanonicalPath::from_absolute(Path::new("/workspace/src/lib.rs"))
-                    .expect("absolute path"),
-            )),
-            PermissionNamespace::Read,
+        assert!(
+            rule.contribution(&read_check("/workspace/src/lib.rs"))
+                .is_some()
         );
-        let outside = check(
-            PermissionTarget::Read(PathSelector::exact(
-                CanonicalPath::from_absolute(Path::new("/other/src/lib.rs"))
-                    .expect("absolute path"),
-            )),
-            PermissionNamespace::Read,
+        assert!(
+            rule.contribution(&read_check("/other/src/lib.rs"))
+                .is_none()
         );
-        assert!(rule.contribution(&inside).is_some());
-        assert!(rule.contribution(&outside).is_none());
+    }
+
+    fn read_check(path: &str) -> PermissionCheck {
+        check(
+            PermissionTarget::Read(
+                CanonicalPath::from_absolute(Path::new(path)).expect("absolute path"),
+            ),
+            PermissionNamespace::Read,
+        )
+    }
+
+    fn read_rule(selector: &str, effect: PolicyEffect) -> PermissionRule {
+        compile_permission_rule(selector, effect, PolicyOrigin::User, &context())
+            .expect("valid rule")
+    }
+
+    #[test]
+    fn restrictive_single_segment_rules_reach_nested_copies() {
+        let nested = read_check("/workspace/vendor/pkg/secrets/prod.key");
+        let top_level = read_check("/workspace/secrets/prod.key");
+
+        for effect in [PolicyEffect::Deny, PolicyEffect::RequireApproval] {
+            let rule = read_rule("Read(secrets/**)", effect);
+            assert!(rule.contribution(&top_level).is_some(), "{effect:?}");
+            assert!(rule.contribution(&nested).is_some(), "{effect:?}");
+        }
+
+        // Widening an Allow would hand out the nested copy the author never
+        // named, so the permissive direction stays anchored.
+        let allow = read_rule("Read(secrets/**)", PolicyEffect::Allow);
+        assert!(allow.contribution(&top_level).is_some());
+        assert!(allow.contribution(&nested).is_none());
+    }
+
+    #[test]
+    fn restrictive_bare_file_rules_match_at_any_depth() {
+        let rule = read_rule("Read(.env)", PolicyEffect::RequireApproval);
+        assert!(rule.contribution(&read_check("/workspace/.env")).is_some());
+        assert!(
+            rule.contribution(&read_check("/workspace/services/api/.env"))
+                .is_some()
+        );
+        assert!(
+            rule.contribution(&read_check("/workspace/.env.example"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn multi_segment_and_absolute_rules_keep_their_depth() {
+        for selector in ["Read(src/components/**)", "Read(/workspace/src/**)"] {
+            for effect in [PolicyEffect::Deny, PolicyEffect::Allow] {
+                let rule = read_rule(selector, effect);
+                assert!(
+                    rule.contribution(&read_check("/workspace/vendor/src/components/a.rs"))
+                        .is_none(),
+                    "{selector} {effect:?}"
+                );
+            }
+        }
+        let anchored = read_rule("Read(src/components/**)", PolicyEffect::Deny);
+        assert!(
+            anchored
+                .contribution(&read_check("/workspace/src/components/a.rs"))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn wildcard_first_segments_are_left_anchored() {
+        // `*.env` already says what it matches; expanding it to any depth would
+        // silently restate the rule as `**/*.env`.
+        let rule = read_rule("Read(*.env)", PolicyEffect::Deny);
+        assert!(
+            rule.contribution(&read_check("/workspace/prod.env"))
+                .is_some()
+        );
+        assert!(
+            rule.contribution(&read_check("/workspace/config/prod.env"))
+                .is_none()
+        );
     }
 
     #[test]
