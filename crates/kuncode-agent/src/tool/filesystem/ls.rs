@@ -241,7 +241,13 @@ impl TypedTool for Ls {
 
         // Existence and type are diagnosed here rather than during preparation,
         // so an unauthorized path cannot reveal metadata by failing early.
-        match tokio::fs::metadata(&path).await {
+        //
+        // `symlink_metadata`, not `metadata`: a prepared path is resolved and
+        // therefore not a symlink, so one appearing here was swapped in after
+        // the check and must not be walked. Unlike the file tools this is a
+        // check and not an atomic open — the walker reopens the root by path —
+        // so it narrows the window rather than closing it.
+        match tokio::fs::symlink_metadata(&path).await {
             Ok(metadata) if metadata.is_dir() => {}
             Ok(_) => {
                 return ToolOutput::failure(

@@ -22,3 +22,8 @@ tokio-util = { workspace = true }
 tracing = { workspace = true }
 turso = { workspace = true }
 url = { workspace = true }
+
+# `O_NOFOLLOW` has no portable spelling; the filesystem tools need it to open a
+# prepared path without racing a symlink swapped in after authorization.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }

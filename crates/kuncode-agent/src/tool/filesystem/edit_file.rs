@@ -8,7 +8,11 @@ use kuncode_core::non_empty_vec::NonEmptyVec;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::helpers::{io_error, non_empty_path, workspace_error};
+use tokio::{fs::OpenOptions, io::AsyncReadExt};
+
+use super::helpers::{
+    io_error, non_empty_path, open_error, open_no_follow, workspace_error, write_no_follow,
+};
 use crate::{
     permission::{
         CanonicalPath, CanonicalToolInput, PathSelector, PermissionCheckSpec, PermissionTarget,
@@ -127,10 +131,14 @@ impl TypedTool for EditFile {
         _ctx: &ToolContext,
     ) -> ToolOutput<EditFileOutput> {
         let PreparedEditFile { args, path } = prepared;
-        let content = match tokio::fs::read_to_string(&path).await {
-            Ok(content) => content,
-            Err(err) => return io_error("read", &path, err, &self.workspace),
+        let mut file = match open_no_follow(&path, OpenOptions::new().read(true)).await {
+            Ok(file) => file,
+            Err(err) => return open_error("read", &path, err, &self.workspace),
         };
+        let mut content = String::new();
+        if let Err(err) = file.read_to_string(&mut content).await {
+            return io_error("read", &path, err, &self.workspace);
+        }
 
         // `old_text` must be unambiguous: zero matches gives the model nothing
         // to anchor on, and more than one would let us silently edit the wrong
@@ -159,8 +167,8 @@ impl TypedTool for EditFile {
         }
 
         let edited = content.replacen(&args.old_text, &args.new_text, 1);
-        if let Err(err) = tokio::fs::write(&path, edited.as_bytes()).await {
-            return io_error("write", &path, err, &self.workspace);
+        if let Err(err) = write_no_follow(&path, edited.as_bytes()).await {
+            return open_error("write", &path, err, &self.workspace);
         }
 
         ToolOutput::success(EditFileOutput {

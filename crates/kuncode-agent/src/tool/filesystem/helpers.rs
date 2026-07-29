@@ -11,6 +11,10 @@ use ignore::{
     Match, WalkBuilder,
     gitignore::{Gitignore, GitignoreBuilder},
 };
+use tokio::{
+    fs::{File, OpenOptions},
+    io::AsyncWriteExt,
+};
 
 use crate::{
     tool::ToolOutput,
@@ -45,6 +49,95 @@ pub(super) fn io_error<D>(
             workspace.relative_display(path)
         ),
     )
+}
+
+/// Why a prepared path could not be opened.
+#[derive(Debug)]
+pub(super) enum OpenError {
+    /// The path is a symlink. A prepared path is resolved, so it is not one —
+    /// something replaced it after the invocation was authorized.
+    Symlink,
+    /// Anything else the filesystem reported.
+    Io(io::Error),
+}
+
+/// Opens a prepared path, refusing to follow a symlink in its final component.
+///
+/// Preparation resolves the path — canonicalizing it, expanding even a dangling
+/// link — so no component of what a tool later opens should be a symlink. The
+/// gap is time: authorization happens against the path as it was, and the open
+/// happens against the path as it is. A link swapped in between the two would
+/// be followed, and the tool would read or write a file no check ever saw.
+///
+/// `O_NOFOLLOW` refuses that inside the open syscall itself, so for the final
+/// component there is no window left at all. A *parent* directory swapped
+/// mid-call still slips through; closing that needs per-component `openat`,
+/// which is a different tool from the portable ones used here.
+pub(super) async fn open_no_follow(
+    path: &Path,
+    options: &mut OpenOptions,
+) -> Result<File, OpenError> {
+    #[cfg(unix)]
+    {
+        options.custom_flags(libc::O_NOFOLLOW);
+        options.open(path).await.map_err(|err| {
+            // Linux and macOS both report the refusal as `ELOOP`. Matched on
+            // the raw code because `ErrorKind::FilesystemLoop` is still
+            // unstable, and a parent-component loop cannot reach here: every
+            // component above the last one was resolved during preparation.
+            if err.raw_os_error() == Some(libc::ELOOP) {
+                OpenError::Symlink
+            } else {
+                OpenError::Io(err)
+            }
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        // Without `O_NOFOLLOW` the check has to precede the open, which leaves
+        // exactly the window this closes elsewhere. A missing path is not a
+        // symlink, so it falls through to the open and its own error.
+        if let Ok(metadata) = tokio::fs::symlink_metadata(path).await
+            && metadata.file_type().is_symlink()
+        {
+            return Err(OpenError::Symlink);
+        }
+        options.open(path).await.map_err(OpenError::Io)
+    }
+}
+
+/// Replaces the contents of a prepared path, refusing to follow a symlink in
+/// its final component; see [`open_no_follow`] for why.
+pub(super) async fn write_no_follow(path: &Path, content: &[u8]) -> Result<(), OpenError> {
+    let mut file = open_no_follow(
+        path,
+        OpenOptions::new().write(true).create(true).truncate(true),
+    )
+    .await?;
+    file.write_all(content).await.map_err(OpenError::Io)?;
+    // A tokio `File` buffers, and dropping one discards whatever it has not
+    // issued yet, so the write is completed here rather than at drop.
+    file.flush().await.map_err(OpenError::Io)
+}
+
+/// Shapes an [`OpenError`] into the model-facing failure for `kind`.
+pub(super) fn open_error<D>(
+    kind: &str,
+    path: &Path,
+    err: OpenError,
+    workspace: &Workspace,
+) -> ToolOutput<D> {
+    match err {
+        OpenError::Symlink => ToolOutput::failure(
+            "symlink_not_followed",
+            format!(
+                "`{}` is a symlink and was not followed; \
+                 pass the path it points to instead",
+                workspace.relative_display(path)
+            ),
+        ),
+        OpenError::Io(err) => io_error(kind, path, err, workspace),
+    }
 }
 
 /// Builds a walker over `walk_root` honoring the project's own notion of noise.
@@ -209,10 +302,60 @@ pub(super) fn is_inside_vcs_store(workspace: &Workspace, path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{fs, path::PathBuf};
 
-    use super::workspace_error;
-    use crate::workspace::WorkspaceError;
+    use super::{OpenError, open_no_follow, workspace_error, write_no_follow};
+    use crate::{test_support::TestDir, workspace::WorkspaceError};
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn opening_refuses_to_follow_a_symlink() {
+        let tmp = TestDir::new();
+        let target = tmp.path().join("target.txt");
+        fs::write(&target, "original").expect("file should be written");
+        let link = tmp.path().join("link.txt");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink should be created");
+
+        let opened = open_no_follow(&link, tokio::fs::OpenOptions::new().read(true)).await;
+
+        assert!(matches!(opened, Err(OpenError::Symlink)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn writing_refuses_a_symlink_without_touching_its_target() {
+        let tmp = TestDir::new();
+        let target = tmp.path().join("target.txt");
+        fs::write(&target, "original").expect("file should be written");
+        let link = tmp.path().join("link.txt");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink should be created");
+
+        let written = write_no_follow(&link, b"replaced").await;
+
+        // The property worth having: the refusal happens in the open, so the
+        // file the link pointed at is never truncated.
+        assert!(matches!(written, Err(OpenError::Symlink)));
+        assert_eq!(
+            fs::read_to_string(&target).expect("target should be readable"),
+            "original"
+        );
+    }
+
+    #[tokio::test]
+    async fn writing_creates_and_replaces_a_regular_file() {
+        let tmp = TestDir::new();
+        let path = tmp.path().join("notes.txt");
+
+        write_no_follow(&path, b"first").await.expect("write");
+        write_no_follow(&path, b"two").await.expect("rewrite");
+
+        // Truncation matters: the shorter second write must not leave a tail of
+        // the first one behind.
+        assert_eq!(
+            fs::read_to_string(&path).expect("file should be readable"),
+            "two"
+        );
+    }
 
     #[test]
     fn workspace_errors_are_model_recoverable() {

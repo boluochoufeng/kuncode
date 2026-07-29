@@ -25,6 +25,7 @@ reqwest = { version = "0.13.3", default-features = false }
 thiserror = "2.0.18"
 async-trait = "0.1.89"
 ignore = "0.4.23"
+libc = "0.2.186"
 tracing = "0.1.44"
 tracing-appender = "0.2.5"
 futures-core = "0.3.31"

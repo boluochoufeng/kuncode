@@ -7,9 +7,12 @@ use kuncode_core::completion::ToolDefinition;
 use kuncode_core::non_empty_vec::NonEmptyVec;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::{
+    fs::OpenOptions,
+    io::{AsyncBufReadExt, BufReader},
+};
 
-use super::helpers::{io_error, non_empty_path, workspace_error};
+use super::helpers::{io_error, non_empty_path, open_error, open_no_follow, workspace_error};
 use crate::{
     permission::{
         CanonicalPath, CanonicalToolInput, PathSelector, PermissionCheckSpec, PermissionTarget,
@@ -166,9 +169,9 @@ impl TypedTool for ReadFile {
             path: resolved,
         } = prepared;
         let start_line = args.start_line.unwrap_or(1);
-        let file = match tokio::fs::File::open(&resolved).await {
+        let file = match open_no_follow(&resolved, OpenOptions::new().read(true)).await {
             Ok(file) => file,
-            Err(err) => return io_error("read", &resolved, err, &self.workspace),
+            Err(err) => return open_error("read", &resolved, err, &self.workspace),
         };
         let mut lines = BufReader::new(file).lines();
 

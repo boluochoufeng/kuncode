@@ -8,7 +8,7 @@ use kuncode_core::non_empty_vec::NonEmptyVec;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::helpers::{io_error, non_empty_path, workspace_error};
+use super::helpers::{non_empty_path, open_error, workspace_error, write_no_follow};
 use crate::{
     permission::{
         CanonicalPath, CanonicalToolInput, PathSelector, PermissionCheckSpec, PermissionTarget,
@@ -116,8 +116,8 @@ impl TypedTool for WriteFile {
         _ctx: &ToolContext,
     ) -> ToolOutput<WriteFileOutput> {
         let PreparedWriteFile { args, path } = prepared;
-        if let Err(error) = tokio::fs::write(&path, args.content.as_bytes()).await {
-            return io_error("write", &path, error, &self.workspace);
+        if let Err(error) = write_no_follow(&path, args.content.as_bytes()).await {
+            return open_error("write", &path, error, &self.workspace);
         }
         ToolOutput::success(WriteFileOutput {
             path: self.workspace.relative_display(&path),
