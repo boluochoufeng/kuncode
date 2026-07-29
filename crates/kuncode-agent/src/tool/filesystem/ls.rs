@@ -9,8 +9,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::helpers::{
-    SymlinkTarget, io_error, is_inside_vcs_store, non_empty_path, relative_slash, symlink_target,
-    workspace_error, workspace_walk_builder,
+    SymlinkTarget, io_error, is_inside_vcs_store, non_empty_path, symlink_target, workspace_error,
+    workspace_walk_builder,
 };
 use crate::{
     permission::{
@@ -98,6 +98,10 @@ pub struct LsOutput {
     /// Total entries found before the cap was applied. Compare against
     /// [`Self::entries`] to see how much the listing left out.
     pub total_entries: usize,
+    /// Entries counted in [`Self::total_entries`] but impossible to name,
+    /// because their file names have no workspace-relative text form.
+    #[serde(skip_serializing_if = "super::helpers::is_zero")]
+    pub unrepresentable_entries: usize,
 }
 
 /// Canonical directory paired with validated listing arguments.
@@ -169,7 +173,15 @@ impl TypedTool for Ls {
 
         let canonical_path = CanonicalPath::from_absolute(&resolved)
             .map_err(|error| ToolOutput::failure("invalid_arguments", error.to_string()))?;
-        let display_path = self.workspace.relative_display(&resolved);
+        // Not `relative_display`: this string becomes the subtree permission
+        // pattern below, so a lossy rendering would have the check authorize a
+        // directory other than the one about to be read.
+        let Some(display_path) = self.workspace.relative_path(&resolved) else {
+            return Err(ToolOutput::failure(
+                "invalid_arguments",
+                "the resolved directory name is not valid UTF-8 and cannot be listed",
+            ));
+        };
         let canonical_input = CanonicalToolInput::new(serde_json::json!({
             "path": canonical_path.as_str(),
             "recursive": args.recursive,
@@ -253,7 +265,7 @@ impl TypedTool for Ls {
         // on the blocking pool to keep the async runtime free.
         let workspace = self.workspace.clone();
         let directory = path.clone();
-        let (entries, total_entries) = match tokio::task::spawn_blocking(move || {
+        let listing = match tokio::task::spawn_blocking(move || {
             walk_directory(&workspace, &directory, recursive, include_ignored)
         })
         .await
@@ -267,11 +279,15 @@ impl TypedTool for Ls {
             }
         };
 
-        let truncated = total_entries > entries.len();
+        // The cap is not the only reason the listing can be short of the total:
+        // an unnameable entry is counted and then left out too, and either way
+        // the result is incomplete.
+        let truncated = listing.total > listing.entries.len();
         let output = ToolOutput::success(LsOutput {
             directory: display_path,
-            entries,
-            total_entries,
+            entries: listing.entries,
+            total_entries: listing.total,
+            unrepresentable_entries: listing.unrepresentable,
         });
 
         if truncated {
@@ -318,13 +334,14 @@ fn walk_directory(
     directory: &Path,
     recursive: bool,
     include_ignored: bool,
-) -> (Vec<LsEntry>, usize) {
+) -> Listing {
     let mut builder = workspace_walk_builder(workspace, directory, include_ignored);
     if !recursive {
         builder.max_depth(Some(1));
     }
 
     let mut walked = Vec::new();
+    let mut unrepresentable = 0;
     for result in builder.build() {
         // Skip unreadable entries (permissions, races) rather than aborting the
         // whole listing, matching ripgrep's resilience. The root's own error is
@@ -351,11 +368,18 @@ fn walk_directory(
             LsEntryKind::File
         };
 
-        walked.push((relative_slash(workspace, path), kind, path.to_path_buf()));
+        // An entry whose name has no faithful text form is counted, not
+        // reported: the caller would only be able to feed such a path back to
+        // `read_file`, where it names a different file or none at all.
+        let Some(relative) = workspace.relative_path(path) else {
+            unrepresentable += 1;
+            continue;
+        };
+        walked.push((relative, kind, path.to_path_buf()));
     }
 
     walked.sort_by(|left, right| left.0.cmp(&right.0));
-    let total = walked.len();
+    let total = walked.len() + unrepresentable;
     walked.truncate(LS_ENTRY_CAP);
 
     // `stat` runs only on entries that survive the cap: `DirEntry::metadata` is
@@ -373,7 +397,18 @@ fn walk_directory(
         })
         .collect();
 
-    (entries, total)
+    Listing {
+        entries,
+        total,
+        unrepresentable,
+    }
+}
+
+/// One walk's result, before it is shaped into [`LsOutput`].
+struct Listing {
+    entries: Vec<LsEntry>,
+    total: usize,
+    unrepresentable: usize,
 }
 
 /// Builds the approval-facing summary.
@@ -854,11 +889,61 @@ mod tests {
     async fn listing_the_workspace_root_authorizes_the_whole_tree() {
         let tmp = TestDir::new();
 
-        // `relative_display` renders the root as ".", which has to normalize to
-        // a root-relative pattern rather than a rejected `./**`.
+        // The root's relative form is ".", which has to normalize to a
+        // root-relative pattern rather than a rejected `./**`.
         assert_eq!(
             subtree_pattern(tmp.workspace().await, serde_json::json!({})).await,
             "**"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_backslash_in_a_name_is_reported_verbatim() {
+        let tmp = TestDir::new();
+        // Both exist, and folding `\` into a separator would report the first
+        // one under the second one's name — an `edit_file` on the reported path
+        // would then rewrite a file the caller never saw.
+        fs::write(tmp.path().join("weird\\name.rs"), "").expect("file should be written");
+        fs::create_dir_all(tmp.path().join("weird")).expect("directory should be created");
+        fs::write(tmp.path().join("weird/name.rs"), "").expect("file should be written");
+        let tool = Ls::new(tmp.workspace().await);
+
+        let output = call(tool, serde_json::json!({ "recursive": true })).await;
+
+        let data = output.data.expect("data present");
+        let paths = data["entries"]
+            .as_array()
+            .expect("entries present")
+            .iter()
+            .map(|entry| entry["path"].as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(paths, ["weird", "weird/name.rs", "weird\\name.rs"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn names_that_are_not_utf8_are_counted_instead_of_listed() {
+        use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+
+        let tmp = TestDir::new();
+        fs::write(tmp.path().join("readable.rs"), "").expect("file should be written");
+        fs::write(tmp.path().join(OsStr::from_bytes(b"caf\xff.rs")), "")
+            .expect("file should be written");
+        let tool = Ls::new(tmp.workspace().await);
+
+        let output = call(tool, serde_json::json!({})).await;
+
+        let data = output.data.expect("data present");
+        // Reporting the name lossily would hand back a path nothing can open,
+        // so it is counted: an entry the caller cannot see still must not read
+        // as an entry that is not there.
+        assert_eq!(
+            data["entries"],
+            serde_json::json!([{ "path": "readable.rs", "kind": "file", "size": 0 }])
+        );
+        assert_eq!(data["total_entries"], 2);
+        assert_eq!(data["unrepresentable_entries"], 1);
+        assert!(output.truncated);
     }
 }

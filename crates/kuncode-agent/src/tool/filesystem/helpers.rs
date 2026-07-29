@@ -162,11 +162,13 @@ fn ignore_files_in(directory: &Path, is_workspace_root: bool) -> Option<Gitignor
     builder.build().ok().filter(|matcher| !matcher.is_empty())
 }
 
-/// Renders `path` as the workspace-relative, slash-separated form every tool
-/// speaks: what a discovery tool reports here can be handed straight back to
-/// `read_file` / `write_file` / `edit_file` as their `path` argument.
-pub(super) fn relative_slash(workspace: &Workspace, path: &Path) -> String {
-    workspace.relative_display(path).replace('\\', "/")
+/// Whether a count is zero, for `serde(skip_serializing_if)`.
+///
+/// Counters that report what a listing had to leave out are noise in the
+/// common case where nothing was left out, so they stay out of the payload
+/// entirely until they say something.
+pub(super) fn is_zero(count: &usize) -> bool {
+    *count == 0
 }
 
 /// Where a symlink inside the workspace points.

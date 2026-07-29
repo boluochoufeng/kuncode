@@ -8,7 +8,7 @@ use kuncode_core::non_empty_vec::NonEmptyVec;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::helpers::{SymlinkTarget, relative_slash, symlink_target, workspace_walk_builder};
+use super::helpers::{SymlinkTarget, symlink_target, workspace_walk_builder};
 use crate::{
     glob::{glob_match, normalize_pattern},
     permission::{
@@ -47,6 +47,10 @@ pub struct GlobOutput {
     pub matches: Vec<String>,
     /// Total matches found before output limiting.
     pub total_matches: usize,
+    /// Paths that could not even be considered because their names have no
+    /// workspace-relative text form.
+    #[serde(skip_serializing_if = "super::helpers::is_zero")]
+    pub unrepresentable_paths: usize,
 }
 
 /// Finds workspace paths using a small glob matcher.
@@ -139,11 +143,11 @@ impl TypedTool for Glob {
         // tree walk runs on the blocking pool to keep the async runtime free.
         let workspace = self.workspace.clone();
         let include_ignored = prepared.include_ignored;
-        let entries =
+        let (entries, unrepresentable_paths) =
             match tokio::task::spawn_blocking(move || walk_workspace(&workspace, include_ignored))
                 .await
             {
-                Ok(entries) => entries,
+                Ok(walked) => walked,
                 Err(err) => {
                     return ToolOutput::failure(
                         "internal",
@@ -167,6 +171,7 @@ impl TypedTool for Glob {
             pattern,
             matches,
             total_matches,
+            unrepresentable_paths,
         });
 
         if truncated {
@@ -202,10 +207,11 @@ fn validate_glob_pattern(pattern: &str) -> Result<(), String> {
 /// [`workspace_walk_builder`](super::helpers::workspace_walk_builder).
 ///
 /// Synchronous and thread-based; callers run it on the blocking pool.
-fn walk_workspace(workspace: &Workspace, include_ignored: bool) -> Vec<String> {
+fn walk_workspace(workspace: &Workspace, include_ignored: bool) -> (Vec<String>, usize) {
     let root = workspace.root();
 
     let mut entries = Vec::new();
+    let mut unrepresentable = 0;
     for result in workspace_walk_builder(workspace, root, include_ignored).build() {
         // Skip unreadable entries (permissions, races) rather than aborting the
         // whole search, matching ripgrep's resilience.
@@ -226,11 +232,18 @@ fn walk_workspace(workspace: &Workspace, include_ignored: bool) -> Vec<String> {
             continue;
         }
 
-        entries.push(relative_slash(workspace, path));
+        // Matching happens on the relative text, so a name without one cannot
+        // be tested against the pattern at all. It is counted rather than
+        // dropped silently: an empty result must not read as "no such file"
+        // when something is standing there unnamed.
+        match workspace.relative_path(path) {
+            Some(relative) => entries.push(relative),
+            None => unrepresentable += 1,
+        }
     }
 
     // Traversal order is irrelevant: the caller sorts matches before returning.
-    entries
+    (entries, unrepresentable)
 }
 
 #[cfg(test)]
@@ -390,6 +403,48 @@ mod tests {
             data["matches"],
             serde_json::json!(["inside_link.rs", "keep.rs"])
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_backslash_in_a_name_is_matched_as_part_of_the_name() {
+        let tmp = TestDir::new();
+        fs::write(tmp.path().join("weird\\name.rs"), "").expect("file should be written");
+        let tool = Glob::new(tmp.workspace().await);
+
+        // The file lives at the workspace root, so `*.rs` must find it while
+        // the nested-looking pattern must not.
+        let flat = call(tool.clone(), serde_json::json!({ "pattern": "*.rs" })).await;
+        let nested = call(tool, serde_json::json!({ "pattern": "weird/*.rs" })).await;
+
+        assert_eq!(
+            flat.data.expect("data present")["matches"],
+            serde_json::json!(["weird\\name.rs"])
+        );
+        assert_eq!(
+            nested.data.expect("data present")["matches"],
+            serde_json::json!([])
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn names_that_are_not_utf8_are_counted_as_unconsidered() {
+        use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+
+        let tmp = TestDir::new();
+        fs::write(tmp.path().join(OsStr::from_bytes(b"caf\xff.rs")), "")
+            .expect("file should be written");
+        let tool = Glob::new(tmp.workspace().await);
+
+        let output = call(tool, serde_json::json!({ "pattern": "*.rs" })).await;
+
+        // Matching runs on the relative text, so a name without one is never
+        // tested. Saying so keeps an empty result from reading as "no such
+        // file".
+        let data = output.data.expect("data present");
+        assert_eq!(data["matches"], serde_json::json!([]));
+        assert_eq!(data["unrepresentable_paths"], 1);
     }
 
     #[tokio::test]

@@ -7,6 +7,7 @@ pub mod error;
 pub mod glob;
 pub mod hook;
 pub mod observer;
+pub(crate) mod path_text;
 pub mod permission;
 pub mod registry;
 pub mod runner;

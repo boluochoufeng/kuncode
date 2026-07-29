@@ -212,7 +212,26 @@ impl Workspace {
         }
     }
 
-    /// Displays paths under the workspace as relative paths.
+    /// The workspace-relative, slash-separated form of `path` — the vocabulary
+    /// tool arguments are written in and tool results report back.
+    ///
+    /// Returns `None` when `path` has no faithful form: it lies outside the
+    /// workspace, or a component is not valid UTF-8. Rendering those lossily
+    /// would hand back a name that opens a different file or no file at all, so
+    /// a caller enumerating the filesystem must drop such an entry rather than
+    /// report it. [`Self::relative_display`] stays available for text that only
+    /// a human reads.
+    pub fn relative_path(&self, path: impl AsRef<Path>) -> Option<String> {
+        crate::path_text::relative_slash(&self.root, path.as_ref())
+    }
+
+    /// Displays paths under the workspace as relative paths, for messages a
+    /// human reads.
+    ///
+    /// Lossy by design: a non-UTF-8 name renders with replacement characters
+    /// rather than failing, because an error message must still say something.
+    /// Never feed the result back to a tool as a path — use
+    /// [`Self::relative_path`] for that.
     pub fn relative_display(&self, path: impl AsRef<Path>) -> String {
         let path = path.as_ref();
         match path.strip_prefix(&self.root) {

@@ -1,10 +1,12 @@
 //! Typed, canonical resources that permission rules can match.
 
-use std::path::{Component, Path, PathBuf};
+use std::path::Path;
 
 use serde::Serialize;
 use thiserror::Error;
 use url::Url;
+
+use crate::path_text::{PathTextError, absolute_slash};
 
 const MAX_COMMAND_CHARS: usize = 4_096;
 const MAX_ORIGIN_CHARS: usize = 4_096;
@@ -56,12 +58,16 @@ impl CanonicalPath {
                 path: path.display().to_string(),
             });
         }
-        let normalized = normalize_absolute_path(path)?;
-        let value = normalized
-            .to_str()
-            .ok_or(PermissionTargetError::NonUtf8Path)?
-            .replace('\\', "/");
-        Ok(Self(value))
+        // Rendering is delegated so that a `\` inside a Unix file name stays
+        // part of the name: folding it into a separator here would give two
+        // distinct files one canonical form, and a rule written for either
+        // would then decide both.
+        absolute_slash(path).map(Self).map_err(|error| match error {
+            PathTextError::NonUtf8 => PermissionTargetError::NonUtf8Path,
+            PathTextError::ParentTraversal => PermissionTargetError::ParentTraversal {
+                path: path.display().to_string(),
+            },
+        })
     }
 
     /// Returns the canonical path text used by namespace matchers.
@@ -424,26 +430,6 @@ pub enum PermissionTargetError {
     },
 }
 
-fn normalize_absolute_path(path: &Path) -> Result<PathBuf, PermissionTargetError> {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
-                normalized.push(component.as_os_str());
-            }
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !normalized.pop() {
-                    return Err(PermissionTargetError::ParentTraversal {
-                        path: path.display().to_string(),
-                    });
-                }
-            }
-        }
-    }
-    Ok(normalized)
-}
-
 fn normalize_relative_pattern(pattern: &str) -> Result<String, PermissionTargetError> {
     let pattern = pattern.replace('\\', "/");
     if pattern.starts_with('/') {
@@ -512,6 +498,32 @@ mod tests {
         let path = CanonicalPath::from_absolute(Path::new("/workspace/./src/../lib.rs"))
             .expect("absolute path normalizes");
         assert_eq!(path.as_str(), "/workspace/lib.rs");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn distinct_files_keep_distinct_canonical_forms() {
+        // `\` is an ordinary character in a Unix file name. Folding it into a
+        // separator would give these two files one canonical form, and a rule
+        // written about either would then decide both.
+        let escaped = CanonicalPath::from_absolute(Path::new("/workspace/weird\\name.rs"))
+            .expect("absolute path");
+        let nested = CanonicalPath::from_absolute(Path::new("/workspace/weird/name.rs"))
+            .expect("absolute path");
+        assert_eq!(escaped.as_str(), "/workspace/weird\\name.rs");
+        assert_ne!(escaped, nested);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_paths_have_no_canonical_form() {
+        use std::{ffi::OsStr, os::unix::ffi::OsStrExt, path::PathBuf};
+
+        let path = PathBuf::from("/workspace").join(OsStr::from_bytes(b"caf\xff"));
+        assert!(matches!(
+            CanonicalPath::from_absolute(&path),
+            Err(PermissionTargetError::NonUtf8Path)
+        ));
     }
 
     #[test]
