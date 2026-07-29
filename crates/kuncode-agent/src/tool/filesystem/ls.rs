@@ -9,8 +9,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::helpers::{
-    SymlinkTarget, io_error, is_inside_vcs_store, non_empty_path, symlink_target, workspace_error,
-    workspace_walk_builder,
+    SymlinkTarget, io_error, is_inside_vcs_store, non_empty_path, revalidate_path, symlink_target,
+    walk_entries, workspace_error,
 };
 use crate::{
     permission::{
@@ -308,20 +308,7 @@ impl TypedTool for Ls {
         prepared: &mut PreparedLs,
         _ctx: &ToolContext,
     ) -> Result<PreparedInvocationState, ToolError> {
-        Ok(
-            if self
-                .workspace
-                .revalidate_target(&prepared.path)
-                .await
-                .is_ok()
-            {
-                PreparedInvocationState::Current
-            } else {
-                // Re-preparation produces the model-safe path diagnostic against
-                // current metadata without executing the stale payload.
-                PreparedInvocationState::Stale
-            },
-        )
+        revalidate_path(&self.workspace, &prepared.path).await
     }
 }
 
@@ -330,9 +317,9 @@ impl TypedTool for Ls {
 ///
 /// The walk is rooted at `directory` rather than at the workspace root, so an
 /// explicit listing of a hidden or ignored directory (`ls target`) still
-/// returns its contents; [`workspace_walk_builder`] supplies the ignore rules
-/// declared above `directory` separately, so everything *inside* stays filtered
-/// exactly as it would be when seen from the workspace root.
+/// returns its contents; [`walk_entries`] supplies the ignore rules declared
+/// above `directory` separately, so everything *inside* stays filtered exactly
+/// as it would be when seen from the workspace root.
 ///
 /// Synchronous and thread-based; callers run it on the blocking pool.
 fn walk_directory(
@@ -341,48 +328,27 @@ fn walk_directory(
     recursive: bool,
     include_ignored: bool,
 ) -> Listing {
-    let mut builder = workspace_walk_builder(workspace, directory, include_ignored);
-    if !recursive {
-        builder.max_depth(Some(1));
-    }
-
-    let mut walked = Vec::new();
-    let mut unrepresentable = 0;
-    for result in builder.build() {
-        // Skip unreadable entries (permissions, races) rather than aborting the
-        // whole listing, matching ripgrep's resilience. The root's own error is
-        // not among them: the caller opens `directory` before walking it.
-        let Ok(entry) = result else { continue };
-        let path = entry.path();
-        if path == directory {
-            continue;
-        }
-        let Some(file_type) = entry.file_type() else {
-            continue;
-        };
-
-        let kind = if file_type.is_dir() {
-            LsEntryKind::Directory
-        } else if file_type.is_symlink() {
-            // Only a link that resolves *outside* is dropped; see
-            // [`LsEntryKind::Symlink`] for why a dangling one is kept.
-            if symlink_target(path, workspace) == SymlinkTarget::Outside {
-                continue;
-            }
-            LsEntryKind::Symlink
-        } else {
-            LsEntryKind::File
-        };
-
-        // An entry whose name has no faithful text form is counted, not
-        // reported: the caller would only be able to feed such a path back to
-        // `read_file`, where it names a different file or none at all.
-        let Some(relative) = workspace.relative_path(path) else {
-            unrepresentable += 1;
-            continue;
-        };
-        walked.push((relative, kind, path.to_path_buf()));
-    }
+    let (mut walked, unrepresentable) = walk_entries(
+        workspace,
+        directory,
+        (!recursive).then_some(1),
+        include_ignored,
+        |entry| {
+            let kind = if entry.file_type.is_dir() {
+                LsEntryKind::Directory
+            } else if entry.file_type.is_symlink() {
+                // Only a link that resolves *outside* is dropped; see
+                // [`LsEntryKind::Symlink`] for why a dangling one is kept.
+                if symlink_target(entry.path, workspace) == SymlinkTarget::Outside {
+                    return None;
+                }
+                LsEntryKind::Symlink
+            } else {
+                LsEntryKind::File
+            };
+            Some((entry.relative, kind, entry.path.to_path_buf()))
+        },
+    );
 
     walked.sort_by(|left, right| left.0.cmp(&right.0));
     let total = walked.len() + unrepresentable;

@@ -8,7 +8,9 @@ use kuncode_core::non_empty_vec::NonEmptyVec;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::helpers::{non_empty_path, open_error, workspace_error, write_no_follow};
+use super::helpers::{
+    non_empty_path, open_error, revalidate_path, workspace_error, write_no_follow,
+};
 use crate::{
     permission::{
         CanonicalPath, CanonicalToolInput, PathSelector, PermissionCheckSpec, PermissionTarget,
@@ -130,18 +132,7 @@ impl TypedTool for WriteFile {
         prepared: &mut PreparedWriteFile,
         _ctx: &ToolContext,
     ) -> Result<PreparedInvocationState, ToolError> {
-        Ok(
-            if self
-                .workspace
-                .revalidate_target(&prepared.path)
-                .await
-                .is_ok()
-            {
-                PreparedInvocationState::Current
-            } else {
-                PreparedInvocationState::Stale
-            },
-        )
+        revalidate_path(&self.workspace, &prepared.path).await
     }
 }
 

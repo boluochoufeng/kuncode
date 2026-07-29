@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 use tokio::{fs::OpenOptions, io::AsyncReadExt};
 
 use super::helpers::{
-    io_error, non_empty_path, open_error, open_no_follow, workspace_error, write_no_follow,
+    io_error, non_empty_path, open_error, open_no_follow, revalidate_path, workspace_error,
+    write_no_follow,
 };
 use crate::{
     permission::{
@@ -183,18 +184,7 @@ impl TypedTool for EditFile {
         prepared: &mut PreparedEditFile,
         _ctx: &ToolContext,
     ) -> Result<PreparedInvocationState, ToolError> {
-        Ok(
-            if self
-                .workspace
-                .revalidate_target(&prepared.path)
-                .await
-                .is_ok()
-            {
-                PreparedInvocationState::Current
-            } else {
-                PreparedInvocationState::Stale
-            },
-        )
+        revalidate_path(&self.workspace, &prepared.path).await
     }
 }
 

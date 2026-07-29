@@ -8,7 +8,7 @@ use kuncode_core::non_empty_vec::NonEmptyVec;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::helpers::{SymlinkTarget, symlink_target, workspace_walk_builder};
+use super::helpers::{SymlinkTarget, symlink_target, walk_entries};
 use crate::{
     glob::{glob_match, normalize_pattern},
     permission::{
@@ -201,49 +201,32 @@ fn validate_glob_pattern(pattern: &str) -> Result<(), String> {
 }
 
 /// Walks the whole workspace, returning every entry as a workspace-relative,
-/// slash-separated path.
+/// slash-separated path, plus the count of entries that have no such path.
 ///
-/// Ignore handling and the `.git` skip come from
-/// [`workspace_walk_builder`](super::helpers::workspace_walk_builder).
+/// Matching happens on the relative text, so an entry without one cannot be
+/// tested against the pattern at all — hence the count, so that an empty result
+/// does not read as "no such file" while something stands there unnamed.
 ///
+/// Traversal order is irrelevant: the caller sorts matches before returning.
 /// Synchronous and thread-based; callers run it on the blocking pool.
 fn walk_workspace(workspace: &Workspace, include_ignored: bool) -> (Vec<String>, usize) {
-    let root = workspace.root();
-
-    let mut entries = Vec::new();
-    let mut unrepresentable = 0;
-    for result in workspace_walk_builder(workspace, root, include_ignored).build() {
-        // Skip unreadable entries (permissions, races) rather than aborting the
-        // whole search, matching ripgrep's resilience.
-        let Ok(entry) = result else { continue };
-        let path = entry.path();
-        if path == root {
-            continue;
-        }
-
-        // A search advertises only links it could actually hand to
-        // `read_file`/`write_file`, so anything that does not resolve inside the
-        // workspace — escaping or dangling — is dropped.
-        if entry
-            .file_type()
-            .is_some_and(|file_type| file_type.is_symlink())
-            && symlink_target(path, workspace) != SymlinkTarget::Inside
-        {
-            continue;
-        }
-
-        // Matching happens on the relative text, so a name without one cannot
-        // be tested against the pattern at all. It is counted rather than
-        // dropped silently: an empty result must not read as "no such file"
-        // when something is standing there unnamed.
-        match workspace.relative_path(path) {
-            Some(relative) => entries.push(relative),
-            None => unrepresentable += 1,
-        }
-    }
-
-    // Traversal order is irrelevant: the caller sorts matches before returning.
-    (entries, unrepresentable)
+    walk_entries(
+        workspace,
+        workspace.root(),
+        None,
+        include_ignored,
+        |entry| {
+            // A search advertises only links it could actually hand to
+            // `read_file`/`write_file`, so anything that does not resolve inside the
+            // workspace — escaping or dangling — is dropped.
+            if entry.file_type.is_symlink()
+                && symlink_target(entry.path, workspace) != SymlinkTarget::Inside
+            {
+                return None;
+            }
+            Some(entry.relative)
+        },
+    )
 }
 
 #[cfg(test)]

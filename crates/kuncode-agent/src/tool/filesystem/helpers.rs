@@ -5,7 +5,7 @@
 //! ls). A helper used by a single tool lives beside that tool instead, so this
 //! module stays the genuinely shared base.
 
-use std::{ffi::OsStr, io, path::Path};
+use std::{ffi::OsStr, fs::FileType, io, path::Path};
 
 use ignore::{
     Match, WalkBuilder,
@@ -17,7 +17,7 @@ use tokio::{
 };
 
 use crate::{
-    tool::ToolOutput,
+    tool::{PreparedInvocationState, ToolError, ToolOutput},
     workspace::{Workspace, WorkspaceError},
 };
 
@@ -49,6 +49,23 @@ pub(super) fn io_error<D>(
             workspace.relative_display(path)
         ),
     )
+}
+
+/// Re-resolves a prepared path and reports whether the invocation still stands.
+///
+/// Every path tool asks the same question before acting: does this path still
+/// resolve to what was authorized? A failure is not raised as an error —
+/// re-preparation produces the model-safe path diagnostic against current
+/// metadata, without executing the stale payload.
+pub(super) async fn revalidate_path(
+    workspace: &Workspace,
+    path: &Path,
+) -> Result<PreparedInvocationState, ToolError> {
+    Ok(if workspace.revalidate_target(path).await.is_ok() {
+        PreparedInvocationState::Current
+    } else {
+        PreparedInvocationState::Stale
+    })
 }
 
 /// Why a prepared path could not be opened.
@@ -140,6 +157,70 @@ pub(super) fn open_error<D>(
     }
 }
 
+/// One walked entry, in the form every tool here consumes it.
+pub(super) struct WalkedEntry<'a> {
+    /// Absolute path on disk.
+    pub path: &'a Path,
+    /// Workspace-relative, slash-separated form of [`Self::path`].
+    pub relative: String,
+    /// What the entry is, resolved without following symlinks.
+    pub file_type: FileType,
+}
+
+/// Walks below `root`, handing each nameable entry to `visit` and collecting
+/// whatever `visit` keeps.
+///
+/// The second return value counts the entries dropped for having no
+/// workspace-relative name. Reporting it is the caller's job: an entry that
+/// cannot be described must not read as an entry that is not there.
+///
+/// `max_depth` of `Some(1)` restricts the walk to the root's own children;
+/// `None` walks the whole tree. The root itself is never visited, and an
+/// unreadable entry is skipped rather than aborting the walk, matching
+/// ripgrep's resilience. Ignore handling and the `.git` skip come from
+/// [`workspace_walk_builder`], including the ignore rules declared above a
+/// `root` deeper than the workspace — so listing a subdirectory filters
+/// exactly as the same paths would when seen from the workspace root.
+///
+/// Synchronous and thread-based; callers run it on the blocking pool.
+pub(super) fn walk_entries<T>(
+    workspace: &Workspace,
+    root: &Path,
+    max_depth: Option<usize>,
+    include_ignored: bool,
+    mut visit: impl FnMut(WalkedEntry<'_>) -> Option<T>,
+) -> (Vec<T>, usize) {
+    let mut builder = workspace_walk_builder(workspace, root, include_ignored);
+    builder.max_depth(max_depth);
+
+    let mut kept = Vec::new();
+    let mut unnameable = 0;
+    for result in builder.build() {
+        let Ok(entry) = result else { continue };
+        let path = entry.path();
+        if path == root {
+            continue;
+        }
+        // `None` here means the entry is stdin, which this walk cannot produce.
+        let Some(file_type) = entry.file_type() else {
+            continue;
+        };
+        let Some(relative) = workspace.relative_path(path) else {
+            unnameable += 1;
+            continue;
+        };
+        if let Some(item) = visit(WalkedEntry {
+            path,
+            relative,
+            file_type,
+        }) {
+            kept.push(item);
+        }
+    }
+
+    (kept, unnameable)
+}
+
 /// Builds a walker over `walk_root` honoring the project's own notion of noise.
 ///
 /// Which paths are noise is delegated to the project rather than a hardcoded
@@ -155,7 +236,7 @@ pub(super) fn open_error<D>(
 ///
 /// The returned walker is synchronous and thread-based; callers run it on the
 /// blocking pool.
-pub(super) fn workspace_walk_builder(
+fn workspace_walk_builder(
     workspace: &Workspace,
     walk_root: &Path,
     include_ignored: bool,

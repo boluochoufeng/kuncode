@@ -12,7 +12,9 @@ use tokio::{
     io::{AsyncBufReadExt, BufReader},
 };
 
-use super::helpers::{io_error, non_empty_path, open_error, open_no_follow, workspace_error};
+use super::helpers::{
+    io_error, non_empty_path, open_error, open_no_follow, revalidate_path, workspace_error,
+};
 use crate::{
     permission::{
         CanonicalPath, CanonicalToolInput, PathSelector, PermissionCheckSpec, PermissionTarget,
@@ -273,20 +275,7 @@ impl TypedTool for ReadFile {
         prepared: &mut PreparedReadFile,
         _ctx: &ToolContext,
     ) -> Result<PreparedInvocationState, ToolError> {
-        Ok(
-            if self
-                .workspace
-                .revalidate_target(&prepared.path)
-                .await
-                .is_ok()
-            {
-                PreparedInvocationState::Current
-            } else {
-                // Re-preparation produces the model-safe path diagnostic against
-                // current metadata without executing the stale payload.
-                PreparedInvocationState::Stale
-            },
-        )
+        revalidate_path(&self.workspace, &prepared.path).await
     }
 }
 
