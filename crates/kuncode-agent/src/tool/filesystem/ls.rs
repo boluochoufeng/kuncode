@@ -727,6 +727,32 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_deny_rule_does_not_make_the_git_directory_listable() {
+        let tmp = TestDir::new();
+        fs::create_dir_all(tmp.path().join(".git")).expect("directory should be created");
+        fs::write(tmp.path().join(".git/packed.rs"), "").expect("file should be written");
+        fs::write(tmp.path().join("keep.rs"), "").expect("file should be written");
+        let workspace = tmp.workspace().await;
+        // An unrelated deny rule installs the visibility filter; the VCS skip
+        // must survive it rather than be traded away for it.
+        let ctx = denying(&workspace, "Read(secrets/**)");
+
+        let output = call_with(
+            Ls::new(workspace),
+            serde_json::json!({ "include_ignored": true }),
+            &ctx,
+        )
+        .await;
+
+        assert!(output.ok);
+        let data = output.data.expect("data present");
+        assert_eq!(
+            data["entries"],
+            serde_json::json!([{ "path": "keep.rs", "kind": "file", "size": 0 }])
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn ls_drops_escaping_symlinks_but_keeps_internal_ones() {

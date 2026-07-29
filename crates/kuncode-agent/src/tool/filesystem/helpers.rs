@@ -9,7 +9,7 @@ use std::{
     ffi::OsStr,
     fs::FileType,
     io,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -218,34 +218,14 @@ pub(super) fn walk_entries<T>(
     visibility: &PathVisibility,
     mut visit: impl FnMut(WalkedEntry<'_>) -> Option<T>,
 ) -> Walked<T> {
-    let mut builder = workspace_walk_builder(workspace, root, include_ignored);
-    builder.max_depth(max_depth);
-
     let hidden = Arc::new(AtomicUsize::new(0));
-    if !visibility.is_unrestricted() {
-        let visibility = visibility.clone();
-        let counter = Arc::clone(&hidden);
-        let walk_root = root.to_path_buf();
-        builder.filter_entry(move |entry| {
-            // The root's own authorization was decided before the call ran;
-            // re-deciding it here would only turn a rejection into an empty
-            // listing.
-            if entry.path() == walk_root {
-                return true;
-            }
-            // A path with no canonical form cannot be matched against a rule at
-            // all. It is dropped below and counted as unnameable, which says
-            // more than counting it as hidden would.
-            let Ok(path) = CanonicalPath::from_absolute(entry.path()) else {
-                return true;
-            };
-            if visibility.hides(&path) {
-                counter.fetch_add(1, Ordering::Relaxed);
-                return false;
-            }
-            true
-        });
-    }
+    let mut builder = workspace_walk_builder(
+        workspace,
+        root,
+        include_ignored,
+        WithheldPaths::new(visibility, root, Arc::clone(&hidden)),
+    );
+    builder.max_depth(max_depth);
 
     let mut kept = Vec::new();
     let mut unnameable = 0;
@@ -304,12 +284,18 @@ pub(super) fn walk_entries<T>(
 /// root from every filter — including this one — so a caller that lets
 /// `walk_root` be user-supplied must reject a root inside the VCS store itself.
 ///
+/// Permission filtering is folded in here rather than layered on by the caller:
+/// [`WalkBuilder::filter_entry`] keeps only the predicate it was given last, so
+/// a second call would silently retire the VCS and ancestor-ignore skips above.
+/// Every reason to drop an entry has to be decided in the one closure below.
+///
 /// The returned walker is synchronous and thread-based; callers run it on the
 /// blocking pool.
 fn workspace_walk_builder(
     workspace: &Workspace,
     walk_root: &Path,
     include_ignored: bool,
+    withheld: WithheldPaths,
 ) -> WalkBuilder {
     let enabled = !include_ignored;
     // `WalkBuilder` reads ignore files only from the tree it walks, so a walk
@@ -338,8 +324,49 @@ fn workspace_walk_builder(
                         .file_type()
                         .is_some_and(|file_type| file_type.is_dir()),
                 )
+                && withheld.admits(entry.path())
         });
     builder
+}
+
+/// Read paths a walk must not surface, and the tally of what it dropped.
+///
+/// Ordered after the noise filters in the predicate above, so an entry skipped
+/// as VCS or ignored noise is never also counted as withheld by policy.
+struct WithheldPaths {
+    visibility: PathVisibility,
+    walk_root: PathBuf,
+    counter: Arc<AtomicUsize>,
+}
+
+impl WithheldPaths {
+    fn new(visibility: &PathVisibility, walk_root: &Path, counter: Arc<AtomicUsize>) -> Self {
+        Self {
+            visibility: visibility.clone(),
+            walk_root: walk_root.to_path_buf(),
+            counter,
+        }
+    }
+
+    /// Whether the walk may surface `path`, counting it when it may not.
+    fn admits(&self, path: &Path) -> bool {
+        // The root's own authorization was decided before the call ran;
+        // re-deciding it here would only turn a rejection into an empty listing.
+        if self.visibility.is_unrestricted() || path == self.walk_root {
+            return true;
+        }
+        // A path with no canonical form cannot be matched against a rule at all.
+        // It is dropped by the caller and counted as unnameable, which says more
+        // than counting it as withheld would.
+        let Ok(candidate) = CanonicalPath::from_absolute(path) else {
+            return true;
+        };
+        if self.visibility.hides(&candidate) {
+            self.counter.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        true
+    }
 }
 
 /// Ignore rules declared between the workspace root and a deeper walk root.
