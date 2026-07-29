@@ -15,12 +15,15 @@ use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::Subscribe
 use crate::settings::{LoggingSettings, SettingsError, load_logging_settings};
 
 const DEFAULT_LEVEL: &str = "info";
+/// Every target the crates actually emit on. The filter is `off` plus these, so
+/// a target missing here is discarded outright — keep it in step with the
+/// `target:` names in the source, not with module paths.
 const PROJECT_TARGETS: [&str; 9] = [
     "kuncode::agent",
+    "kuncode::authorization",
     "kuncode::compaction",
     "kuncode::hook",
     "kuncode::logging",
-    "kuncode::permission",
     "kuncode::persistence",
     "kuncode::provider",
     "kuncode::runtime",
