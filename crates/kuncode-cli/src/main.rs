@@ -42,6 +42,12 @@ pub(crate) struct Cli {
     /// Trust this workspace's permission relaxations for the current process.
     #[arg(long)]
     pub(crate) trust_project: bool,
+    /// User-level provider profile selected for this run.
+    #[arg(long, value_name = "PROFILE")]
+    pub(crate) profile: Option<String>,
+    /// Model identifier overriding profile and trusted project defaults.
+    #[arg(long, value_name = "MODEL")]
+    pub(crate) model: Option<String>,
     /// Prompt to run. Omit to start an interactive session.
     #[arg(trailing_var_arg = true)]
     prompt: Vec<String>,

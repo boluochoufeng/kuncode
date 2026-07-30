@@ -11,7 +11,7 @@ pub mod retry;
 pub mod streaming;
 
 pub use message::{
-    AssistantContent, Message, Reasoning, ReasoningContent, Text, ToolCall, ToolChoice,
+    AssistantContent, Message, Reasoning, ReasoningContent, Refusal, Text, ToolCall, ToolChoice,
     ToolFunction, ToolResult, ToolResultContent, UserContent,
 };
 

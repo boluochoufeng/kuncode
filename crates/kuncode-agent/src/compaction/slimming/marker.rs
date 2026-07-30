@@ -139,6 +139,7 @@ fn assistant_call<'a>(
         AssistantContent::ToolCall(call) if call.id == result_id => Some(call),
         AssistantContent::Text(_)
         | AssistantContent::Reasoning(_)
+        | AssistantContent::Refusal(_)
         | AssistantContent::ToolCall(_) => None,
     })
 }
