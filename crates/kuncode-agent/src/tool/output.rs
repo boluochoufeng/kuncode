@@ -152,6 +152,31 @@ impl<D> ToolOutput<D> {
     }
 }
 
+/// Truncates `input` to at most `max_bytes` bytes, backing off to the nearest
+/// UTF-8 code-point boundary so the result is always valid UTF-8, and reports
+/// whether anything was dropped.
+///
+/// This guards the *code-point* boundary (one Rust `char`), not the *grapheme
+/// cluster* (what a user sees as one character). A grapheme can span several
+/// code points — `e` + combining accent, a ZWJ emoji sequence, a flag — and the
+/// cut may land between them, leaving a lone combining mark or a half emoji. The
+/// bytes stay valid UTF-8; only the rendered glyph may look odd. This is
+/// deliberate: grapheme segmentation needs an extra crate (`unicode-segmentation`)
+/// and only matters in degenerate cases (a minified line, a base64 blob), so it
+/// is not worth the dependency.
+pub(crate) fn truncate_utf8(input: &str, max_bytes: usize) -> (String, bool) {
+    if input.len() <= max_bytes {
+        return (input.to_string(), false);
+    }
+
+    let mut end = max_bytes;
+    while !input.is_char_boundary(end) {
+        end -= 1;
+    }
+
+    (input[..end].to_string(), true)
+}
+
 fn bounded_error_message(message: String) -> String {
     let mut bounded = String::with_capacity(message.len().min(MAX_TOOL_ERROR_BYTES));
     for character in message.chars() {

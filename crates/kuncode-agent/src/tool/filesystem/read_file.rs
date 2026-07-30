@@ -21,7 +21,7 @@ use crate::{
     },
     tool::{
         PreparationContext, PreparedInvocationState, ToolContext, ToolError, ToolOutput,
-        TypedPreparation, TypedTool, definition_for,
+        TypedPreparation, TypedTool, definition_for, output::truncate_utf8,
     },
     workspace::Workspace,
 };
@@ -286,30 +286,6 @@ fn line_truncated_marker(elided_bytes: usize) -> String {
     format!(
         "…⟨kuncode: line truncated, {elided_bytes} more bytes — re-reading won't return them; use grep⟩"
     )
-}
-
-/// Truncates `input` to at most `max_bytes` bytes, backing off to the nearest
-/// UTF-8 code-point boundary so the result is always valid UTF-8.
-///
-/// This guards the *code-point* boundary (one Rust `char`), not the *grapheme
-/// cluster* (what a user sees as one character). A grapheme can span several
-/// code points — `e` + combining accent, a ZWJ emoji sequence, a flag — and the
-/// cut may land between them, leaving a lone combining mark or a half emoji. The
-/// bytes stay valid UTF-8; only the rendered glyph may look odd. This is
-/// deliberate: grapheme segmentation needs an extra crate (`unicode-segmentation`)
-/// and only matters in the degenerate over-long-line case (minified JS, base64),
-/// so it is not worth the dependency.
-fn truncate_utf8(input: &str, max_bytes: usize) -> (String, bool) {
-    if input.len() <= max_bytes {
-        return (input.to_string(), false);
-    }
-
-    let mut end = max_bytes;
-    while !input.is_char_boundary(end) {
-        end -= 1;
-    }
-
-    (input[..end].to_string(), true)
 }
 
 #[cfg(test)]
