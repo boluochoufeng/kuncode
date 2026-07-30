@@ -12,7 +12,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
-use super::{MAX_BODY_BYTES, MAX_CONTENT_BYTES, MAX_SAME_ORIGIN_REDIRECTS, WebFetch, WebFetchArgs};
+use super::{
+    MAX_BODY_BYTES, MAX_CONTENT_BYTES, MAX_SAME_ORIGIN_REDIRECTS, WebFetch, WebFetchArgs, paginate,
+};
 use crate::permission::{PermissionTarget, PermissionTargetError};
 use crate::tool::{PreparationContext, Tool, ToolContext, ToolOutput, execute_for_test};
 
@@ -93,18 +95,65 @@ fn redirect(status: &str, location: &str) -> Vec<u8> {
     .into_bytes()
 }
 
+/// Serves `payload` under `Content-Encoding: gzip`, which the client only asks
+/// for — and only undoes — while the `gzip` feature is on.
+fn gzipped_response(content_type: &str, payload: &str) -> Vec<u8> {
+    let body = gzip_frame(payload.as_bytes());
+    let mut message = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    message.extend_from_slice(&body);
+    message
+}
+
+/// Wraps `payload` in a gzip frame that stores it rather than compressing it.
+///
+/// DEFLATE's stored block needs no encoder, so this fixture stays readable — the
+/// payload sits verbatim in the bytes — while still being a frame the client has
+/// to unwrap. What is under test is the client's side of the exchange, not a
+/// compression ratio.
+fn gzip_frame(payload: &[u8]) -> Vec<u8> {
+    let length = u16::try_from(payload.len()).expect("fixture payload fits one stored block");
+    let mut framed = vec![0x1f, 0x8b, 0x08, 0, 0, 0, 0, 0, 0, 0xff];
+    framed.push(0x01); // Final block, stored.
+    framed.extend_from_slice(&length.to_le_bytes());
+    framed.extend_from_slice(&(!length).to_le_bytes());
+    framed.extend_from_slice(payload);
+    // A decoder rejects the frame outright if either trailer is wrong.
+    framed.extend_from_slice(&crc32(payload).to_le_bytes());
+    framed.extend_from_slice(&u32::from(length).to_le_bytes());
+    framed
+}
+
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for byte in data {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = if crc & 1 == 1 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
 fn tool() -> Arc<WebFetch> {
     Arc::new(WebFetch::new().expect("HTTP client builds"))
 }
 
 async fn fetch(url: &str) -> ToolOutput {
-    execute_for_test(
-        tool(),
-        serde_json::json!({ "url": url }),
-        &ToolContext::new(),
-    )
-    .await
-    .expect("no harness-level error")
+    fetch_with(serde_json::json!({ "url": url })).await
+}
+
+async fn fetch_with(arguments: serde_json::Value) -> ToolOutput {
+    execute_for_test(tool(), arguments, &ToolContext::new())
+        .await
+        .expect("no harness-level error")
 }
 
 #[tokio::test]
@@ -306,24 +355,215 @@ async fn an_empty_body_is_reported_as_empty_rather_than_as_a_failure() {
 }
 
 #[tokio::test]
-async fn both_caps_bound_the_returned_content() {
+async fn each_cap_says_whether_a_later_call_can_reach_what_it_withheld() {
     // One body trips both: more bytes than the socket cap reads, and more text
-    // than the model cap returns.
+    // than one page returns.
     let body = "x".repeat(MAX_BODY_BYTES + 1_024);
     let server = TestServer::new(vec![response("200 OK", "text/plain", &body)]).await;
 
     let output = fetch(&server.url("/big.txt")).await;
 
     assert!(output.ok);
+    // Only the body cap counts as truncation. Its bytes are gone for good, while
+    // the text past this page is merely unread.
     assert!(output.truncated);
     let data = output.data.expect("data present");
     assert_eq!(data["body_bytes"], MAX_BODY_BYTES);
+    assert_eq!(data["start_index"], 0);
+    assert_eq!(data["next_index"], MAX_CONTENT_BYTES);
     let content = data["content"].as_str().expect("content is a string");
     assert!(content.starts_with(&"x".repeat(MAX_CONTENT_BYTES)));
-    // The marker names both caps and says a second call will not continue.
-    assert!(content.contains("response body capped"));
-    assert!(content.contains("text capped"));
-    assert!(content.contains("fetching again will not add it"));
+    // And the marker keeps the two apart: one is an instruction, one is a loss.
+    assert!(content.contains(&format!("start_index={MAX_CONTENT_BYTES}")));
+    assert!(content.contains("response body cut off"));
+    assert!(content.contains("no later call will reach"));
+}
+
+#[tokio::test]
+async fn paging_reassembles_the_whole_page_on_line_boundaries() {
+    let body = (0..300)
+        .map(|index| format!("guide line {index} — what it explains"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let page_bytes: usize = 900;
+    // The loop below asserts the walk terminates on its own; the spare responses
+    // only keep the server from being what stops it.
+    let server = TestServer::new(vec![response("200 OK", "text/plain", &body); 24]).await;
+    let url = server.url("/guide.txt");
+
+    let mut reassembled = String::new();
+    let mut next = Some(0u64);
+    let mut pages = 0;
+    while let Some(start_index) = next {
+        let output = fetch_with(serde_json::json!({
+            "url": &url,
+            "start_index": start_index,
+            "max_length": page_bytes,
+        }))
+        .await;
+
+        assert!(output.ok);
+        // Paging is not truncating: every byte stays reachable, so the flag that
+        // means "content was dropped" must stay clear.
+        assert!(!output.truncated);
+        let data = output.data.expect("data present");
+        assert_eq!(data["start_index"], start_index);
+        assert_eq!(data["content_bytes"], body.len() as u64);
+        let content = data["content"].as_str().expect("content is a string");
+        next = data["next_index"].as_u64();
+
+        let page = match next {
+            // The marker is metadata about the page, not part of it.
+            Some(_) => {
+                let (page, marker) = content
+                    .split_once("\n…⟨kuncode:")
+                    .expect("a continued page carries the marker");
+                assert!(marker.contains("start_index="));
+                // A break lands just after a newline, so no line is ever split.
+                assert!(page.ends_with('\n'));
+                page
+            }
+            None => content,
+        };
+        assert!(page.len() <= page_bytes);
+        reassembled.push_str(page);
+        pages += 1;
+    }
+
+    assert!(
+        pages > 3,
+        "{} bytes should not fit in {pages} pages",
+        body.len()
+    );
+    assert_eq!(reassembled, body);
+}
+
+#[tokio::test]
+async fn a_start_index_past_the_end_returns_no_text_rather_than_failing() {
+    let body = "short page";
+    let server = TestServer::new(vec![response("200 OK", "text/plain", body)]).await;
+
+    let output = fetch_with(serde_json::json!({
+        "url": server.url("/short.txt"),
+        "start_index": 5_000,
+    }))
+    .await;
+
+    assert!(output.ok);
+    let data = output.data.expect("data present");
+    assert_eq!(data["content"], "");
+    // Clamped to the end, and reported next to the real size so the model can see
+    // that it overshot rather than that the page was empty.
+    assert_eq!(data["start_index"], body.len() as u64);
+    assert_eq!(data["content_bytes"], body.len() as u64);
+    assert!(data["next_index"].is_null());
+}
+
+#[tokio::test]
+async fn a_zero_max_length_is_refused_before_anything_is_dialed() {
+    // No server stands behind this URL: the check belongs to preparation, so the
+    // call must fail without a request.
+    let output = fetch_with(serde_json::json!({
+        "url": "http://127.0.0.1:1/page",
+        "max_length": 0,
+    }))
+    .await;
+
+    let error = output.error.expect("error present");
+    assert_eq!(error.kind.as_str(), "invalid_arguments");
+    assert!(error.message.contains("max_length"));
+}
+
+#[tokio::test]
+async fn a_compressed_body_arrives_decompressed() {
+    let page = "<html><body><p>Compressed guidance.</p></body></html>";
+    let server = TestServer::new(vec![gzipped_response("text/html", page)]).await;
+
+    let output = fetch(&server.url("/guide.html")).await;
+
+    assert!(output.ok);
+    let data = output.data.expect("data present");
+    assert_eq!(data["content"], "Compressed guidance.");
+    // The document's size rather than the transfer's, which is the size the caps
+    // are meant to bound.
+    assert_eq!(data["body_bytes"], page.len() as u64);
+}
+
+#[test]
+fn a_page_ends_at_the_last_line_break_it_can_reach() {
+    let (page, _, next) = paginate("first line\nsecond line\nthird line", 0, 20);
+
+    // Twenty bytes would land inside "second line"; the page stops after the
+    // newline before it instead.
+    assert_eq!(page, "first line\n");
+    assert_eq!(next, Some(11));
+}
+
+#[test]
+fn a_page_break_with_no_line_to_land_on_still_splits_between_characters() {
+    // Three-byte characters and not one newline, so the cut has to fall back to
+    // bytes — and eight bytes of room holds two whole characters, not two thirds
+    // of a third.
+    let text = "。".repeat(10);
+
+    let (page, start, next) = paginate(&text, 0, 8);
+
+    assert_eq!(page, "。。");
+    assert_eq!(start, 0);
+    assert_eq!(next, Some(6));
+}
+
+#[test]
+fn a_start_index_inside_a_character_backs_off_to_its_boundary() {
+    let text = "。。。";
+
+    let (page, start, next) = paginate(text, 4, 64);
+
+    // Four is mid-character: reading from there would panic, so the page begins
+    // at the boundary below it.
+    assert_eq!(start, 3);
+    assert_eq!(page, "。。");
+    assert_eq!(next, None);
+}
+
+#[test]
+fn no_page_width_can_split_a_character_or_lose_a_byte() {
+    // One-, two-, three-, and four-byte characters, a newline for the
+    // line-boundary path to find, and a combining mark. Slicing between the bytes
+    // of any character would panic inside `paginate` rather than return, so a walk
+    // that completes for every width proves no width finds a bad cut; the join
+    // then proves `next_index` neither skipped nor repeated a byte.
+    let text = "ascii\n中文 → 内容\ne\u{301}f 🌐🚀\nlast";
+
+    for max_bytes in 1..=text.len() + 4 {
+        let mut walked = String::new();
+        let mut next = Some(0);
+        let mut pages = 0;
+        while let Some(start) = next {
+            let (page, at, after) = paginate(text, start, max_bytes);
+            // A `next_index` that landed inside a character would get floored back
+            // here, which is the one way a walk could silently repeat bytes.
+            assert_eq!(at, start, "width {max_bytes} moved a page's own start");
+            walked.push_str(page);
+            next = after;
+            pages += 1;
+            assert!(pages <= text.len(), "width {max_bytes} does not terminate");
+        }
+        assert_eq!(
+            walked, text,
+            "width {max_bytes} did not reassemble the text"
+        );
+    }
+}
+
+#[test]
+fn a_max_length_narrower_than_one_character_still_advances() {
+    // Rounding down to a boundary would leave no room at all, and a page that
+    // returns nothing while repeating its `next_index` never terminates.
+    let (page, _, next) = paginate("。。", 0, 1);
+
+    assert_eq!(page, "。");
+    assert_eq!(next, Some(3));
 }
 
 #[tokio::test]
@@ -394,7 +634,9 @@ async fn authorization_names_the_origin_and_input_drops_the_fragment() {
 #[test]
 fn arguments_advertise_one_required_url() {
     // The schema the model sees is generated from `WebFetchArgs`, so this pins
-    // that the tool takes a URL and nothing that could widen its reach.
+    // that a URL is the one thing a call must supply, and that the optional rest
+    // only pick which stretch of that one page comes back — nothing here widens
+    // what the tool can reach.
     let definition = crate::tool::definition_for::<WebFetchArgs>("web_fetch", "");
     assert_eq!(
         definition.parameters["required"],
@@ -404,6 +646,12 @@ fn arguments_advertise_one_required_url() {
         definition.parameters["properties"]["url"]["type"],
         serde_json::json!("string")
     );
+    for paging in ["start_index", "max_length"] {
+        assert!(
+            !definition.parameters["properties"][paging].is_null(),
+            "{paging} is advertised to the model"
+        );
+    }
 }
 
 #[tokio::test]
@@ -419,6 +667,50 @@ async fn fetches_a_real_page_over_https() {
     assert_eq!(data["reduced_from_html"], true);
     let content = data["content"].as_str().expect("content is a string");
     assert!(content.contains("Example Domain"), "{content}");
+}
+
+#[tokio::test]
+#[ignore = "hits the real network; requires outbound HTTPS"]
+async fn pages_through_a_real_documentation_page() {
+    // A real docs page reduces to several windows' worth of text, arrives
+    // compressed, and breaks lines wherever its own markup does — none of which
+    // the loopback fixtures can stand in for all at once.
+    let url = "https://doc.rust-lang.org/std/vec/struct.Vec.html";
+
+    let mut reassembled = String::new();
+    let mut sizes = Vec::new();
+    let mut next = Some(0u64);
+    while let Some(start_index) = next {
+        let output =
+            fetch_with(serde_json::json!({ "url": url, "start_index": start_index })).await;
+
+        assert!(output.ok, "page at {start_index}: {:?}", output.error);
+        let data = output.data.expect("data present");
+        assert_eq!(data["start_index"], start_index);
+        let content = data["content"].as_str().expect("content is a string");
+        next = data["next_index"].as_u64();
+        sizes.push(data["content_bytes"].as_u64().expect("size reported"));
+
+        reassembled.push_str(match next {
+            Some(_) => {
+                content
+                    .split_once("\n…⟨kuncode:")
+                    .expect("a continued page carries the marker")
+                    .0
+            }
+            None => content,
+        });
+    }
+
+    assert!(
+        sizes.len() > 1,
+        "this page now fits one window; pick another"
+    );
+    // Every call re-fetches and re-reduces, so a differing size would mean the
+    // walk stitched together two different versions of the page.
+    assert!(sizes.windows(2).all(|pair| pair[0] == pair[1]), "{sizes:?}");
+    assert_eq!(Some(reassembled.len() as u64), sizes.first().copied());
+    assert!(reassembled.contains("A contiguous growable array type"));
 }
 
 #[test]

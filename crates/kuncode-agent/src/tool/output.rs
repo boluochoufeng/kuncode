@@ -169,12 +169,25 @@ pub(crate) fn truncate_utf8(input: &str, max_bytes: usize) -> (String, bool) {
         return (input.to_string(), false);
     }
 
-    let mut end = max_bytes;
-    while !input.is_char_boundary(end) {
-        end -= 1;
-    }
+    (
+        input[..floor_char_boundary(input, max_bytes)].to_string(),
+        true,
+    )
+}
 
-    (input[..end].to_string(), true)
+/// Moves `index` back to the nearest UTF-8 code-point boundary at or below it,
+/// clamped to the end of `input`, so slicing there cannot panic.
+///
+/// Byte offsets that reach a tool from the model — a paginating `start_index`, a
+/// cap counted in bytes — are not guaranteed to land between code points, and
+/// `str` indexing panics when they do not.
+pub(crate) fn floor_char_boundary(input: &str, index: usize) -> usize {
+    // `is_char_boundary(0)` always holds, so this terminates.
+    let mut index = index.min(input.len());
+    while !input.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
 }
 
 fn bounded_error_message(message: String) -> String {

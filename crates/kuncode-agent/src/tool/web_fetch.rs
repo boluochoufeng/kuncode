@@ -13,8 +13,10 @@
 //!
 //! What comes back is bounded and lossy on purpose: the body is capped as it is
 //! read, decoded to text by the private `charset` module, HTML is reduced to
-//! prose by the private `html_text` module, and the text is capped again before
-//! it reaches the model.
+//! prose by the private `html_text` module, and only a window of that text goes
+//! to the model. The two bounds differ in kind. The window is a view — the rest
+//! of the text is a `start_index` away — while the body cap discards bytes for
+//! good, so the marker appended to the content distinguishes them.
 
 // Imported anonymously for `source()`: the cause chain is where a transport
 // failure actually explains itself.
@@ -38,7 +40,7 @@ use crate::{
     },
     tool::{
         PreparationContext, ToolContext, ToolErrorKind, ToolErrorPayload, ToolOutput,
-        TypedPreparation, TypedTool, definition_for, output::truncate_utf8,
+        TypedPreparation, TypedTool, definition_for, output::floor_char_boundary,
     },
 };
 
@@ -53,9 +55,14 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// dribbles bytes forever must not hold the agent loop open.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Cap on what is read off the socket, applied while reading so an unbounded or
-/// hostile body is never buffered in full.
+/// hostile body is never buffered in full. Compression does not slip past it:
+/// `chunk()` yields decompressed bytes, so an archive that inflates without bound
+/// still stops here rather than after expanding.
 const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
-/// Cap on the text handed to the model, after HTML reduction.
+/// Cap on the text one call hands to the model, after HTML reduction, and the
+/// default window size. Text beyond it is withheld rather than lost: `next_index`
+/// resumes there. The price is a fresh fetch and reduction per call, this tool
+/// holding no state between them.
 const MAX_CONTENT_BYTES: usize = 50_000;
 /// Redirect hops followed within the authorized origin.
 const MAX_SAME_ORIGIN_REDIRECTS: usize = 5;
@@ -70,14 +77,24 @@ const FETCH_ACCEPT: &str = "text/html,text/plain,text/markdown,application/json,
 const DESCRIPTION: &str = "Fetch one http(s) URL and return its content as text. \
 HTML is reduced to readable text (scripts, styles, and tags stripped, whitespace collapsed); \
 JSON, plain text, and markdown come back verbatim. Use it to read documentation, API \
-responses, or files hosted outside the workspace. Fetches only the URL given: a redirect to \
-another origin is reported instead of followed, so call again with that URL to follow it.";
+responses, or files hosted outside the workspace. A page too long for one reply comes back in \
+stretches: pass the `next_index` it returns back as `start_index` to read on. Fetches only the \
+URL given: a redirect to another origin is reported instead of followed, so call again with \
+that URL to follow it.";
 
 /// Arguments accepted by the [`WebFetch`] tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct WebFetchArgs {
     /// Absolute URL to fetch, beginning with `http://` or `https://`.
     url: String,
+    /// Byte offset into the page text to start returning from. Defaults to `0`
+    /// (the beginning). Feed back the `next_index` from a previous result to read
+    /// the next stretch of a page too long to return at once.
+    #[serde(default)]
+    start_index: Option<usize>,
+    /// Maximum number of bytes of page text to return.
+    #[serde(default)]
+    max_length: Option<usize>,
 }
 
 /// Text content read from one URL.
@@ -91,7 +108,8 @@ pub struct WebFetchOutput {
     /// `Content-Type` with its parameters dropped, when the server sent one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_type: Option<String>,
-    /// Bytes read from the response body, before any extraction.
+    /// Bytes of body read, counted after transfer decompression and before any
+    /// extraction, so this is the size of the document rather than of the transfer.
     pub body_bytes: usize,
     /// Encoding the body was read as. Anything other than `UTF-8` means the text
     /// was transcoded, so a page that misdeclares its charset can still read as
@@ -101,14 +119,26 @@ pub struct WebFetchOutput {
     /// markup, attributes, and script bodies are gone, so this content answers
     /// questions about what the page *says*, never about how it is built.
     pub reduced_from_html: bool,
-    /// The page text.
+    /// The stretch of page text this call returns.
     pub content: String,
+    /// Byte offset of [`Self::content`] within the whole page text.
+    pub start_index: usize,
+    /// Size of the whole page text, so the share still unread is visible without
+    /// fetching it. Unlike `read_file`, which would have to read a whole file to
+    /// count its lines, this tool already holds the entire text before slicing.
+    pub content_bytes: usize,
+    /// Byte offset to pass back as `start_index` to continue where this call left
+    /// off. Present only while text remains.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_index: Option<usize>,
 }
 
-/// Authorized URL retained for execution.
+/// Authorized URL paired with the validated window of text to return.
 #[derive(Debug)]
 pub struct PreparedWebFetch {
     url: Url,
+    start_index: usize,
+    max_length: usize,
 }
 
 /// Reads one URL over HTTP(S).
@@ -195,12 +225,37 @@ impl TypedTool for WebFetch {
             ));
         }
 
+        if matches!(args.max_length, Some(0)) {
+            return Err(ToolOutput::failure(
+                ToolErrorKind::InvalidArguments,
+                "`max_length` must be greater than zero",
+            ));
+        }
+        let start_index = args.start_index.unwrap_or(0);
+        // Asking for more than one page yields a page anyway, matching how
+        // `read_file` lets `limit` exceed its own byte budget: the window is
+        // whatever fits, and `next_index` carries the rest.
+        let max_length = args
+            .max_length
+            .unwrap_or(MAX_CONTENT_BYTES)
+            .min(MAX_CONTENT_BYTES);
+
         let canonical_input = CanonicalToolInput::new(serde_json::json!({
             "url": url.as_str(),
+            "start_index": start_index,
+            "max_length": max_length,
         }));
-        let display = ToolDisplay::new(format!("Fetch URL: {url}"));
+        let display = ToolDisplay::new(if start_index == 0 {
+            format!("Fetch URL: {url}")
+        } else {
+            format!("Fetch URL: {url} (from byte {start_index})")
+        });
         Ok(TypedPreparation::new(
-            PreparedWebFetch { url },
+            PreparedWebFetch {
+                url,
+                start_index,
+                max_length,
+            },
             canonical_input,
             NonEmptyVec::new(PermissionCheckSpec::new(PermissionTarget::WebFetch(origin))),
             display,
@@ -212,7 +267,11 @@ impl TypedTool for WebFetch {
         prepared: PreparedWebFetch,
         _ctx: &ToolContext,
     ) -> ToolOutput<WebFetchOutput> {
-        let PreparedWebFetch { url } = prepared;
+        let PreparedWebFetch {
+            url,
+            start_index,
+            max_length,
+        } = prepared;
         let mut response = match self.client.get(url.clone()).send().await {
             Ok(response) => response,
             Err(error) => return transport_failure(&url, &error),
@@ -255,8 +314,9 @@ impl TypedTool for WebFetch {
             decoded.into_owned()
         };
 
-        let (mut content, content_truncated) = truncate_utf8(&text, MAX_CONTENT_BYTES);
-        if let Some(note) = truncation_note(body_truncated, content.len(), text.len()) {
+        let (page, start_index, next_index) = paginate(&text, start_index, max_length);
+        let mut content = page.to_string();
+        if let Some(note) = truncation_note(body_truncated, next_index) {
             content.push_str(&note);
         }
 
@@ -270,11 +330,16 @@ impl TypedTool for WebFetch {
                 encoding: encoding.name().to_string(),
                 reduced_from_html,
                 content,
+                start_index,
+                content_bytes: text.len(),
+                next_index,
             }),
             // The body of a failing response usually explains it, so it is
             // returned alongside the error rather than dropped.
             error: (!status.is_success()).then(|| http_status_error(&fetched, status)),
-            truncated: body_truncated || content_truncated,
+            // Only the body cap loses content for good. Text past the end of a
+            // page is not truncated, just unread: `next_index` reaches it.
+            truncated: body_truncated,
         }
     }
 }
@@ -428,28 +493,56 @@ fn looks_like_html(text: &str) -> bool {
     head.contains("<!doctype html") || head.contains("<html")
 }
 
-/// Builds the marker naming every cap that trimmed the returned content.
+/// Slices one page out of `text`: at most `max_bytes` from `start`, cut at a line
+/// boundary whenever the window contains one.
 ///
-/// Both caps are one-way: `web_fetch` has no pagination, and asking again
-/// returns the same head, so the marker says as much rather than implying a
-/// second call would continue.
-fn truncation_note(body_truncated: bool, shown_bytes: usize, text_bytes: usize) -> Option<String> {
-    let mut caps = Vec::new();
-    if body_truncated {
-        caps.push(format!("response body capped at {MAX_BODY_BYTES} bytes"));
+/// Returns the page, the offset it really starts at, and the offset to resume
+/// from — `None` once nothing follows.
+fn paginate(text: &str, start: usize, max_bytes: usize) -> (&str, usize, Option<usize>) {
+    let start = floor_char_boundary(text, start);
+    let rest = &text[start..];
+    if rest.len() <= max_bytes {
+        return (rest, start, None);
     }
-    if shown_bytes < text_bytes {
-        caps.push(format!(
-            "text capped at {shown_bytes} of {text_bytes} bytes"
+
+    let room = match floor_char_boundary(rest, max_bytes) {
+        // A `max_length` narrower than the first character floors to zero, which
+        // would return an empty page and repeat the same `next_index` forever.
+        // Overshooting by that one character keeps every page advancing.
+        0 => rest.chars().next().map_or(0, char::len_utf8),
+        room => room,
+    };
+    // Cutting after the last newline carries whole lines across a page break, so
+    // a table row or a code line is never split down the middle. A window holding
+    // no newline at all — a single-line JSON body, a minified page — takes the
+    // plain byte cut, which is what keeps such content paginable instead of
+    // stalling on one unbreakable line.
+    let end = rest[..room].rfind('\n').map_or(room, |newline| newline + 1);
+    (&rest[..end], start, Some(start + end))
+}
+
+/// Builds the marker that tells the model what it is not being shown, and which
+/// of the two caps withheld it.
+///
+/// The distinction is the point: text past the end of a page is one more call
+/// away, while the body cap stopped bytes that were never downloaded and that a
+/// re-fetch would stop again in the same place.
+fn truncation_note(body_truncated: bool, next_index: Option<usize>) -> Option<String> {
+    let mut notes = Vec::new();
+    if let Some(next_index) = next_index {
+        notes.push(format!(
+            "text continues — call web_fetch again with start_index={next_index}"
         ));
     }
-    if caps.is_empty() {
+    if body_truncated {
+        notes.push(format!(
+            "response body cut off at {MAX_BODY_BYTES} bytes, which no later call will reach"
+        ));
+    }
+    if notes.is_empty() {
         return None;
     }
-    Some(format!(
-        "\n…⟨kuncode: {} — the rest is not returned, and fetching again will not add it⟩",
-        caps.join("; ")
-    ))
+    Some(format!("\n…⟨kuncode: {}⟩", notes.join("; ")))
 }
 
 #[cfg(test)]

@@ -14,11 +14,12 @@ futures-util = { workspace = true }
 html5ever = { workspace = true }
 ignore = { workspace = true }
 kuncode-core = { path = "../kuncode-core" }
-# `web_fetch` needs TLS and a pluggable resolver, and nothing else. Its `charset`
-# and `json` features only serve `Response::text()`/`json()`, which read the body
-# whole — that tool caps the body as it arrives and decodes the capped bytes
-# itself, so those features would buy an API it cannot call.
-reqwest = { workspace = true, features = ["rustls"] }
+# `web_fetch` needs TLS, a pluggable resolver, and transfer compression, which
+# shrinks a documentation page roughly tenfold. Its `charset` and `json` features
+# only serve `Response::text()`/`json()`, which read the body whole — that tool
+# caps the body as it arrives and decodes the capped bytes itself, so those
+# features would buy an API it cannot call.
+reqwest = { workspace = true, features = ["rustls", "gzip"] }
 schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
