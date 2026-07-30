@@ -3,7 +3,7 @@
 use kuncode_core::{
     completion::{
         AssistantContent, CompletionError, CompletionModel, CompletionRequestBuilder, Message,
-        ReasoningEffort, ToolChoice, Usage,
+        ReasoningEffort, Usage,
     },
     non_empty_vec::NonEmptyVec,
 };
@@ -42,11 +42,11 @@ pub(super) async fn run_attempt<M>(
 where
     M: CompletionModel,
 {
+    // An empty tool set already makes `none` the provider default.
     let completion = CompletionRequestBuilder::from_messages(prompt)
         .temperature(Some(0.0))
         .max_tokens(Some(max_output_tokens))
         .reasoning(Some(ReasoningEffort::Off))
-        .tool_choice(Some(ToolChoice::None))
         .output_schema(Some(schema))
         .build();
     let response = model

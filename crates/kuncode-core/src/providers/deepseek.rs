@@ -6,14 +6,16 @@
 //! private `protocol` module.
 
 use std::env::VarError;
-use std::time::Duration;
 
 use thiserror::Error;
 
 use crate::{
     completion::{CompletionError, CompletionModel},
     json_utils,
-    providers::deepseek::protocol::{DeepSeekCompletionRequest, DeepSeekCompletionResponse},
+    providers::{
+        chat_completions::{CONNECT_TIMEOUT, READ_TIMEOUT, REQUEST_TIMEOUT},
+        deepseek::protocol::{DeepSeekCompletionRequest, DeepSeekCompletionResponse},
+    },
 };
 
 mod model;
@@ -26,18 +28,6 @@ pub use model::{
 const DEEPSEEK_API_BASE_URL: &str = "https://api.deepseek.com";
 #[cfg(test)]
 const DEEPSEEK_V4_FLASH: &str = DEEPSEEK_V4_FLASH_MODEL_ID;
-
-/// Bound on dialing the endpoint.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// Maximum idle gap while reading a response body. Resets on each chunk, so it
-/// catches a stalled connection *without* capping how long a (streaming)
-/// generation may run — a total request deadline would instead abort a long but
-/// healthy stream mid-flight.
-const READ_TIMEOUT: Duration = Duration::from_secs(360);
-/// Total deadline (connect → full body) for a *non-streaming* request. Applied
-/// per-request to `completion()` only; a stream's length is unbounded by design,
-/// so it relies on [`READ_TIMEOUT`] instead.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(360);
 
 /// Errors produced while constructing a DeepSeek client.
 #[derive(Debug, Error)]

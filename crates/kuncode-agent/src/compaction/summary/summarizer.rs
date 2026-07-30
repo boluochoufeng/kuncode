@@ -219,7 +219,7 @@ mod tests {
     use kuncode_core::{
         completion::{
             AssistantContent, CompletionError, CompletionModel, CompletionRequest,
-            CompletionResponse, CompletionStream, Message, ReasoningEffort, ToolChoice, Usage,
+            CompletionResponse, CompletionStream, Message, ReasoningEffort, Usage,
         },
         non_empty_vec::NonEmptyVec,
     };
@@ -308,7 +308,7 @@ mod tests {
         assert!(sent.model.is_none());
         assert_eq!(sent.chat_history.len(), 2);
         assert!(sent.tools.is_empty());
-        assert_eq!(sent.tool_choice, Some(ToolChoice::None));
+        assert!(sent.tool_choice.is_none());
         assert_eq!(sent.temperature, Some(0.0));
         assert_eq!(sent.max_tokens, Some(2_048));
         assert_eq!(sent.reasoning, Some(ReasoningEffort::Off));
