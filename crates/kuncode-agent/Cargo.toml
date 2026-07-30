@@ -10,8 +10,14 @@ path = "src/lib.rs"
 async-trait = { workspace = true }
 chrono = { workspace = true }
 futures-util = { workspace = true }
+encoding_rs = { workspace = true }
 ignore = { workspace = true }
 kuncode-core = { path = "../kuncode-core" }
+# `web_fetch` needs TLS and a pluggable resolver, and nothing else. Its `charset`
+# and `json` features only serve `Response::text()`/`json()`, which read the body
+# whole — that tool caps the body as it arrives and decodes the capped bytes
+# itself, so those features would buy an API it cannot call.
+reqwest = { workspace = true, features = ["rustls"] }
 schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

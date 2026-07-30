@@ -17,6 +17,7 @@ use crate::todo::TodoHandle;
 pub mod bash;
 pub mod filesystem;
 pub mod todo_write;
+pub mod web_fetch;
 
 mod output;
 

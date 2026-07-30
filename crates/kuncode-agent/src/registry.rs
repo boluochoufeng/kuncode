@@ -21,6 +21,7 @@ use crate::{
         bash::Bash,
         filesystem::{EditFile, Glob, Ls, ReadFile, WriteFile},
         todo_write::TodoWrite,
+        web_fetch::{WebFetch, WebFetchError},
     },
     workspace::Workspace,
 };
@@ -189,6 +190,20 @@ impl ToolRegistry {
             )?
             .constrain_paths_to(workspace_root)?,
         )?;
+        // Reaching the network is the one built-in capability with no workspace
+        // root to constrain it, so the origin is the only thing a rule can
+        // decide — hence an approval by default, like `bash`.
+        self.register_with_profile(
+            WebFetch::new()?,
+            ToolPermissionProfile::new(
+                "web_fetch",
+                [(
+                    PermissionNamespace::WebFetch,
+                    ProfileDefault::RequireApproval,
+                )],
+                false,
+            )?,
+        )?;
         Ok(())
     }
 
@@ -341,6 +356,9 @@ pub enum RegistryError {
     /// One registry cannot mix built-in tools from different workspaces.
     #[error("tool registry contains conflicting workspace roots")]
     WorkspaceMismatch,
+    /// The `web_fetch` HTTP client could not be built.
+    #[error(transparent)]
+    WebFetch(#[from] WebFetchError),
 }
 
 #[cfg(test)]
@@ -461,7 +479,8 @@ mod tests {
                 "edit_file",
                 "glob",
                 "todo_write",
-                "ls"
+                "ls",
+                "web_fetch"
             ]
         );
     }
