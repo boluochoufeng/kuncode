@@ -4,30 +4,37 @@
 //! not markup that round-trips. Structure survives only where it changes
 //! meaning — headings, list items, code blocks, table cell boundaries, and link
 //! targets — and everything else (attributes, styling, script and style bodies)
-//! is dropped. Nothing here validates HTML: real pages are malformed, so an
-//! unrecognized or unclosed construct degrades to text rather than failing.
+//! is dropped.
+//!
+//! Tokenizing is `html5ever`'s, reducing is this module's, and the split is
+//! deliberate. Where a `<script>` body ends, what `&NotLessLess;` stands for,
+//! whether `<a title="a<b">` closed its tag — those are settled by the HTML
+//! standard, and getting them wrong means reading a page differently than every
+//! other reader does. Which elements carry meaning worth keeping, and what shape
+//! that meaning takes as text, the standard says nothing about.
 
 use std::borrow::Cow;
+use std::cell::{Cell, RefCell};
 
-use html_escape::decode_html_entities;
+use html5ever::buffer_queue::BufferQueue;
+use html5ever::interface::Attribute;
+use html5ever::tendril::StrTendril;
+use html5ever::tokenizer::states::RawKind;
+use html5ever::tokenizer::{Tag, TagKind, Token, TokenSink, TokenSinkResult, Tokenizer};
 use url::Url;
-
-/// Longest element name [`Element::classify`] recognizes (`blockquote`,
-/// `figcaption`). A longer name is `Inline` whatever its case, so it needs no
-/// normalization.
-const MAX_ELEMENT_NAME: usize = 10;
 
 /// What an element contributes to the reduced text.
 ///
-/// Classifying a tag name once, at parse time, is what keeps [`TextWriter::open`]
-/// and [`TextWriter::close`] from disagreeing about an element — both match this
-/// type exhaustively, so a new variant cannot be handled on one side only. It is
-/// also why a tag name is never carried past the parser: nothing downstream
-/// prints one, so nothing downstream needs to own one.
+/// Classifying a tag name once, on its start tag, is what keeps
+/// [`TextWriter::open`] and [`TextWriter::close`] from disagreeing about an
+/// element — both match this type exhaustively, so a new variant cannot be
+/// handled on one side only.
 #[derive(Clone, Copy, Debug)]
 enum Element {
     /// `<a href>`: the resolved target follows the link text.
     Anchor,
+    /// `<base href>`: retargets every relative link that follows.
+    Base,
     /// A heading or `<title>`, carrying its ATX marker.
     Heading(&'static str),
     /// `<p>`: a blank line on both sides.
@@ -42,9 +49,10 @@ enum Element {
     Break,
     /// `<td>` / `<th>`: ` | ` separates it from the previous cell.
     Cell,
-    /// Content is raw text to drop wholesale, carrying the canonical name its
-    /// end tag must match so no `String` is needed to find it.
-    RawText(&'static str),
+    /// The element and everything inside it stays out of the prose. The
+    /// [`RawKind`] is the tokenizer state its content must be read in, for the
+    /// elements whose bodies are not markup at all.
+    Discarded(Option<RawKind>),
     /// Starts a line, but no blank line of its own.
     Block,
     /// Contributes its text and no structure.
@@ -52,20 +60,12 @@ enum Element {
 }
 
 impl Element {
-    /// Classifies a tag name case-insensitively.
+    /// Classifies a tag name. The tokenizer lowercases names, so nothing here
+    /// normalizes one.
     fn classify(name: &str) -> Self {
-        // Tag names are ASCII and short, so lowercasing through a fixed buffer
-        // keeps the parser free of per-tag allocation.
-        let mut lowered = [0u8; MAX_ELEMENT_NAME];
-        let Some(slot) = lowered.get_mut(..name.len()) else {
-            return Self::Inline;
-        };
-        slot.copy_from_slice(name.as_bytes());
-        slot.make_ascii_lowercase();
-        // The parser accepts only ASCII alphanumerics as a name, so this cannot
-        // fail; an empty name would classify as `Inline` regardless.
-        match std::str::from_utf8(slot).unwrap_or_default() {
+        match name {
             "a" => Self::Anchor,
+            "base" => Self::Base,
             // `<title>` becomes the top heading: it is the page's name, and no
             // page needs two of them.
             "title" | "h1" => Self::Heading("# "),
@@ -78,10 +78,17 @@ impl Element {
             "blockquote" => Self::Quote,
             "br" | "hr" => Self::Break,
             "td" | "th" => Self::Cell,
-            // Raw text carries nothing a reader wants, and skipping it wholesale
-            // is what stops an inline script from leaking code into the prose.
-            "script" => Self::RawText("script"),
-            "style" => Self::RawText("style"),
+            // A script or style body carries nothing a reader wants, and asking
+            // for its raw state is what stops `if (a < b)` from being read as a
+            // tag. `<textarea>` is a form's default value rather than prose, and
+            // its body is text even where it looks like markup.
+            "script" => Self::Discarded(Some(RawKind::ScriptData)),
+            "style" => Self::Discarded(Some(RawKind::Rawtext)),
+            "textarea" => Self::Discarded(Some(RawKind::Rcdata)),
+            // A `<template>` body is markup the page never renders — it is
+            // material for scripts this tool does not run — so it is dropped
+            // without changing how it is tokenized.
+            "template" => Self::Discarded(None),
             "address" | "article" | "aside" | "body" | "caption" | "dd" | "details" | "dialog"
             | "div" | "dl" | "dt" | "fieldset" | "figcaption" | "figure" | "footer" | "form"
             | "head" | "header" | "html" | "main" | "nav" | "ol" | "section" | "summary"
@@ -92,230 +99,184 @@ impl Element {
 }
 
 /// Reduces `input` to readable text, resolving link targets against `base` —
-/// the URL the document was read from.
+/// the URL the document was read from, unless the document declares another.
 pub(super) fn html_to_text(input: &str, base: &Url) -> String {
-    let mut writer = TextWriter::new(base);
-    let mut rest = input;
-    // Depth rather than a flag: nested `<pre>` is malformed but occurs, and the
-    // inner close must not re-enable whitespace collapsing for the outer block.
-    let mut preformatted = 0usize;
-
-    while let Some(open) = rest.find('<') {
-        writer.push_text(&rest[..open], preformatted > 0);
-        // `<` is one ASCII byte, so the parser receives the tag body and the
-        // precondition "input starts with `<`" cannot be violated at all.
-        let (construct, remainder) = Construct::parse(&rest[open + 1..]);
-        rest = remainder;
-
-        match construct {
-            Construct::Literal => writer.push_text("<", preformatted > 0),
-            Construct::Ignored => {}
-            Construct::Start {
-                element,
-                attributes,
-                self_closing,
-            } => match element {
-                Element::RawText(name) if !self_closing => rest = skip_raw_text(rest, name),
-                Element::Anchor => writer.open_link(attribute(attributes, "href")),
-                Element::Preformatted if !self_closing => {
-                    preformatted += 1;
-                    writer.open(element);
-                }
-                element => writer.open(element),
-            },
-            Construct::End { element } => match element {
-                Element::Anchor => writer.close_link(),
-                Element::Preformatted => {
-                    preformatted = preformatted.saturating_sub(1);
-                    writer.close(element);
-                }
-                element => writer.close(element),
-            },
-        }
-    }
-    writer.push_text(rest, preformatted > 0);
-    normalize(&writer.finish())
+    let tokenizer = Tokenizer::new(Reducer::new(base.clone()), Default::default());
+    let queue = BufferQueue::default();
+    queue.push_back(StrTendril::from(input));
+    // The sink never asks the tokenizer to stop, so feeding once drains the
+    // whole document and the result carries nothing to act on.
+    let _ = tokenizer.feed(&queue);
+    tokenizer.end();
+    normalize(&tokenizer.sink.finish())
 }
 
-/// One construct at the head of the document.
-enum Construct<'a> {
-    /// A start tag, possibly self-closing.
-    Start {
-        element: Element,
-        attributes: &'a str,
-        self_closing: bool,
-    },
-    /// An end tag.
-    End { element: Element },
-    /// A `<` that starts no tag at all, so it is the literal character it looks
-    /// like (`a < b`).
-    Literal,
-    /// Consumed but contributing nothing: a comment, doctype, processing
-    /// instruction, or a tag left unterminated at end of input.
-    Ignored,
-}
-
-impl<'a> Construct<'a> {
-    /// Splits the construct following a `<` from the rest of the document.
-    ///
-    /// `body` is the text *after* the `<`. A [`Self::Literal`] result therefore
-    /// leaves `body` itself as the remainder, which is both what the caller needs
-    /// in order to emit the `<` as text and what guarantees the scan advances.
-    fn parse(body: &'a str) -> (Self, &'a str) {
-        if let Some(comment) = body.strip_prefix("!--") {
-            // An unterminated comment swallows the rest of the document, which
-            // is what a browser does with it too.
-            let end = comment.find("-->").map_or(comment.len(), |at| at + 3);
-            return (Self::Ignored, &comment[end..]);
-        }
-        if body.starts_with(['!', '?']) {
-            let end = body.find('>').map_or(body.len(), |at| at + 1);
-            return (Self::Ignored, &body[end..]);
-        }
-
-        let (rest, closing) = match body.strip_prefix('/') {
-            Some(rest) => (rest, true),
-            None => (body, false),
-        };
-        if !rest.starts_with(|ch: char| ch.is_ascii_alphabetic()) {
-            return (Self::Literal, body);
-        }
-        let name_end = rest
-            .find(|ch: char| !ch.is_ascii_alphanumeric())
-            .unwrap_or(rest.len());
-        let (name, rest) = rest.split_at(name_end);
-        let element = Element::classify(name);
-
-        let Some(tag_end) = find_tag_end(rest) else {
-            // A tag left open at end of input names no content; a browser
-            // discards it, and printing its raw markup would read worse.
-            return (Self::Ignored, "");
-        };
-        let (attributes, remainder) = rest.split_at(tag_end);
-        let remainder = &remainder[1..];
-        if closing {
-            return (Self::End { element }, remainder);
-        }
-        (
-            Self::Start {
-                element,
-                attributes,
-                self_closing: attributes.trim_end().ends_with('/'),
-            },
-            remainder,
-        )
-    }
-}
-
-/// Locates the `>` closing a tag, skipping quoted attribute values so a `>`
-/// inside one does not end the tag early.
-fn find_tag_end(body: &str) -> Option<usize> {
-    let mut quote = None::<char>;
-    for (index, ch) in body.char_indices() {
-        match (quote, ch) {
-            (Some(open), ch) if ch == open => quote = None,
-            (Some(_), _) => {}
-            (None, '"' | '\'') => quote = Some(ch),
-            (None, '>') => return Some(index),
-            (None, _) => {}
-        }
-    }
-    None
-}
-
-/// Returns the value of `name` in a start tag's attribute text.
-fn attribute<'a>(attributes: &'a str, name: &str) -> Option<Cow<'a, str>> {
-    let mut rest = attributes;
-    while let Some(at) = rest.find(|ch: char| ch.is_ascii_alphabetic()) {
-        rest = &rest[at..];
-        let key_end = rest
-            .find(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-' && ch != ':')
-            .unwrap_or(rest.len());
-        let (key, remainder) = rest.split_at(key_end);
-        let matched = key.eq_ignore_ascii_case(name);
-        let Some(remainder) = remainder.trim_start().strip_prefix('=') else {
-            // A valueless attribute (`disabled`); resume after its name.
-            rest = remainder;
-            continue;
-        };
-        let remainder = remainder.trim_start();
-        let (value, remainder) = match remainder.strip_prefix(['"', '\'']) {
-            // The prefix matched, so byte 0 is that ASCII quote character.
-            Some(quoted) => match quoted.split_once(remainder.as_bytes()[0] as char) {
-                Some(pair) => pair,
-                None => (quoted, ""),
-            },
-            None => remainder.split_at(
-                remainder
-                    .find(char::is_whitespace)
-                    .unwrap_or(remainder.len()),
-            ),
-        };
-        if matched {
-            return Some(decode_html_entities(value));
-        }
-        rest = remainder;
-    }
-    None
-}
-
-/// Skips past the matching end tag of a raw-text element, whose body may contain
-/// anything — including markup that must not be parsed as such.
-fn skip_raw_text<'a>(input: &'a str, name: &str) -> &'a str {
-    let mut rest = input;
-    loop {
-        let Some(at) = rest.find("</") else {
-            return "";
-        };
-        rest = &rest[at..];
-        if closes_raw_text(&rest.as_bytes()[2..], name) {
-            let end = rest.find('>').map_or(rest.len(), |at| at + 1);
-            return &rest[end..];
-        }
-        rest = &rest[2..];
-    }
-}
-
-/// Reports whether `after_slash` — the bytes following `</` — closes the
-/// raw-text element `name`.
+/// Turns the token stream into text.
 ///
-/// The tag name must be followed by a delimiter. Matching the name as a bare
-/// prefix would let `</scriptfoo>` end a `<script>`, resuming markup parsing
-/// inside the element and spilling its code into the extracted prose.
-fn closes_raw_text(after_slash: &[u8], name: &str) -> bool {
-    let Some(delimiter) = after_slash.split_at_checked(name.len()) else {
-        return false;
-    };
-    let (candidate, delimiter) = delimiter;
-    candidate.eq_ignore_ascii_case(name.as_bytes())
-        // Nothing after the name means the document ended mid-tag, which closes
-        // the element as surely as `>` would: there is no more content either way.
-        && delimiter
-            .first()
-            .is_none_or(|byte| byte.is_ascii_whitespace() || *byte == b'/' || *byte == b'>')
+/// The interior mutability is `html5ever`'s requirement, not a design choice:
+/// [`TokenSink::process_token`] takes `&self` so a sink can be shared, and this
+/// one has to accumulate.
+struct Reducer {
+    writer: RefCell<TextWriter>,
+    /// Depth rather than a flag: nested `<pre>` is malformed but occurs, and the
+    /// inner close must not re-enable whitespace collapsing for the outer block.
+    preformatted: Cell<usize>,
+    /// Depth of discarded elements. `<template>` nests, and the tokenizer's raw
+    /// states keep the others from ever nesting, so one counter serves both.
+    discarded: Cell<usize>,
+}
+
+impl Reducer {
+    fn new(base: Url) -> Self {
+        Self {
+            writer: RefCell::new(TextWriter::new(base)),
+            preformatted: Cell::new(0),
+            discarded: Cell::new(0),
+        }
+    }
+
+    fn finish(&self) -> String {
+        self.writer.borrow().text().to_string()
+    }
+
+    fn tag(&self, tag: Tag) -> TokenSinkResult<()> {
+        let element = Element::classify(&tag.name);
+        let ending = tag.kind == TagKind::EndTag;
+
+        // Inside a discarded element the only tag that matters is one that
+        // changes the depth; everything else contributes neither text nor
+        // structure, so it is not worth telling the writer about.
+        if self.discarded.get() > 0 {
+            if let Element::Discarded(_) = element {
+                self.depth(&self.discarded, ending, tag.self_closing);
+            }
+            return TokenSinkResult::Continue;
+        }
+
+        if let Element::Preformatted = element {
+            self.depth(&self.preformatted, ending, tag.self_closing);
+        }
+        if ending {
+            match element {
+                Element::Anchor => self.writer.borrow_mut().close_link(),
+                element => self.writer.borrow_mut().close(element),
+            }
+            return TokenSinkResult::Continue;
+        }
+        match element {
+            Element::Anchor => self
+                .writer
+                .borrow_mut()
+                .open_link(attribute(&tag.attrs, "href")),
+            Element::Base => {
+                if let Some(href) = attribute(&tag.attrs, "href") {
+                    self.writer.borrow_mut().declare_base(href);
+                }
+            }
+            Element::Discarded(raw) => {
+                self.depth(&self.discarded, false, tag.self_closing);
+                // Asking for the raw state is what makes the tokenizer read the
+                // body as text and find its end tag by the standard's rules
+                // rather than by looking for the next `<`.
+                if let Some(kind) = raw.filter(|_| !tag.self_closing) {
+                    return TokenSinkResult::RawData(kind);
+                }
+            }
+            element => self.writer.borrow_mut().open(element),
+        }
+        TokenSinkResult::Continue
+    }
+
+    /// Tracks entering and leaving a nesting element.
+    ///
+    /// A self-closing *start* tag opens nothing, so it changes no depth. An end
+    /// tag closes regardless: `</style/>` carries the self-closing flag because
+    /// the standard routes that stray slash through the self-closing state, and
+    /// treating it as "not really an end tag" would leave the element open and
+    /// swallow the rest of the page.
+    fn depth(&self, counter: &Cell<usize>, ending: bool, self_closing: bool) {
+        if ending {
+            counter.set(counter.get().saturating_sub(1));
+        } else if !self_closing {
+            counter.set(counter.get() + 1);
+        }
+    }
+}
+
+impl TokenSink for Reducer {
+    type Handle = ();
+
+    fn process_token(&self, token: Token, _line_number: u64) -> TokenSinkResult<()> {
+        match token {
+            Token::TagToken(tag) => return self.tag(tag),
+            Token::CharacterTokens(text) if self.discarded.get() == 0 => {
+                self.writer
+                    .borrow_mut()
+                    .push_text(&text, self.preformatted.get() > 0);
+            }
+            // Text inside a discarded element, plus the tokens that carry nothing
+            // a reader wants. A NUL is dropped rather than turned into the U+FFFD
+            // the standard asks for: this output is prose, and a replacement
+            // character is noise either way.
+            Token::CharacterTokens(_)
+            | Token::NullCharacterToken
+            | Token::CommentToken(_)
+            | Token::DoctypeToken(_)
+            | Token::EOFToken
+            | Token::ParseError(_) => {}
+        }
+        TokenSinkResult::Continue
+    }
+}
+
+/// Reads an attribute value from a start tag.
+fn attribute<'tag>(attrs: &'tag [Attribute], name: &str) -> Option<&'tag str> {
+    attrs
+        .iter()
+        .find(|attribute| &*attribute.name.local == name)
+        .map(|attribute| &*attribute.value)
 }
 
 /// Accumulates reduced text, inserting the boundaries that carry meaning.
-struct TextWriter<'a> {
+struct TextWriter {
     buffer: String,
-    /// Open `<a href>` targets, already resolved. A stack because nested anchors
-    /// are malformed but appear, and a close must pair with what opened it.
+    /// Open `<a href>` targets, already resolved. A stack because a close must
+    /// pair with what opened it.
     links: Vec<Option<String>>,
-    /// URL the document was read from, which relative targets resolve against.
-    base: &'a Url,
+    /// URL relative targets resolve against.
+    base: Url,
+    /// Whether a `<base href>` has replaced it. Only the first one counts.
+    base_declared: bool,
 }
 
-impl<'a> TextWriter<'a> {
-    fn new(base: &'a Url) -> Self {
+impl TextWriter {
+    fn new(base: Url) -> Self {
         Self {
             buffer: String::new(),
             links: Vec::new(),
             base,
+            base_declared: false,
         }
     }
 
-    fn finish(self) -> String {
-        self.buffer
+    fn text(&self) -> &str {
+        &self.buffer
+    }
+
+    /// Retargets relative links to the URL the document names as its base.
+    ///
+    /// Without this, a page served from one host but written for another — an
+    /// ordinary arrangement behind a CDN or a docs mirror — yields links that
+    /// resolve against the wrong origin, and the model is handed URLs that 404.
+    /// A later `<base>` is ignored, as in a browser.
+    fn declare_base(&mut self, href: &str) {
+        if self.base_declared {
+            return;
+        }
+        if let Ok(declared) = self.base.join(href.trim()) {
+            self.base = declared;
+            self.base_declared = true;
+        }
     }
 
     fn open(&mut self, element: Element) {
@@ -339,9 +300,10 @@ impl<'a> TextWriter<'a> {
             }
             Element::Break | Element::Block => self.newline(),
             Element::Cell => self.cell_boundary(),
-            // An anchor's target goes through `open_link`; raw text never reaches
-            // the writer at all; inline elements contribute only their text.
-            Element::Anchor | Element::RawText(_) | Element::Inline => {}
+            // An anchor's target goes through `open_link` and a base through
+            // `declare_base`; a discarded element never reaches the writer;
+            // inline elements contribute only their text.
+            Element::Anchor | Element::Base | Element::Discarded(_) | Element::Inline => {}
         }
     }
 
@@ -356,17 +318,18 @@ impl<'a> TextWriter<'a> {
             Element::ListItem | Element::Block => self.newline(),
             // A cell boundary is written when the *next* cell opens, so closing
             // one must not add a line the row does not have. A void element's end
-            // tag is meaningless markup — its break was emitted on open.
+            // contributes nothing — its break was emitted on open.
             Element::Cell
             | Element::Break
             | Element::Anchor
-            | Element::RawText(_)
+            | Element::Base
+            | Element::Discarded(_)
             | Element::Inline => {}
         }
     }
 
-    fn open_link(&mut self, href: Option<Cow<'_, str>>) {
-        let resolved = href.and_then(|href| self.resolve(&href));
+    fn open_link(&mut self, href: Option<&str>) {
+        let resolved = href.and_then(|href| self.resolve(href));
         self.links.push(resolved);
     }
 
@@ -381,9 +344,9 @@ impl<'a> TextWriter<'a> {
         self.buffer.push(')');
     }
 
-    /// Resolves a link target against the document's own URL, because an
-    /// emitted target is only worth its bytes if it is one `web_fetch` can be
-    /// handed back: a bare `index.html` tells the model nothing.
+    /// Resolves a link target against the document's base, because an emitted
+    /// target is only worth its bytes if it is one `web_fetch` can be handed
+    /// back: a bare `index.html` tells the model nothing.
     ///
     /// Returns `None` for a target that names no document to fetch — a bare
     /// fragment, or a `javascript:` / `mailto:` / `data:` scheme.
@@ -400,12 +363,11 @@ impl<'a> TextWriter<'a> {
         if text.is_empty() {
             return;
         }
-        let text = decode_html_entities(text);
         if preformatted {
-            self.buffer.push_str(&plain_spaces(&text));
+            self.buffer.push_str(&plain_spaces(text));
             return;
         }
-        let collapsed = collapse_inline(&text);
+        let collapsed = collapse_inline(text);
         if collapsed.trim().is_empty() {
             // Whitespace between tags still separates words, so it survives as
             // at most one space — never as a blank line.
@@ -484,7 +446,8 @@ fn collapse_inline(text: &str) -> Cow<'_, str> {
     Cow::Owned(collapsed)
 }
 
-/// Rewrites the space-like characters a reference can produce as plain spaces.
+/// Rewrites the space-like characters a character reference can produce as plain
+/// spaces.
 ///
 /// Only needed where [`collapse_inline`] does not run, which is preformatted
 /// text: a code block that indents with `&nbsp;` is old but real, and a U+00A0
@@ -563,6 +526,52 @@ mod tests {
     }
 
     #[test]
+    fn a_declared_base_retargets_relative_links() {
+        // A page served from one host but written for another is ordinary behind
+        // a CDN or a docs mirror. Resolving against the fetched URL instead
+        // hands the model links that 404.
+        assert_eq!(
+            reduce(r#"<base href="https://cdn.example.com/v2/"><a href="x.html">link</a>"#),
+            "link (https://cdn.example.com/v2/x.html)"
+        );
+        // Only the first `<base>` counts, as in a browser.
+        assert_eq!(
+            reduce(
+                r#"<base href="https://a.example.com/"><base href="https://b.example.com/"><a href="x">l</a>"#
+            ),
+            "l (https://a.example.com/x)"
+        );
+        // Without one, the URL the document was read from still governs.
+        assert_eq!(
+            reduce(r#"<a href="x.html">link</a>"#),
+            "link (https://docs.example.com/guide/x.html)"
+        );
+    }
+
+    #[test]
+    fn elements_that_are_not_prose_are_dropped_whole() {
+        // A `<template>` body is material for scripts this tool never runs, and
+        // a `<textarea>` holds a form's default value — neither is what the page
+        // says. Both nest and both stay out.
+        assert_eq!(reduce("<template><p>hidden</p></template><p>b</p>"), "b");
+        assert_eq!(
+            reduce("<template><p>a</p><template><p>deep</p></template><p>c</p></template><p>b</p>"),
+            "b"
+        );
+        assert_eq!(reduce("<textarea><b>default</b></textarea><p>b</p>"), "b");
+        // `<noscript>`, by contrast, is written for exactly this reader: one that
+        // will not run the page's JavaScript.
+        assert_eq!(reduce("<noscript><p>fallback</p></noscript>"), "fallback");
+    }
+
+    #[test]
+    fn a_null_byte_does_not_reach_the_model() {
+        // The standard turns a NUL in text into U+FFFD; prose wants neither, and
+        // a raw NUL in a tool result is a hazard for whatever serializes it next.
+        assert_eq!(reduce("<p>a\u{0}b</p>"), "ab");
+    }
+
+    #[test]
     fn preformatted_text_keeps_its_line_structure() {
         let reduced = reduce("<p>Example:</p><pre>fn main() {\n    ok();\n}</pre>");
 
@@ -580,9 +589,9 @@ mod tests {
 
     #[test]
     fn character_references_resolve_and_unknown_ones_stay_verbatim() {
-        let reduced = reduce("<p>a&nbsp;&amp;&nbsp;b &#8212; c &notareference; &#x41;</p>");
+        let reduced = reduce("<p>a&nbsp;&amp;&nbsp;b &#8212; c &bogus; &#x41;</p>");
 
-        assert_eq!(reduced, "a & b — c &notareference; A");
+        assert_eq!(reduced, "a & b — c &bogus; A");
     }
 
     #[test]
@@ -605,20 +614,20 @@ mod tests {
     }
 
     #[test]
-    fn multi_codepoint_references_lose_their_combining_mark() {
-        // A known defect in `html-escape`: the 93 table entries that map to two
-        // code points come back as the first one only, so `&NotGreaterFullEqual;`
-        // reads as its own opposite. Pinned rather than worked around — patching
-        // it here would mean maintaining a slice of the very table the dependency
-        // exists to own. If this test ever fails, upstream fixed it: delete the
-        // test and this comment.
-        assert_eq!(reduce("<p>&NotGreaterFullEqual;</p>"), "≧");
-        assert_eq!(reduce("<p>&NotLessLess;</p>"), "≪");
-
-        // Same trade on the 106 entries HTML5 allows without a semicolon. Leaving
-        // them verbatim is the safe direction: `&AMP` still reads as an ampersand
-        // to a model, where a silently wrong operator does not.
-        assert_eq!(reduce("<p>&AMP &copy</p>"), "&AMP &copy");
+    fn every_reference_the_standard_defines_resolves() {
+        // Two code points, which is what 93 of the table's entries map to.
+        // Keeping only the first would print `≧` for a name that means the
+        // opposite of `≧` — the defect a hand-written table shipped with.
+        assert_eq!(reduce("<p>&NotGreaterFullEqual;</p>"), "≧\u{338}");
+        assert_eq!(reduce("<p>&NotLessLess;</p>"), "≪\u{338}");
+        assert_eq!(reduce("<p>&lvertneqq;</p>"), "≨\u{fe00}");
+        // The 106 names HTML5 still resolves without a semicolon, for historical
+        // reasons.
+        assert_eq!(reduce("<p>&AMP &copy</p>"), "& ©");
+        // And the longest-match rule that follows from them: `&not` is one such
+        // name, so this is not an unknown reference left verbatim — it is `¬`
+        // followed by the rest of the text, exactly as a browser reads it.
+        assert_eq!(reduce("<p>&notareference;</p>"), "¬areference;");
     }
 
     #[test]
@@ -654,11 +663,11 @@ mod tests {
     }
 
     #[test]
-    fn classification_is_case_insensitive_up_to_the_longest_name() {
-        // `blockquote` and `figcaption` are exactly `MAX_ELEMENT_NAME` long, so an
-        // upper-case spelling is what actually exercises the buffer's edge. A name
-        // that outgrew the bound would silently fall through to `Inline` and lose
-        // its boundary, which no other test would notice — hence this one.
+    fn tag_names_are_classified_whatever_their_case() {
+        // The tokenizer lowercases names, which is the whole reason
+        // `Element::classify` matches only lower-case spellings. If that stopped
+        // holding, every upper-case tag would fall through to `Inline` and lose
+        // its boundary — silently, because the text still comes out.
         assert_eq!(
             reduce("<P>a</P><BLOCKQUOTE>quoted</BLOCKQUOTE><P>b</P>"),
             "a\n\n> quoted\n\nb"
@@ -676,7 +685,11 @@ mod tests {
             reduce("<p>before</p><script>var a = 1; </scriptfoo> leaked();</script><p>after</p>"),
             "before\n\nafter"
         );
-        // Any delimiter closes it, not just `>`.
+        // Any delimiter closes it, not just `>`. The stray slash in `</style/>`
+        // is the one that bites: the standard routes it through the self-closing
+        // state, so the end tag arrives carrying that flag, and a depth counter
+        // that skips self-closing tags would leave `<style>` open forever and
+        // swallow the rest of the page.
         assert_eq!(reduce("<p>a</p><script>x()</script  >\n<p>b</p>"), "a\n\nb");
         assert_eq!(reduce("<p>a</p><style>.x{}</style/><p>b</p>"), "a\n\nb");
         // A document that ends mid-end-tag has no further content to recover.
