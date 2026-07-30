@@ -47,7 +47,7 @@ DEEPSEEK_API_KEY=your-api-key
 {
   "model": {
     "provider": "openai",
-    "name": "your-openai-model",
+    "name": "gpt-5.1",
     "maxTokens": 16384
   }
 }
@@ -118,6 +118,9 @@ cargo build --release -p kuncode-cli
 - `model.provider` 支持 `deepseek` 和 `openai`；两者分别使用固定官方 endpoint，
   并读取 `DEEPSEEK_API_KEY` 或 `OPENAI_API_KEY`。
 - 内置模型配置包括 `deepseek-v4-pro` 和 `deepseek-v4-flash`。
+- 没有内置能力档案的模型，`model.maxTokens` 默认值为 `16384`；从旧版
+  `32768` 默认值升级时，如配置了 `compaction.reservedOutput`，需同步调整或显式设置
+  `model.maxTokens`。
 - 非内置模型启用上下文压缩时，需要显式设置 `compaction.contextLimit`。
 - `compaction.mode` 支持 `disabled`、`shadow` 和 `enabled`，默认是 `disabled`。
 - `shadow` 只计算和报告压缩候选，不替换当前上下文。

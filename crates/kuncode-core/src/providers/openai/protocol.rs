@@ -189,15 +189,30 @@ impl TryFrom<completion::CompletionRequest> for OpenAiCompletionRequest {
             .into_iter()
             .flat_map(Vec::<Message>::from)
             .collect();
+        let tools = request
+            .tools
+            .into_iter()
+            .map(ToolDefinition::from)
+            .collect::<Vec<_>>();
+        let tool_choice = match request.tool_choice {
+            // OpenAI already defaults to `none` when no tools are present.
+            Some(message::ToolChoice::None) if tools.is_empty() => None,
+            value => value.map(ToolChoice::from),
+        };
+        let capabilities = ModelCapabilities::for_model(&model);
+        let reasoning_effort = request
+            .reasoning
+            .and_then(|value| ReasoningEffort::from_domain(value, capabilities));
+        let temperature = if capabilities.requires_default_temperature {
+            None
+        } else {
+            request.temperature
+        };
         Ok(Self {
             model,
             messages,
-            tools: request
-                .tools
-                .into_iter()
-                .map(ToolDefinition::from)
-                .collect(),
-            tool_choice: request.tool_choice.map(ToolChoice::from),
+            tools,
+            tool_choice,
             max_completion_tokens: request
                 .max_tokens
                 .map(|value| {
@@ -208,10 +223,10 @@ impl TryFrom<completion::CompletionRequest> for OpenAiCompletionRequest {
                     })
                 })
                 .transpose()?,
-            temperature: request.temperature,
+            temperature,
             top_p: request.top_p,
             stop: request.stop.filter(|value| !value.is_empty()),
-            reasoning_effort: request.reasoning.and_then(ReasoningEffort::from_domain),
+            reasoning_effort,
             response_format: request.output_schema.map(ResponseFormat::json_schema),
             stream: None,
             stream_options: None,
@@ -232,6 +247,7 @@ impl OpenAiCompletionRequest {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum ReasoningEffort {
+    None,
     Minimal,
     Low,
     Medium,
@@ -239,16 +255,43 @@ enum ReasoningEffort {
     Xhigh,
 }
 
+#[derive(Clone, Copy)]
+struct ModelCapabilities {
+    supports_none_reasoning_effort: bool,
+    requires_default_temperature: bool,
+}
+
+impl ModelCapabilities {
+    fn for_model(model: &str) -> Self {
+        let is_gpt_5 =
+            model == "gpt-5" || model.starts_with("gpt-5-") || model.starts_with("gpt-5.");
+        let is_o_series = ["o1", "o3", "o4"].iter().any(|family| {
+            model == *family
+                || model
+                    .strip_prefix(family)
+                    .is_some_and(|suffix| suffix.starts_with('-'))
+        });
+        Self {
+            supports_none_reasoning_effort: supports_none_reasoning_effort(model),
+            requires_default_temperature: is_gpt_5 || is_o_series,
+        }
+    }
+}
+
 impl ReasoningEffort {
-    /// Maps the domain effort onto the wire value; [`Off`] maps to omitting the
-    /// field entirely. Non-reasoning models (gpt-4o family) reject the parameter
-    /// outright, and reasoning models reject `"none"` — leaving the field out is
-    /// the only spelling every Chat Completions model accepts, mirroring the
-    /// DeepSeek mapper's treatment of [`Off`].
+    /// Maps explicit disablement to `none` only for model families that support
+    /// it. Older reasoning and non-reasoning models reject that wire value, so
+    /// omission is the compatible fallback for them.
     ///
     /// [`Off`]: completion::ReasoningEffort::Off
-    fn from_domain(value: completion::ReasoningEffort) -> Option<Self> {
+    fn from_domain(
+        value: completion::ReasoningEffort,
+        capabilities: ModelCapabilities,
+    ) -> Option<Self> {
         match value {
+            completion::ReasoningEffort::Off if capabilities.supports_none_reasoning_effort => {
+                Some(Self::None)
+            }
             completion::ReasoningEffort::Off => None,
             completion::ReasoningEffort::Minimal => Some(Self::Minimal),
             completion::ReasoningEffort::Low => Some(Self::Low),
@@ -257,6 +300,14 @@ impl ReasoningEffort {
             completion::ReasoningEffort::Xhigh => Some(Self::Xhigh),
         }
     }
+}
+
+fn supports_none_reasoning_effort(model: &str) -> bool {
+    model
+        .strip_prefix("gpt-5.")
+        .and_then(|suffix| suffix.split('-').next())
+        .and_then(|minor| minor.parse::<u16>().ok())
+        .is_some_and(|minor| minor >= 1)
 }
 
 #[derive(Debug, Serialize)]
@@ -406,14 +457,18 @@ impl TryFrom<OpenAiCompletionResponse>
             ));
         };
         let mut blocks = Vec::new();
+        let mut answer = String::new();
         if !content.trim().is_empty() {
-            blocks.push(AssistantContent::text(content));
+            answer.push_str(content);
         }
         // A refusal is OpenAI's wire spelling for "the answer text is a
         // decline"; the agent has no refusal-aware branching, so it flattens to
         // ordinary text. The verbatim field survives in `raw_response`.
         if let Some(refusal) = refusal.as_ref().filter(|value| !value.is_empty()) {
-            blocks.push(AssistantContent::text(refusal));
+            answer.push_str(refusal);
+        }
+        if !answer.is_empty() {
+            blocks.push(AssistantContent::text(answer));
         }
         blocks.extend(tool_calls.iter().map(|call| {
             AssistantContent::tool_call(
@@ -441,7 +496,14 @@ impl TryFrom<OpenAiCompletionResponse>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::completion::{CompletionRequestBuilder, Message as DomainMessage, ReasoningEffort};
+    use crate::{
+        completion::{
+            CompletionRequestBuilder, Message as DomainMessage, ReasoningEffort,
+            ToolChoice as DomainToolChoice, ToolDefinition as DomainToolDefinition, ToolResult,
+            ToolResultContent, UserContent,
+        },
+        non_empty_vec::NonEmptyVec,
+    };
 
     #[test]
     fn maps_openai_specific_request_fields() {
@@ -471,17 +533,164 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_effort_off_omits_the_field_entirely() {
-        // gpt-4o-family models reject the parameter and reasoning models reject
-        // "none"; the only universally-accepted spelling of Off is absence.
+    fn reasoning_effort_off_maps_to_none_when_the_model_supports_it() {
         let request = CompletionRequestBuilder::new(DomainMessage::user("test"))
-            .model("gpt-test")
+            .model("gpt-5.1")
+            .temperature(Some(0.0))
+            .reasoning(Some(ReasoningEffort::Off))
+            .build();
+        let wire = OpenAiCompletionRequest::try_from(request).expect("wire request");
+        let json = serde_json::to_value(wire).expect("serialize request");
+
+        assert_eq!(json["reasoning_effort"], "none");
+        assert!(json.get("temperature").is_none());
+    }
+
+    #[test]
+    fn reasoning_effort_off_is_omitted_for_models_without_none_support() {
+        let request = CompletionRequestBuilder::new(DomainMessage::user("test"))
+            .model("gpt-4o")
+            .temperature(Some(0.0))
             .reasoning(Some(ReasoningEffort::Off))
             .build();
         let wire = OpenAiCompletionRequest::try_from(request).expect("wire request");
         let json = serde_json::to_value(wire).expect("serialize request");
 
         assert!(json.get("reasoning_effort").is_none());
+        assert_eq!(json["temperature"], 0.0);
+    }
+
+    #[test]
+    fn reasoning_model_omits_non_default_temperature() {
+        let request = CompletionRequestBuilder::new(DomainMessage::user("test"))
+            .model("o3")
+            .temperature(Some(0.0))
+            .build();
+        let wire = OpenAiCompletionRequest::try_from(request).expect("wire request");
+        let json = serde_json::to_value(wire).expect("serialize request");
+
+        assert!(json.get("temperature").is_none());
+    }
+
+    #[test]
+    fn no_tools_omits_redundant_none_tool_choice() {
+        let request = CompletionRequestBuilder::new(DomainMessage::user("test"))
+            .model("gpt-test")
+            .tool_choice(Some(DomainToolChoice::None))
+            .build();
+        let wire = OpenAiCompletionRequest::try_from(request).expect("wire request");
+        let json = serde_json::to_value(wire).expect("serialize request");
+
+        assert!(json.get("tools").is_none());
+        assert!(json.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn tool_definition_and_specific_choice_use_openai_wire_shapes() {
+        let request = CompletionRequestBuilder::new(DomainMessage::user("test"))
+            .model("gpt-test")
+            .tool(DomainToolDefinition {
+                name: "lookup".to_string(),
+                description: "Look up a value".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": { "key": { "type": "string" } },
+                    "required": ["key"]
+                }),
+            })
+            .tool_choice(Some(DomainToolChoice::Specific {
+                function_name: "lookup".to_string(),
+            }))
+            .build();
+        let wire = OpenAiCompletionRequest::try_from(request).expect("wire request");
+        let json = serde_json::to_value(wire).expect("serialize request");
+
+        assert_eq!(
+            json["tools"],
+            serde_json::json!([{
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "description": "Look up a value",
+                    "parameters": {
+                        "type": "object",
+                        "properties": { "key": { "type": "string" } },
+                        "required": ["key"]
+                    }
+                }
+            }])
+        );
+        assert_eq!(
+            json["tool_choice"],
+            serde_json::json!({
+                "type": "function",
+                "function": { "name": "lookup" }
+            })
+        );
+    }
+
+    #[test]
+    fn mixed_user_content_emits_tool_results_before_joined_text() {
+        let domain = DomainMessage::User {
+            content: NonEmptyVec::from_first_rest(
+                UserContent::text("first"),
+                vec![
+                    UserContent::ToolResult(ToolResult {
+                        id: "call_1".to_string(),
+                        call_id: None,
+                        content: NonEmptyVec::new(ToolResultContent::text("tool output")),
+                    }),
+                    UserContent::text("second"),
+                ],
+            ),
+        };
+
+        let wire = Vec::<Message>::from(domain);
+
+        assert_eq!(wire.len(), 2);
+        assert!(matches!(
+            &wire[0],
+            Message::ToolResult { tool_call_id, content }
+                if tool_call_id == "call_1" && content == "tool output"
+        ));
+        assert!(matches!(
+            &wire[1],
+            Message::User { content } if content == "first\nsecond"
+        ));
+    }
+
+    #[test]
+    fn pure_tool_call_assistant_turn_serializes_empty_content() {
+        let domain = DomainMessage::Assistant {
+            id: None,
+            content: NonEmptyVec::from_first_rest(
+                AssistantContent::tool_call(
+                    "call_1",
+                    "lookup",
+                    serde_json::json!({"key": "value"}),
+                ),
+                vec![AssistantContent::reasoning("not replayed")],
+            ),
+        };
+
+        let wire = Vec::<Message>::from(domain);
+        let json = serde_json::to_value(&wire).expect("serialize messages");
+
+        assert_eq!(
+            json,
+            serde_json::json!([{
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "arguments": "{\"key\":\"value\"}"
+                    }
+                }]
+            }])
+        );
     }
 
     #[test]
@@ -518,6 +727,36 @@ mod tests {
 
         // The wire refusal reaches the agent as ordinary text — the domain has
         // no refusal-aware consumer — while `raw_response` keeps the original.
+        assert!(matches!(
+            normalized.choice.first(),
+            AssistantContent::Text(value) if value.text_ref() == "Cannot comply"
+        ));
+    }
+
+    #[test]
+    fn content_and_refusal_flatten_to_one_text_block() {
+        let response: OpenAiCompletionResponse = serde_json::from_value(serde_json::json!({
+            "id": "chatcmpl-test",
+            "choices": [{
+                "finish_reason": "stop",
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Cannot ",
+                    "refusal": "comply"
+                },
+                "logprobs": null
+            }],
+            "created": 1,
+            "model": "gpt-test",
+            "object": "chat.completion",
+            "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}
+        }))
+        .expect("response fixture");
+        let normalized: completion::CompletionResponse<_> =
+            response.try_into().expect("normalize response");
+
+        assert_eq!(normalized.choice.len(), 1);
         assert!(matches!(
             normalized.choice.first(),
             AssistantContent::Text(value) if value.text_ref() == "Cannot comply"

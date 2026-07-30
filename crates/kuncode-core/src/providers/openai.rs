@@ -1,6 +1,6 @@
 //! Official OpenAI Chat Completions provider.
 
-use std::{env::VarError, time::Duration};
+use std::env::VarError;
 
 use reqwest::header::CONTENT_TYPE;
 use serde::Deserialize;
@@ -10,7 +10,7 @@ use thiserror::Error;
 use crate::{
     completion::{CompletionError, CompletionModel, CompletionRequest, CompletionResponse},
     json_utils,
-    providers::chat_completions::streaming,
+    providers::chat_completions::{CONNECT_TIMEOUT, READ_TIMEOUT, REQUEST_TIMEOUT, streaming},
 };
 
 use self::protocol::{OpenAiCompletionRequest, OpenAiCompletionResponse, Usage};
@@ -18,9 +18,6 @@ use self::protocol::{OpenAiCompletionRequest, OpenAiCompletionResponse, Usage};
 mod protocol;
 
 const OPENAI_COMPLETIONS_URL: &str = "https://api.openai.com/v1/chat/completions";
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const READ_TIMEOUT: Duration = Duration::from_secs(360);
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(360);
 
 /// Errors produced while constructing an OpenAI client.
 #[derive(Debug, Error)]
@@ -152,8 +149,8 @@ impl CompletionModel for OpenAiCompletionModel {
 }
 
 /// Projects the server's JSON into the domain response while handing the
-/// untouched original through as `raw_response`. Deserializes by reference so
-/// the projection does not deep-copy the body.
+/// untouched original through as `raw_response`. Deserializing from `&Value`
+/// avoids cloning the full JSON tree before building the typed projection.
 fn normalize_response(raw: Value) -> Result<CompletionResponse<Value>, CompletionError> {
     let response = OpenAiCompletionResponse::deserialize(&raw)?;
     let normalized: CompletionResponse<OpenAiCompletionResponse> = response.try_into()?;

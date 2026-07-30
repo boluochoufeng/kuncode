@@ -7,7 +7,7 @@ use crate::{
         CompletionError, CompletionModel, CompletionRequest, CompletionResponse, CompletionStream,
     },
     providers::{
-        deepseek::{DeepSeekClient, DeepSeekCompletionModel},
+        deepseek::{DeepSeekClient, DeepSeekCompletionModel, protocol::DeepSeekCompletionResponse},
         openai::{OpenAiClient, OpenAiCompletionModel},
     },
 };
@@ -17,7 +17,7 @@ use crate::{
 pub enum AnyChatClient {
     /// Native DeepSeek protocol behavior.
     DeepSeek(DeepSeekClient),
-    /// OpenAI-compatible Chat Completions behavior.
+    /// Official OpenAI Chat Completions behavior.
     OpenAi(OpenAiClient),
 }
 
@@ -26,7 +26,7 @@ pub enum AnyChatClient {
 pub enum AnyChatCompletionModel {
     /// Native DeepSeek model.
     DeepSeek(DeepSeekCompletionModel),
-    /// OpenAI-compatible model.
+    /// Official OpenAI model.
     OpenAi(OpenAiCompletionModel),
 }
 
@@ -58,13 +58,7 @@ impl CompletionModel for AnyChatCompletionModel {
         match self {
             Self::DeepSeek(model) => {
                 let response = model.completion(request).await?;
-                let raw_response = serde_json::to_value(response.raw_response)?;
-                Ok(CompletionResponse {
-                    choice: response.choice,
-                    usage: response.usage,
-                    raw_response,
-                    message_id: response.message_id,
-                })
+                erase_deepseek_response(response)
             }
             Self::OpenAi(model) => model.completion(request).await,
         }
@@ -78,5 +72,82 @@ impl CompletionModel for AnyChatCompletionModel {
             Self::DeepSeek(model) => model.stream(request).await,
             Self::OpenAi(model) => model.stream(request).await,
         }
+    }
+}
+
+fn erase_deepseek_response(
+    response: CompletionResponse<DeepSeekCompletionResponse>,
+) -> Result<CompletionResponse<Value>, CompletionError> {
+    let raw_response = serde_json::to_value(response.raw_response)?;
+    Ok(CompletionResponse {
+        choice: response.choice,
+        usage: response.usage,
+        raw_response,
+        message_id: response.message_id,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::completion::AssistantContent;
+
+    #[test]
+    fn make_dispatches_to_the_selected_provider() {
+        let deepseek = AnyChatClient::DeepSeek(
+            DeepSeekClient::new("test-key").expect("build DeepSeek test client"),
+        );
+        let openai =
+            AnyChatClient::OpenAi(OpenAiClient::new("test-key").expect("build OpenAI test client"));
+
+        assert!(matches!(
+            AnyChatCompletionModel::make(&deepseek, "deepseek-test"),
+            AnyChatCompletionModel::DeepSeek(_)
+        ));
+        assert!(matches!(
+            AnyChatCompletionModel::make(&openai, "gpt-test"),
+            AnyChatCompletionModel::OpenAi(_)
+        ));
+    }
+
+    #[test]
+    fn deepseek_response_erasure_serializes_the_typed_raw_response() {
+        let raw: DeepSeekCompletionResponse = serde_json::from_value(serde_json::json!({
+            "id": "chatcmpl-test",
+            "choices": [{
+                "finish_reason": "stop",
+                "index": 0,
+                "message": {"role": "assistant", "content": "hello"},
+                "logprobs": null
+            }],
+            "created": 1,
+            "model": "deepseek-test",
+            "system_fingerprint": "fp_test",
+            "object": "chat.completion",
+            "usage": {
+                "prompt_tokens": 4,
+                "completion_tokens": 2,
+                "total_tokens": 6,
+                "unmodeled_extension": true
+            }
+        }))
+        .expect("DeepSeek response fixture");
+        let typed: CompletionResponse<DeepSeekCompletionResponse> =
+            raw.try_into().expect("normalize DeepSeek response");
+
+        let erased = erase_deepseek_response(typed).expect("erase response type");
+
+        assert!(matches!(
+            erased.choice.first(),
+            AssistantContent::Text(text) if text.text_ref() == "hello"
+        ));
+        assert_eq!(erased.usage.total_tokens, 6);
+        assert_eq!(erased.raw_response["id"], "chatcmpl-test");
+        assert!(
+            erased.raw_response["usage"]
+                .get("unmodeled_extension")
+                .is_none(),
+            "typed DeepSeek responses intentionally drop unmodeled fields"
+        );
     }
 }

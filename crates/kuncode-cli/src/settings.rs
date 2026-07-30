@@ -96,6 +96,15 @@ pub(crate) enum ProviderKind {
     OpenAi,
 }
 
+impl ProviderKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::DeepSeek => "deepseek",
+            Self::OpenAi => "openai",
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 struct AgentSection {
@@ -319,9 +328,10 @@ fn resolve_settings(
         // No cross-provider default exists: falling back to the DeepSeek model
         // id would send it to the other provider and fail at the first request.
         (None, None, ProviderKind::OpenAi) => {
-            return Err(SettingsError::Model(
-                "provider \"openai\" requires an explicit model name".to_string(),
-            ));
+            return Err(SettingsError::Model(format!(
+                "provider \"{}\" requires an explicit model name",
+                ProviderKind::OpenAi.as_str()
+            )));
         }
     };
     if model_name.trim().is_empty() {
