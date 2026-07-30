@@ -9,8 +9,11 @@ path = "src/lib.rs"
 [dependencies]
 async-trait = { workspace = true }
 chrono = { workspace = true }
-futures-util = { workspace = true }
 encoding_rs = { workspace = true }
+futures-util = { workspace = true }
+# The full HTML5 named-character-reference table, which is 2231 entries nobody
+# should hand-maintain. Zero transitive dependencies, so it costs one crate.
+html-escape = { workspace = true }
 ignore = { workspace = true }
 kuncode-core = { path = "../kuncode-core" }
 # `web_fetch` needs TLS and a pluggable resolver, and nothing else. Its `charset`

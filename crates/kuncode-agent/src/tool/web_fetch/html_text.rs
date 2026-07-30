@@ -9,11 +9,8 @@
 
 use std::borrow::Cow;
 
+use html_escape::decode_html_entities;
 use url::Url;
-
-/// Longest `&…;` span treated as a character reference, so a bare `&` in prose
-/// cannot scan the rest of the page looking for a terminator.
-const MAX_REFERENCE_BYTES: usize = 32;
 
 /// Longest element name [`Element::classify`] recognizes (`blockquote`,
 /// `figcaption`). A longer name is `Inline` whatever its case, so it needs no
@@ -255,7 +252,7 @@ fn attribute<'a>(attributes: &'a str, name: &str) -> Option<Cow<'a, str>> {
             ),
         };
         if matched {
-            return Some(unescape(value));
+            return Some(decode_html_entities(value));
         }
         rest = remainder;
     }
@@ -403,9 +400,9 @@ impl<'a> TextWriter<'a> {
         if text.is_empty() {
             return;
         }
-        let text = unescape(text);
+        let text = decode_html_entities(text);
         if preformatted {
-            self.buffer.push_str(&text);
+            self.buffer.push_str(&plain_spaces(&text));
             return;
         }
         let collapsed = collapse_inline(&text);
@@ -487,83 +484,29 @@ fn collapse_inline(text: &str) -> Cow<'_, str> {
     Cow::Owned(collapsed)
 }
 
-/// Resolves character references, leaving unknown ones verbatim.
-fn unescape(text: &str) -> Cow<'_, str> {
-    if !text.contains('&') {
+/// Rewrites the space-like characters a reference can produce as plain spaces.
+///
+/// Only needed where [`collapse_inline`] does not run, which is preformatted
+/// text: a code block that indents with `&nbsp;` is old but real, and a U+00A0
+/// the model copies into a shell or a source file is a syntax error it cannot
+/// see. ASCII whitespace is left alone — a tab is indentation and a newline is a
+/// line.
+fn plain_spaces(text: &str) -> Cow<'_, str> {
+    let space_like = |character: char| character.is_whitespace() && !character.is_ascii();
+    if !text.contains(space_like) {
         return Cow::Borrowed(text);
     }
-    let mut resolved = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(at) = rest.find('&') {
-        resolved.push_str(&rest[..at]);
-        rest = &rest[at..];
-        // `;` is ASCII, so its byte offset is a character boundary.
-        let terminator = rest
-            .bytes()
-            .take(MAX_REFERENCE_BYTES)
-            .position(|byte| byte == b';');
-        match terminator
-            .and_then(|end| character_reference(&rest[1..end]).map(|resolved| (resolved, end + 1)))
-        {
-            Some((character, end)) => {
-                resolved.push(character);
-                rest = &rest[end..];
-            }
-            None => {
-                resolved.push('&');
-                rest = &rest[1..];
-            }
-        }
-    }
-    resolved.push_str(rest);
-    Cow::Owned(resolved)
-}
-
-/// Resolves one reference name — the text between `&` and `;`.
-///
-/// Numeric references are resolved in full. Named ones cover the two tiers that
-/// change what the text *says*: the markup delimiters, because `Vec&lt;T&gt;` in a
-/// code sample must not reach the model as `Vec&lt;T&gt;`, and the spacing
-/// references, because leaving them would litter the prose with `&nbsp;`. The
-/// rest of the HTML5 table — some two thousand entries, mostly symbols and Greek
-/// letters — is deliberately absent: `&alpha;` already reads as alpha to a model,
-/// and shipping the table would cost a dependency to change nothing.
-fn character_reference(name: &str) -> Option<char> {
-    if let Some(digits) = name.strip_prefix('#') {
-        let code = match digits.strip_prefix(['x', 'X']) {
-            Some(hex) => u32::from_str_radix(hex, 16).ok()?,
-            None => digits.parse().ok()?,
-        };
-        return char::from_u32(code);
-    }
-    Some(match name {
-        "amp" => '&',
-        "lt" => '<',
-        "gt" => '>',
-        "quot" => '"',
-        "apos" => '\'',
-        // Resolved to a plain space so the collapse step treats them as the
-        // spacing they stand for.
-        "nbsp" | "ensp" | "emsp" | "thinsp" => ' ',
-        "shy" => '\u{ad}',
-        "copy" => '©',
-        "reg" => '®',
-        "trade" => '™',
-        "deg" => '°',
-        "middot" => '·',
-        "bull" => '•',
-        "hellip" => '…',
-        "mdash" => '—',
-        "ndash" => '–',
-        "lsquo" => '‘',
-        "rsquo" => '’',
-        "ldquo" => '“',
-        "rdquo" => '”',
-        "laquo" => '«',
-        "raquo" => '»',
-        "times" => '×',
-        _ => return None,
-    })
+    Cow::Owned(
+        text.chars()
+            .map(|character| {
+                if space_like(character) {
+                    ' '
+                } else {
+                    character
+                }
+            })
+            .collect(),
+    )
 }
 
 /// Trims trailing whitespace per line and collapses runs of blank lines, which
@@ -640,6 +583,55 @@ mod tests {
         let reduced = reduce("<p>a&nbsp;&amp;&nbsp;b &#8212; c &notareference; &#x41;</p>");
 
         assert_eq!(reduced, "a & b — c &notareference; A");
+    }
+
+    #[test]
+    fn the_whole_html5_reference_table_resolves() {
+        // The point of the dependency: the table is 2231 entries, and a page is
+        // free to use any of them. These are the tiers a hand-written table kept
+        // getting wrong — Greek letters and mathematical operators in technical
+        // prose, box-drawing and rarely-seen names, and the case-distinct pairs.
+        assert_eq!(
+            reduce("<p>&alpha; &Omega; &sum; &infin; &ne; &asymp; &times; &frac12;</p>"),
+            "α Ω ∑ ∞ ≠ ≈ × ½"
+        );
+        assert_eq!(
+            reduce("<p>&boxdl; &nldr; &plankv; &Zopf; &vzigzag; &dagger; &Dagger;</p>"),
+            "┐ ‥ ℏ ℤ ⦚ † ‡"
+        );
+        // Resolving is what keeps them from spending the content budget: seven
+        // bytes of `&alpha;` against two of `α`, against a 50 kB cap.
+        assert!("&alpha;".len() > "α".len());
+    }
+
+    #[test]
+    fn multi_codepoint_references_lose_their_combining_mark() {
+        // A known defect in `html-escape`: the 93 table entries that map to two
+        // code points come back as the first one only, so `&NotGreaterFullEqual;`
+        // reads as its own opposite. Pinned rather than worked around — patching
+        // it here would mean maintaining a slice of the very table the dependency
+        // exists to own. If this test ever fails, upstream fixed it: delete the
+        // test and this comment.
+        assert_eq!(reduce("<p>&NotGreaterFullEqual;</p>"), "≧");
+        assert_eq!(reduce("<p>&NotLessLess;</p>"), "≪");
+
+        // Same trade on the 106 entries HTML5 allows without a semicolon. Leaving
+        // them verbatim is the safe direction: `&AMP` still reads as an ampersand
+        // to a model, where a silently wrong operator does not.
+        assert_eq!(reduce("<p>&AMP &copy</p>"), "&AMP &copy");
+    }
+
+    #[test]
+    fn space_like_references_do_not_leak_into_code_blocks() {
+        // `&nbsp;` indentation in a `<pre>` is old but real, and U+00A0 copied
+        // into a shell or a source file is an error the model cannot see. Outside
+        // preformatted text the collapse step already handles them.
+        let reduced = reduce("<pre>fn main() {\n&nbsp;&nbsp;&nbsp;&nbsp;ok();\n}</pre>");
+
+        assert_eq!(reduced, "```\nfn main() {\n    ok();\n}\n```");
+        assert!(!reduced.contains('\u{a0}'), "U+00A0 reached the model");
+        // A tab is indentation, not a reference artifact, so it is left alone.
+        assert_eq!(reduce("<pre>a\n\tb</pre>"), "```\na\n\tb\n```");
     }
 
     #[test]
