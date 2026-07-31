@@ -12,7 +12,7 @@ use kuncode_agent::{
     runner::{AgentCompactionConfig, AgentCompactionConfigError},
 };
 use kuncode_core::providers::deepseek::{
-    DEEPSEEK_V4_PRO_MODEL_ID, DeepSeekModelProfile, model_profile,
+    DEEPSEEK_V4_FLASH_MODEL_ID, DeepSeekModelProfile, model_profile,
 };
 use serde::Deserialize;
 
@@ -198,7 +198,7 @@ pub struct ProjectSettings {
 
 impl Default for ProjectSettings {
     fn default() -> Self {
-        let max_tokens = model_profile(DEEPSEEK_V4_PRO_MODEL_ID).map_or(
+        let max_tokens = model_profile(DEEPSEEK_V4_FLASH_MODEL_ID).map_or(
             CONSERVATIVE_DEFAULT_MAX_TOKENS,
             DeepSeekModelProfile::default_max_tokens,
         );
@@ -207,7 +207,7 @@ impl Default for ProjectSettings {
             default_mode: None,
             trust: ProjectTrust::Untrusted,
             provider: ProviderKind::DeepSeek,
-            model_name: DEEPSEEK_V4_PRO_MODEL_ID.to_string(),
+            model_name: DEEPSEEK_V4_FLASH_MODEL_ID.to_string(),
             max_tokens,
             max_iterations: DEFAULT_MAX_ITERATIONS,
             todo_reminder_interval: default_todo_reminder_interval(),
@@ -324,7 +324,7 @@ fn resolve_settings(
     let model_name = match (model_override, &file.model.name, file.model.provider) {
         (Some(name), _, _) => name.to_string(),
         (None, Some(name), _) => name.clone(),
-        (None, None, ProviderKind::DeepSeek) => DEEPSEEK_V4_PRO_MODEL_ID.to_string(),
+        (None, None, ProviderKind::DeepSeek) => DEEPSEEK_V4_FLASH_MODEL_ID.to_string(),
         // No cross-provider default exists: falling back to the DeepSeek model
         // id would send it to the other provider and fail at the first request.
         (None, None, ProviderKind::OpenAi) => {
@@ -653,7 +653,7 @@ mod tests {
         assert!(loaded.policy.expect("resolved policy").rules().is_empty());
         assert!(loaded.default_mode.is_none());
         assert!(loaded.compaction.is_none());
-        assert_eq!(loaded.model_name, "deepseek-v4-pro");
+        assert_eq!(loaded.model_name, "deepseek-v4-flash");
         assert_eq!(loaded.max_tokens, 65_536);
         assert_eq!(loaded.max_iterations, 50);
         assert_eq!(loaded.todo_reminder_interval, Some(3));
@@ -936,7 +936,7 @@ mod tests {
         )
         .expect("loads");
 
-        assert_eq!(loaded.model_name, "deepseek-v4-pro");
+        assert_eq!(loaded.model_name, "deepseek-v4-flash");
         assert_eq!(loaded.max_tokens, 32_768);
         assert_eq!(loaded.max_iterations, 12);
         assert_eq!(loaded.todo_reminder_interval, None);
@@ -1027,7 +1027,7 @@ mod tests {
         let loaded = load_project_settings_from(
             &dir,
             ModelOverrides {
-                universal: Some("deepseek-v4-flash"),
+                universal: Some("deepseek-v4-pro"),
                 deepseek: None,
             },
             ProjectTrust::Trusted,
@@ -1035,7 +1035,7 @@ mod tests {
         .expect("environment override selects a known model");
         let _ = fs::remove_dir_all(&dir);
 
-        assert_eq!(loaded.model_name, "deepseek-v4-flash");
+        assert_eq!(loaded.model_name, "deepseek-v4-pro");
         assert_eq!(loaded.max_tokens, 8_192);
         assert_eq!(
             loaded

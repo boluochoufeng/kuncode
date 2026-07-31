@@ -96,7 +96,7 @@ cargo build --release -p kuncode-cli
   },
   "model": {
     "provider": "deepseek",
-    "name": "deepseek-v4-pro",
+    "name": "deepseek-v4-flash",
     "maxTokens": 65536
   },
   "agent": {
@@ -117,7 +117,8 @@ cargo build --release -p kuncode-cli
 - `KUNCODE_MODEL` 可以覆盖配置文件中的模型名称；`DEEPSEEK_MODEL` 作为兼容别名保留。
 - `model.provider` 支持 `deepseek` 和 `openai`；两者分别使用固定官方 endpoint，
   并读取 `DEEPSEEK_API_KEY` 或 `OPENAI_API_KEY`。
-- 内置模型配置包括 `deepseek-v4-pro` 和 `deepseek-v4-flash`。
+- 内置模型配置包括 `deepseek-v4-flash` 和 `deepseek-v4-pro`；未指定 `model.name`
+  时，DeepSeek provider 默认使用 `deepseek-v4-flash`。
 - 没有内置能力档案的模型，`model.maxTokens` 默认值为 `16384`；从旧版
   `32768` 默认值升级时，如配置了 `compaction.reservedOutput`，需同步调整或显式设置
   `model.maxTokens`。
