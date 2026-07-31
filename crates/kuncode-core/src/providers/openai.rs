@@ -18,6 +18,7 @@ use self::protocol::{OpenAiCompletionRequest, OpenAiCompletionResponse, Usage};
 mod protocol;
 
 const OPENAI_COMPLETIONS_URL: &str = "https://api.openai.com/v1/chat/completions";
+const OPENAI_API_KEY_ENV: &str = "OPENAI_API_KEY";
 
 /// Errors produced while constructing an OpenAI client.
 #[derive(Debug, Error)]
@@ -25,9 +26,15 @@ pub enum Error {
     /// The underlying HTTP client could not be built.
     #[error("HTTP client error: {0}")]
     Client(#[from] reqwest::Error),
-    /// `OPENAI_API_KEY` was missing or invalid Unicode.
-    #[error("environment variable `OPENAI_API_KEY` is not set or is invalid")]
-    EnvironmentVariable(#[source] VarError),
+    /// Required environment variable was missing or invalid.
+    #[error("environment variable `{name}` is not set or is invalid")]
+    EnvironmentVariable {
+        /// Environment variable name that was read.
+        name: String,
+        #[source]
+        /// Original environment lookup error.
+        source: VarError,
+    },
 }
 
 /// Authenticated client for the official OpenAI API.
@@ -61,7 +68,11 @@ impl OpenAiClient {
     /// Returns [`Error::EnvironmentVariable`] when the credential is unavailable,
     /// or [`Error::Client`] when the HTTP client cannot be configured.
     pub fn from_env() -> Result<Self, Error> {
-        let api_key = std::env::var("OPENAI_API_KEY").map_err(Error::EnvironmentVariable)?;
+        let api_key =
+            std::env::var(OPENAI_API_KEY_ENV).map_err(|source| Error::EnvironmentVariable {
+                name: OPENAI_API_KEY_ENV.to_string(),
+                source,
+            })?;
         Self::new(api_key)
     }
 
@@ -166,6 +177,19 @@ fn normalize_response(raw: Value) -> Result<CompletionResponse<Value>, Completio
 mod tests {
     use super::*;
     use crate::completion::AssistantContent;
+
+    #[test]
+    fn environment_variable_error_debug_names_openai_api_key() {
+        let error: Box<dyn std::error::Error> = Box::new(Error::EnvironmentVariable {
+            name: OPENAI_API_KEY_ENV.to_string(),
+            source: VarError::NotPresent,
+        });
+
+        assert_eq!(
+            format!("Error: {error:?}"),
+            r#"Error: EnvironmentVariable { name: "OPENAI_API_KEY", source: NotPresent }"#
+        );
+    }
 
     #[test]
     fn normalize_response_projects_content_and_keeps_the_original_json() {
