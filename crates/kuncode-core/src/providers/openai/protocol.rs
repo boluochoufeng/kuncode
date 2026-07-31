@@ -418,18 +418,26 @@ struct CompletionTokenDetails {
 struct PromptTokenDetails {
     #[serde(default)]
     cached_tokens: u32,
+    #[serde(default)]
+    cache_write_tokens: u32,
 }
 
 impl From<Usage> for completion::Usage {
     fn from(value: Usage) -> Self {
+        let (cached_input_tokens, cache_creation_input_tokens) =
+            value.prompt_tokens_details.map_or((0, 0), |details| {
+                (
+                    u64::from(details.cached_tokens),
+                    u64::from(details.cache_write_tokens),
+                )
+            });
+
         Self {
             input_tokens: u64::from(value.prompt_tokens),
             output_tokens: u64::from(value.completion_tokens),
             total_tokens: u64::from(value.total_tokens),
-            cached_input_tokens: value
-                .prompt_tokens_details
-                .map_or(0, |details| u64::from(details.cached_tokens)),
-            cache_creation_input_tokens: 0,
+            cached_input_tokens,
+            cache_creation_input_tokens,
             reasoning_tokens: value
                 .completion_tokens_details
                 .map_or(0, |details| u64::from(details.reasoning_tokens)),
@@ -704,6 +712,30 @@ mod tests {
             OpenAiCompletionRequest::try_from(request),
             Err(CompletionError::RequestError(_))
         ));
+    }
+
+    #[test]
+    fn usage_maps_cache_reads_and_writes() {
+        let usage: Usage = serde_json::from_value(serde_json::json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "total_tokens": 120,
+            "prompt_tokens_details": {
+                "cached_tokens": 40,
+                "cache_write_tokens": 60
+            },
+            "completion_tokens_details": {"reasoning_tokens": 10}
+        }))
+        .expect("usage fixture");
+
+        let normalized: completion::Usage = usage.into();
+
+        assert_eq!(normalized.input_tokens, 100);
+        assert_eq!(normalized.output_tokens, 20);
+        assert_eq!(normalized.total_tokens, 120);
+        assert_eq!(normalized.cached_input_tokens, 40);
+        assert_eq!(normalized.cache_creation_input_tokens, 60);
+        assert_eq!(normalized.reasoning_tokens, 10);
     }
 
     #[test]
