@@ -1,6 +1,10 @@
 //! The `ls` tool: list the entries of one workspace directory.
 
-use std::path::{Path, PathBuf};
+use std::{
+    iter::Peekable,
+    path::{Path, PathBuf},
+    vec,
+};
 
 use async_trait::async_trait;
 use kuncode_core::completion::ToolDefinition;
@@ -88,6 +92,16 @@ pub struct LsEntry {
     /// almost certainly mistake for the size of its target.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
+    /// What this directory holds, present only when `depth` reached inside it.
+    ///
+    /// Nesting is what separates this tool from `glob`: a listing answers "how
+    /// is this organized", and a flat vector of paths makes the reader
+    /// reconstruct the hierarchy that the walk already knew. An empty vector
+    /// therefore means "nothing more to show here" — either the directory is
+    /// empty or `depth` stopped at it — never that the entry is a file, which
+    /// [`Self::kind`] says.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<LsEntry>,
 }
 
 /// Entries found under one workspace directory.
@@ -95,10 +109,14 @@ pub struct LsEntry {
 pub struct LsOutput {
     /// Directory that was listed, workspace-relative (`.` for the root).
     pub directory: String,
-    /// Matching entries sorted by path, capped for context safety.
+    /// Direct entries of [`Self::directory`], each carrying whatever `depth`
+    /// reached beneath it. Sorted by name within a level, with a directory
+    /// ahead of a sibling file sharing its stem (`filesystem/` before
+    /// `filesystem.rs`). Capped for context safety.
     pub entries: Vec<LsEntry>,
-    /// Total entries found before the cap was applied. Compare against
-    /// [`Self::entries`] to see how much the listing left out.
+    /// Total entries found at every level before the cap was applied. Compare
+    /// against the number of nodes in [`Self::entries`] to see how much the
+    /// listing left out.
     pub total_entries: usize,
     /// Entries counted in [`Self::total_entries`] but impossible to name,
     /// because their file names have no workspace-relative text form.
@@ -136,12 +154,13 @@ impl Ls {
             // here or not at all.
             definition: definition_for::<LsArgs>(
                 "ls",
-                "List what a workspace directory contains, one level deep by \
-                 default and further with `depth`. Each entry reports a \
-                 workspace-relative path usable as-is with read_file and \
-                 edit_file. Use it to see how a tree is organized; use glob to \
-                 find files by name at any depth, and grep to search their \
-                 contents.",
+                "List what a workspace directory contains, as a tree: a \
+                 directory entry carries what was found inside it under \
+                 `children`. Reaches one level deep by default, further with \
+                 `depth`. Every path reported is usable as-is with read_file \
+                 and edit_file. Use this to see how a project is organized; \
+                 use glob to find files by name at any depth, and grep to \
+                 search their contents.",
             ),
             workspace,
         }
@@ -273,8 +292,16 @@ impl TypedTool for Ls {
         let workspace = self.workspace.clone();
         let directory = path.clone();
         let visibility = ctx.visibility.clone();
+        let root = display_path.clone();
         let listing = match tokio::task::spawn_blocking(move || {
-            walk_directory(&workspace, &directory, depth, include_ignored, &visibility)
+            walk_directory(
+                &workspace,
+                &directory,
+                &root,
+                depth,
+                include_ignored,
+                &visibility,
+            )
         })
         .await
         {
@@ -337,6 +364,7 @@ impl TypedTool for Ls {
 fn walk_directory(
     workspace: &Workspace,
     directory: &Path,
+    root: &str,
     depth: usize,
     include_ignored: bool,
     visibility: &PathVisibility,
@@ -369,16 +397,19 @@ fn walk_directory(
         unnameable,
         hidden,
     } = walked;
-    kept.sort_by(|left, right| left.0.cmp(&right.0));
+    // Sorting is what makes the nesting below a single pass: it places a
+    // directory immediately before its whole subtree. It also decides which
+    // entries the cap keeps, so it has to happen first.
+    kept.sort_by(|left, right| tree_order(&left.0, &right.0));
     let total = kept.len() + unnameable;
     kept.truncate(LS_ENTRY_CAP);
 
     // `stat` runs only on entries that survive the cap: `DirEntry::metadata` is
-    // an uncached syscall per entry on Unix, and a recursive walk discards
-    // nearly all of them.
-    let entries = kept
+    // an uncached syscall per entry on Unix, and a deep walk discards nearly
+    // all of them.
+    let flat = kept
         .into_iter()
-        .map(|(relative, kind, path)| LsEntry {
+        .map(|(relative, kind, path)| FlatEntry {
             size: match kind {
                 LsEntryKind::File => std::fs::metadata(&path).ok().map(|meta| meta.len()),
                 LsEntryKind::Directory | LsEntryKind::Symlink => None,
@@ -386,14 +417,87 @@ fn walk_directory(
             path: relative,
             kind,
         })
-        .collect();
+        .collect::<Vec<_>>();
 
+    // The walk root is the tree's root, and the workspace root names itself
+    // `.` — a prefix no walked path carries, so it becomes the empty prefix
+    // that admits everything.
+    let prefix = if root == "." { "" } else { root };
     Listing {
-        entries,
+        entries: nest(&mut flat.into_iter().peekable(), prefix),
         total,
         unrepresentable: unnameable,
         hidden,
     }
+}
+
+/// Orders paths so that a directory is followed by its own subtree and nothing
+/// else, which is the contiguity [`nest`] consumes.
+///
+/// Plain byte order does not give that. `.` sorts below `/`, so `filesystem.rs`
+/// lands *between* `filesystem` and `filesystem/edit_file.rs` — a sibling
+/// wedged into the middle of a subtree, which ends the nested run early and
+/// strands the rest of the subtree at the parent's level. Sorting the separator
+/// below every other byte closes the subtree first.
+fn tree_order(left: &str, right: &str) -> std::cmp::Ordering {
+    left.bytes()
+        .map(separator_first)
+        .cmp(right.bytes().map(separator_first))
+}
+
+fn separator_first(byte: u8) -> u8 {
+    // No other byte maps to 0, because a path component cannot contain NUL.
+    if byte == b'/' { 0 } else { byte }
+}
+
+/// One walked entry before nesting, with its size already resolved.
+struct FlatEntry {
+    path: String,
+    kind: LsEntryKind,
+    size: Option<u64>,
+}
+
+/// Folds the run of entries below `prefix` into nested children.
+///
+/// Relies on the caller's path sort: a directory is immediately followed by its
+/// whole subtree, so one pass over a peekable iterator suffices. The first
+/// entry that is not below `prefix` ends the run and returns to the level
+/// above, which is where it belongs.
+///
+/// Recursion is bounded by [`LS_ENTRY_CAP`], since a level can only exist if
+/// some entry survived the cap to occupy it.
+fn nest(entries: &mut Peekable<vec::IntoIter<FlatEntry>>, prefix: &str) -> Vec<LsEntry> {
+    let mut nested = Vec::new();
+    while entries
+        .peek()
+        .is_some_and(|entry| is_below(&entry.path, prefix))
+    {
+        let entry = entries.next().expect("peek reported an entry");
+        let children = match entry.kind {
+            LsEntryKind::Directory => nest(entries, &entry.path),
+            // A symlink is listed but never followed, so nothing nests under
+            // one even when it points at a directory inside the workspace.
+            LsEntryKind::File | LsEntryKind::Symlink => Vec::new(),
+        };
+        nested.push(LsEntry {
+            path: entry.path,
+            kind: entry.kind,
+            size: entry.size,
+            children,
+        });
+    }
+    nested
+}
+
+/// Whether `path` names something inside the directory `prefix`.
+///
+/// The separator is checked explicitly so that `src2/main.rs` is not mistaken
+/// for something under `src`.
+fn is_below(path: &str, prefix: &str) -> bool {
+    prefix.is_empty()
+        || (path.len() > prefix.len()
+            && path.starts_with(prefix)
+            && path.as_bytes()[prefix.len()] == b'/')
 }
 
 /// One walk's result, before it is shaped into [`LsOutput`].
@@ -451,6 +555,27 @@ mod tests {
             .expect("no harness-level error")
     }
 
+    /// Every path in the tree, sorted.
+    ///
+    /// Most assertions here care about *which* entries a listing reached, not
+    /// how they are shaped, so they compare against this rather than walking
+    /// `children` by hand. Tests about the nesting itself inspect the tree
+    /// directly.
+    fn paths_in(entries: &serde_json::Value) -> Vec<String> {
+        let mut flat = Vec::new();
+        let mut pending = vec![entries];
+        while let Some(level) = pending.pop() {
+            for entry in level.as_array().into_iter().flatten() {
+                flat.push(entry["path"].as_str().unwrap_or_default().to_string());
+                if let Some(children) = entry.get("children") {
+                    pending.push(children);
+                }
+            }
+        }
+        flat.sort();
+        flat
+    }
+
     #[tokio::test]
     async fn denied_entries_are_withheld_from_a_listing_rooted_above_them() {
         let tmp = TestDir::new();
@@ -464,12 +589,7 @@ mod tests {
         let output = call_with(Ls::new(workspace), serde_json::json!({ "depth": 64 }), &ctx).await;
 
         let data = output.data.expect("data present");
-        let paths = data["entries"]
-            .as_array()
-            .expect("entries present")
-            .iter()
-            .map(|entry| entry["path"].as_str().unwrap_or_default().to_string())
-            .collect::<Vec<_>>();
+        let paths = paths_in(&data["entries"]);
         assert!(paths.contains(&"src/lib.rs".to_string()));
         assert!(
             !paths.iter().any(|path| path.starts_with("secrets")),
@@ -553,14 +673,7 @@ mod tests {
         fs::write(tmp.path().join("a/b/c/three.rs"), "").expect("file should be written");
         let tool = Ls::new(tmp.workspace().await);
 
-        let paths = |output: ToolOutput| {
-            output.data.expect("data present")["entries"]
-                .as_array()
-                .expect("entries is an array")
-                .iter()
-                .map(|entry| entry["path"].as_str().expect("path").to_string())
-                .collect::<Vec<_>>()
-        };
+        let reached = |output: ToolOutput| paths_in(&output.data.expect("data present")["entries"]);
 
         // The default reaches one level; each step adds exactly one more. This
         // is the middle ground a boolean `recursive` could not express.
@@ -568,12 +681,97 @@ mod tests {
         let two = call(tool.clone(), serde_json::json!({ "path": "a", "depth": 2 })).await;
         let three = call(tool, serde_json::json!({ "path": "a", "depth": 3 })).await;
 
-        assert_eq!(paths(default), ["a/b", "a/one.rs"]);
-        assert_eq!(paths(two), ["a/b", "a/b/c", "a/b/two.rs", "a/one.rs"]);
+        assert_eq!(reached(default), ["a/b", "a/one.rs"]);
+        assert_eq!(reached(two), ["a/b", "a/b/c", "a/b/two.rs", "a/one.rs"]);
         assert_eq!(
-            paths(three),
+            reached(three),
             ["a/b", "a/b/c", "a/b/c/three.rs", "a/b/two.rs", "a/one.rs"]
         );
+    }
+
+    #[tokio::test]
+    async fn entries_nest_under_the_directory_that_holds_them() {
+        let tmp = TestDir::new();
+        fs::create_dir_all(tmp.path().join("src/bin")).expect("directory should be created");
+        fs::write(tmp.path().join("src/bin/main.rs"), "fn main() {}")
+            .expect("file should be written");
+        fs::write(tmp.path().join("src/lib.rs"), "").expect("file should be written");
+        fs::create_dir_all(tmp.path().join("empty")).expect("directory should be created");
+        let tool = Ls::new(tmp.workspace().await);
+
+        let output = call(tool, serde_json::json!({ "depth": 3 })).await;
+
+        // The shape is the point: a reader sees the hierarchy without parsing
+        // it back out of the paths, and every path is still complete enough to
+        // hand straight to `read_file`.
+        assert_eq!(
+            output.data.expect("data present")["entries"],
+            serde_json::json!([
+                { "path": "empty", "kind": "directory" },
+                {
+                    "path": "src",
+                    "kind": "directory",
+                    "children": [
+                        {
+                            "path": "src/bin",
+                            "kind": "directory",
+                            "children": [
+                                { "path": "src/bin/main.rs", "kind": "file", "size": 12 },
+                            ],
+                        },
+                        { "path": "src/lib.rs", "kind": "file", "size": 0 },
+                    ],
+                },
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_module_file_beside_its_directory_does_not_split_the_subtree() {
+        let tmp = TestDir::new();
+        // The `mod.rs`-free layout this project itself uses: `filesystem/` and
+        // `filesystem.rs` are siblings. In plain byte order `.` sorts below
+        // `/`, which wedges `filesystem.rs` into the middle of the subtree.
+        fs::create_dir_all(tmp.path().join("filesystem")).expect("directory should be created");
+        fs::write(tmp.path().join("filesystem.rs"), "").expect("file should be written");
+        fs::write(tmp.path().join("filesystem/ls.rs"), "").expect("file should be written");
+        fs::write(tmp.path().join("filesystem/glob.rs"), "").expect("file should be written");
+        let tool = Ls::new(tmp.workspace().await);
+
+        let output = call(tool, serde_json::json!({ "depth": 2 })).await;
+
+        let data = output.data.expect("data present");
+        let top = data["entries"].as_array().expect("entries is an array");
+        // Both files belong to the directory, not to the level above it.
+        assert_eq!(top.len(), 2);
+        assert_eq!(top[0]["path"], "filesystem");
+        assert_eq!(
+            paths_in(&top[0]["children"]),
+            ["filesystem/glob.rs", "filesystem/ls.rs"]
+        );
+        assert_eq!(top[1]["path"], "filesystem.rs");
+    }
+
+    #[tokio::test]
+    async fn a_sibling_with_a_shared_prefix_does_not_nest() {
+        let tmp = TestDir::new();
+        fs::create_dir_all(tmp.path().join("src")).expect("directory should be created");
+        fs::create_dir_all(tmp.path().join("src2")).expect("directory should be created");
+        fs::write(tmp.path().join("src/a.rs"), "").expect("file should be written");
+        fs::write(tmp.path().join("src2/b.rs"), "").expect("file should be written");
+        let tool = Ls::new(tmp.workspace().await);
+
+        let output = call(tool, serde_json::json!({ "depth": 2 })).await;
+
+        // `src2` starts with `src` but is not inside it; nesting has to compare
+        // whole path segments, not a string prefix.
+        let entries = output.data.expect("data present");
+        let top = entries["entries"].as_array().expect("entries is an array");
+        assert_eq!(top.len(), 2);
+        assert_eq!(top[0]["path"], "src");
+        assert_eq!(top[0]["children"][0]["path"], "src/a.rs");
+        assert_eq!(top[1]["path"], "src2");
+        assert_eq!(top[1]["children"][0]["path"], "src2/b.rs");
     }
 
     #[tokio::test]
@@ -602,12 +800,7 @@ mod tests {
 
         assert!(output.ok);
         let data = output.data.expect("data present");
-        let names = data["entries"]
-            .as_array()
-            .expect("entries is an array")
-            .iter()
-            .map(|entry| entry["path"].as_str().expect("path is a string"))
-            .collect::<Vec<_>>();
+        let names = paths_in(&data["entries"]);
         // Nested entries carry the same path `read_file` and `glob` would use,
         // and the sibling outside `src` is not reachable from this listing.
         assert_eq!(names, ["src/bin", "src/bin/main.rs"]);
@@ -645,12 +838,7 @@ mod tests {
 
         assert!(output.ok);
         let data = output.data.expect("data present");
-        let names = data["entries"]
-            .as_array()
-            .expect("entries is an array")
-            .iter()
-            .map(|entry| entry["path"].as_str().expect("path is a string"))
-            .collect::<Vec<_>>();
+        let names = paths_in(&data["entries"]);
         assert_eq!(names, [".gitignore", "build", "keep.rs"]);
     }
 
@@ -730,12 +918,7 @@ mod tests {
         .await;
 
         let data = escaped.data.expect("data present");
-        let names = data["entries"]
-            .as_array()
-            .expect("entries is an array")
-            .iter()
-            .map(|entry| entry["path"].as_str().expect("path is a string"))
-            .collect::<Vec<_>>();
+        let names = paths_in(&data["entries"]);
         assert_eq!(
             names,
             [
@@ -1036,12 +1219,7 @@ mod tests {
         let output = call(tool, serde_json::json!({ "depth": 64 })).await;
 
         let data = output.data.expect("data present");
-        let paths = data["entries"]
-            .as_array()
-            .expect("entries present")
-            .iter()
-            .map(|entry| entry["path"].as_str().unwrap_or_default().to_string())
-            .collect::<Vec<_>>();
+        let paths = paths_in(&data["entries"]);
         assert_eq!(paths, ["weird", "weird/name.rs", "weird\\name.rs"]);
     }
 
