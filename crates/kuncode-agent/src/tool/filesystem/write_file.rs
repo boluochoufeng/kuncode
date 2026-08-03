@@ -27,7 +27,9 @@ use crate::{
 pub struct WriteFileArgs {
     /// Workspace-relative or absolute file path to write.
     path: String,
-    /// UTF-8 content to write to the file.
+    /// Complete UTF-8 content of the file. This replaces the file wholesale,
+    /// so pass everything it should end up containing — never an abbreviation
+    /// like `// ... rest unchanged`, which would be written literally.
     content: String,
 }
 
@@ -60,7 +62,11 @@ impl WriteFile {
         Self {
             definition: definition_for::<WriteFileArgs>(
                 "write_file",
-                "Write a UTF-8 workspace file",
+                "Create a UTF-8 workspace file, or replace one entirely. An \
+                 existing file is truncated first, so whatever is not in \
+                 `content` is gone. To change part of a file, use edit_file \
+                 instead: it names only the text being replaced and so cannot \
+                 lose the rest.",
             ),
             workspace,
         }

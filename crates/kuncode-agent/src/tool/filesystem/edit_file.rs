@@ -30,9 +30,11 @@ use crate::{
 pub struct EditFileArgs {
     /// Workspace-relative or absolute path to an existing UTF-8 file.
     path: String,
-    /// Existing text to replace once.
+    /// Text to replace, which must appear in the file exactly once. Include
+    /// enough surrounding lines to make it unique — a snippet that occurs
+    /// twice is rejected rather than guessed at.
     old_text: String,
-    /// Replacement text.
+    /// Replacement text, written in place of `old_text` verbatim.
     new_text: String,
 }
 
@@ -67,7 +69,10 @@ impl EditFile {
         Self {
             definition: definition_for::<EditFileArgs>(
                 "edit_file",
-                "Replace text once in a UTF-8 workspace file",
+                "Replace one exact occurrence of `old_text` in a UTF-8 \
+                 workspace file, leaving the rest untouched. Preferred over \
+                 write_file for changing a file that already exists, since it \
+                 names only what changes.",
             ),
             workspace,
         }

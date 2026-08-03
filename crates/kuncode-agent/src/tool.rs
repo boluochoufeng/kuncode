@@ -429,6 +429,11 @@ pub(crate) async fn execute_for_test<T: Tool>(
 /// Build a [`ToolDefinition`] whose argument schema is generated from `A` via
 /// `schemars`, keeping the advertised schema in lockstep with the type the
 /// tool actually deserializes.
+///
+/// Argument doc comments serve two readers at once: `cargo doc` renders them
+/// for a Rust developer, and the model receives the same text as its only
+/// instructions. Everything below reconciles the two, so a doc comment can stay
+/// idiomatic Rust without shipping rustdoc artifacts to the model.
 pub fn definition_for<A: JsonSchema>(
     name: impl Into<String>,
     description: impl Into<String>,
@@ -440,11 +445,160 @@ pub fn definition_for<A: JsonSchema>(
     if let Some(obj) = parameters.as_object_mut() {
         obj.remove("$schema");
         obj.remove("title");
+        // The argument struct's own doc ("Arguments accepted by ...") restates
+        // what the caller already knows from the tool it invoked. The tool's
+        // `description` is what carries this role.
+        obj.remove("description");
     }
+    strip_doc_link_markup(&mut parameters);
 
     ToolDefinition {
         name: name.into(),
         description: description.into(),
         parameters,
+    }
+}
+
+/// Rewrites rustdoc intra-doc links in every `description` the schema carries.
+fn strip_doc_link_markup(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map.iter_mut() {
+                match child.as_str() {
+                    Some(text) if key == "description" => {
+                        *child = serde_json::Value::String(strip_doc_links(text));
+                    }
+                    _ => strip_doc_link_markup(child),
+                }
+            }
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(strip_doc_link_markup),
+        _ => {}
+    }
+}
+
+/// Removes rustdoc link markup, keeping the link text.
+///
+/// `` [`NonEmptyVec`] `` becomes `` `NonEmptyVec` `` and `[text](Self::field)`
+/// becomes `text`: rustdoc renders these as hyperlinks, but the model sees the
+/// raw brackets and a Rust path that names nothing it can reach.
+///
+/// Two things are deliberately left alone. A link to a real URL renders the
+/// same for both readers, so it stays whole. And a bare `[...]` is only
+/// unwrapped when the text inside is code-quoted — otherwise ordinary prose
+/// like "an array [1, 2]" would lose its brackets.
+fn strip_doc_links(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
+
+    // Bracket and parenthesis are ASCII, and no byte of a multi-byte UTF-8
+    // sequence is, so scanning by byte cannot split a character.
+    while let Some(offset) = bytes[cursor..].iter().position(|&byte| byte == b'[') {
+        let open = cursor + offset;
+        let Some(offset) = bytes[open + 1..].iter().position(|&byte| byte == b']') else {
+            break;
+        };
+        let close = open + 1 + offset;
+        let label = &text[open + 1..close];
+        out.push_str(&text[cursor..open]);
+
+        let after = close + 1;
+        let target_end = if bytes.get(after) == Some(&b'(') {
+            bytes[after + 1..]
+                .iter()
+                .position(|&byte| byte == b')')
+                .map(|offset| after + 1 + offset)
+        } else {
+            None
+        };
+
+        match target_end {
+            Some(end) if text[after + 1..end].starts_with("http") => {
+                out.push_str(&text[open..=end]);
+                cursor = end + 1;
+            }
+            Some(end) => {
+                out.push_str(label);
+                cursor = end + 1;
+            }
+            None => {
+                if is_code_quoted(label) {
+                    out.push_str(label);
+                } else {
+                    out.push_str(&text[open..=close]);
+                }
+                cursor = close + 1;
+            }
+        }
+    }
+
+    out.push_str(&text[cursor..]);
+    out
+}
+
+fn is_code_quoted(label: &str) -> bool {
+    label.len() > 2 && label.starts_with('`') && label.ends_with('`')
+}
+
+#[cfg(test)]
+mod definition_tests {
+    use schemars::JsonSchema;
+
+    use super::{definition_for, strip_doc_links};
+
+    #[test]
+    fn rustdoc_links_lose_their_markup_but_keep_their_text() {
+        assert_eq!(
+            strip_doc_links("Arguments accepted by the [`Bash`] tool."),
+            "Arguments accepted by the `Bash` tool."
+        );
+        assert_eq!(
+            strip_doc_links("shown while [`InProgress`](TodoStatus::InProgress)"),
+            "shown while `InProgress`"
+        );
+        assert_eq!(
+            strip_doc_links("see [the docs](Self::build)"),
+            "see the docs"
+        );
+    }
+
+    #[test]
+    fn prose_and_real_links_are_left_alone() {
+        // A URL renders as a link for both readers, so there is nothing to fix.
+        assert_eq!(
+            strip_doc_links("see [the spec](https://example.com/spec)"),
+            "see [the spec](https://example.com/spec)"
+        );
+        // Brackets around ordinary prose are not link markup.
+        assert_eq!(
+            strip_doc_links("an array [1, 2] here"),
+            "an array [1, 2] here"
+        );
+        // An unclosed bracket is text, not a truncated link.
+        assert_eq!(strip_doc_links("a [ b"), "a [ b");
+    }
+
+    /// Doc of the arguments struct, which the model has no use for.
+    #[derive(JsonSchema)]
+    #[allow(dead_code)]
+    struct Args {
+        /// Pass it to [`Args::other`], see [`crate::tool::Tool`].
+        field: String,
+        /// Second one.
+        other: u8,
+    }
+
+    #[test]
+    fn generated_schema_drops_struct_doc_and_link_markup() {
+        let definition = definition_for::<Args>("t", "a tool");
+        let parameters = &definition.parameters;
+
+        // The struct's own doc restates the tool the caller already chose.
+        assert!(parameters.get("description").is_none());
+        assert_eq!(
+            parameters["properties"]["field"]["description"],
+            serde_json::json!("Pass it to `Args::other`, see `crate::tool::Tool`.")
+        );
     }
 }

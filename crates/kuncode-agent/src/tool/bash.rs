@@ -25,7 +25,7 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 /// Arguments accepted by the [`Bash`] tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct BashArgs {
-    /// The shell command to run, e.g. `ls -la .`
+    /// The shell command to run, e.g. `cargo test --workspace`.
     cmd: String,
 }
 
@@ -47,7 +47,15 @@ pub struct Bash {
 impl Bash {
     pub fn new(workspace: Workspace) -> Self {
         Self {
-            definition: definition_for::<BashArgs>("bash", "Run a shell command"),
+            definition: definition_for::<BashArgs>(
+                "bash",
+                "Run a shell command in the workspace. Use it for commands that \
+                 do something — building, testing, version control, package \
+                 managers — rather than to inspect the workspace: read_file, \
+                 ls, glob, and grep answer those questions without an approval \
+                 prompt and without spilling unbounded output into the \
+                 conversation.",
+            ),
             workspace,
         }
     }

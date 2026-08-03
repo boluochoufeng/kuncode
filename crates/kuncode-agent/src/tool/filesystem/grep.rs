@@ -225,7 +225,9 @@ impl Grep {
                  Returns the paths of matching files by default; set \
                  output_mode to \"content\" for the matching lines themselves. \
                  Every reported path is usable as-is with read_file and edit_file. \
-                 Prefer this over running grep or rg through bash.",
+                 Use the `glob` argument to restrict which files are searched \
+                 rather than writing file names into the pattern, and prefer \
+                 this over running grep or rg through bash.",
             ),
             workspace,
         }

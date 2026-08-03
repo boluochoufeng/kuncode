@@ -518,7 +518,7 @@ mod tests {
 
         assert_eq!(
             snapshot,
-            r#"[{"name":"bash","description":"Run a shell command","parameters":{"description":"Arguments accepted by the [`Bash`] tool.","properties":{"cmd":{"description":"The shell command to run, e.g. `ls -la .`","type":"string"}},"required":["cmd"],"type":"object"}}]"#
+            r#"[{"name":"bash","description":"Run a shell command in the workspace. Use it for commands that do something — building, testing, version control, package managers — rather than to inspect the workspace: read_file, ls, glob, and grep answer those questions without an approval prompt and without spilling unbounded output into the conversation.","parameters":{"properties":{"cmd":{"description":"The shell command to run, e.g. `cargo test --workspace`.","type":"string"}},"required":["cmd"],"type":"object"}}]"#
         );
     }
 

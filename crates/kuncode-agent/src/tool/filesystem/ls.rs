@@ -40,10 +40,12 @@ pub struct LsArgs {
     /// root.
     #[serde(default)]
     path: Option<String>,
-    /// Walk nested directories instead of listing a single level. Defaults to
-    /// `false`.
+    /// How many directory levels to descend. `1` (the default) lists only the
+    /// directory's own entries; `2` also lists what its subdirectories hold,
+    /// and so on. Raise it to understand how a tree is organized — to find
+    /// files by name at any depth, use `glob` instead.
     #[serde(default)]
-    recursive: bool,
+    depth: Option<usize>,
     /// Also list entries hidden or excluded by `.gitignore`. The VCS store
     /// (`.git`) is never listed and cannot be listed directly. Defaults to
     /// `false`.
@@ -55,7 +57,7 @@ pub struct LsArgs {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LsEntryKind {
-    /// A directory. Descended into only when `recursive` is set.
+    /// A directory. Descended into only while `depth` allows.
     Directory,
     /// A regular file.
     File,
@@ -114,7 +116,7 @@ pub struct LsOutput {
 pub struct PreparedLs {
     path: PathBuf,
     display_path: String,
-    recursive: bool,
+    depth: usize,
     include_ignored: bool,
 }
 
@@ -134,9 +136,12 @@ impl Ls {
             // here or not at all.
             definition: definition_for::<LsArgs>(
                 "ls",
-                "List the entries of a workspace directory. \
-                 Each entry reports a workspace-relative path usable as-is with \
-                 read_file, edit_file, and glob.",
+                "List what a workspace directory contains, one level deep by \
+                 default and further with `depth`. Each entry reports a \
+                 workspace-relative path usable as-is with read_file and \
+                 edit_file. Use it to see how a tree is organized; use glob to \
+                 find files by name at any depth, and grep to search their \
+                 contents.",
             ),
             workspace,
         }
@@ -187,9 +192,16 @@ impl TypedTool for Ls {
                 "the resolved directory name is not valid UTF-8 and cannot be listed",
             ));
         };
+        let depth = args.depth.unwrap_or(1);
+        if depth == 0 {
+            return Err(ToolOutput::failure(
+                "invalid_arguments",
+                "`depth` must be at least 1; a depth of 0 would list nothing",
+            ));
+        }
         let canonical_input = CanonicalToolInput::new(serde_json::json!({
             "path": canonical_path.as_str(),
-            "recursive": args.recursive,
+            "depth": depth,
             "include_ignored": args.include_ignored,
         }));
         // The listed directory is the whole authorization surface: a rule
@@ -211,16 +223,12 @@ impl TypedTool for Ls {
             PreparedLs {
                 path: resolved,
                 display_path: display_path.clone(),
-                recursive: args.recursive,
+                depth,
                 include_ignored: args.include_ignored,
             },
             canonical_input,
             checks,
-            ToolDisplay::new(listing_summary(
-                &display_path,
-                args.recursive,
-                args.include_ignored,
-            )),
+            ToolDisplay::new(listing_summary(&display_path, depth, args.include_ignored)),
         ))
     }
 
@@ -228,7 +236,7 @@ impl TypedTool for Ls {
         let PreparedLs {
             path,
             display_path,
-            recursive,
+            depth,
             include_ignored,
         } = prepared;
 
@@ -266,13 +274,7 @@ impl TypedTool for Ls {
         let directory = path.clone();
         let visibility = ctx.visibility.clone();
         let listing = match tokio::task::spawn_blocking(move || {
-            walk_directory(
-                &workspace,
-                &directory,
-                recursive,
-                include_ignored,
-                &visibility,
-            )
+            walk_directory(&workspace, &directory, depth, include_ignored, &visibility)
         })
         .await
         {
@@ -322,8 +324,8 @@ impl TypedTool for Ls {
     }
 }
 
-/// Collects the entries under `directory`, one level deep unless `recursive`,
-/// returning the capped listing together with the total found.
+/// Collects the entries under `directory` down to `depth` levels, returning the
+/// capped listing together with the total found.
 ///
 /// The walk is rooted at `directory` rather than at the workspace root, so an
 /// explicit listing of a hidden or ignored directory (`ls target`) still
@@ -335,14 +337,14 @@ impl TypedTool for Ls {
 fn walk_directory(
     workspace: &Workspace,
     directory: &Path,
-    recursive: bool,
+    depth: usize,
     include_ignored: bool,
     visibility: &PathVisibility,
 ) -> Listing {
     let walked = walk_entries(
         workspace,
         directory,
-        (!recursive).then_some(1),
+        Some(depth),
         include_ignored,
         visibility,
         |entry| {
@@ -404,14 +406,14 @@ struct Listing {
 
 /// Builds the approval-facing summary.
 ///
-/// Both flags are named: the escape hatch is authorized through a separate
-/// `ExactTool` check, and an approver shown only "List directory: src" would be
-/// granting the ignore/hidden bypass — persistently, if they choose "always" —
-/// without ever seeing it.
-fn listing_summary(display_path: &str, recursive: bool, include_ignored: bool) -> String {
+/// Both the reach and the escape hatch are named: the latter is authorized
+/// through a separate `ExactTool` check, and an approver shown only "List
+/// directory: src" would be granting the ignore/hidden bypass — persistently,
+/// if they choose "always" — without ever seeing it.
+fn listing_summary(display_path: &str, depth: usize, include_ignored: bool) -> String {
     let mut summary = format!("List directory: {display_path}");
-    if recursive {
-        summary.push_str(" (recursive)");
+    if depth > 1 {
+        summary.push_str(&format!(" ({depth} levels deep)"));
     }
     if include_ignored {
         summary.push_str(" (including ignored and hidden entries)");
@@ -459,12 +461,7 @@ mod tests {
         let workspace = tmp.workspace().await;
         let ctx = denying(&workspace, "Read(secrets/**)");
 
-        let output = call_with(
-            Ls::new(workspace),
-            serde_json::json!({ "recursive": true }),
-            &ctx,
-        )
-        .await;
+        let output = call_with(Ls::new(workspace), serde_json::json!({ "depth": 64 }), &ctx).await;
 
         let data = output.data.expect("data present");
         let paths = data["entries"]
@@ -548,18 +545,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ls_recursive_returns_workspace_relative_paths() {
+    async fn depth_selects_how_far_the_listing_reaches() {
+        let tmp = TestDir::new();
+        fs::create_dir_all(tmp.path().join("a/b/c")).expect("directory should be created");
+        fs::write(tmp.path().join("a/one.rs"), "").expect("file should be written");
+        fs::write(tmp.path().join("a/b/two.rs"), "").expect("file should be written");
+        fs::write(tmp.path().join("a/b/c/three.rs"), "").expect("file should be written");
+        let tool = Ls::new(tmp.workspace().await);
+
+        let paths = |output: ToolOutput| {
+            output.data.expect("data present")["entries"]
+                .as_array()
+                .expect("entries is an array")
+                .iter()
+                .map(|entry| entry["path"].as_str().expect("path").to_string())
+                .collect::<Vec<_>>()
+        };
+
+        // The default reaches one level; each step adds exactly one more. This
+        // is the middle ground a boolean `recursive` could not express.
+        let default = call(tool.clone(), serde_json::json!({ "path": "a" })).await;
+        let two = call(tool.clone(), serde_json::json!({ "path": "a", "depth": 2 })).await;
+        let three = call(tool, serde_json::json!({ "path": "a", "depth": 3 })).await;
+
+        assert_eq!(paths(default), ["a/b", "a/one.rs"]);
+        assert_eq!(paths(two), ["a/b", "a/b/c", "a/b/two.rs", "a/one.rs"]);
+        assert_eq!(
+            paths(three),
+            ["a/b", "a/b/c", "a/b/c/three.rs", "a/b/two.rs", "a/one.rs"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_depth_of_zero_is_refused_rather_than_returning_nothing() {
+        let tmp = TestDir::new();
+        let tool = Ls::new(tmp.workspace().await);
+
+        let output = call(tool, serde_json::json!({ "depth": 0 })).await;
+
+        assert!(!output.ok);
+        assert_eq!(
+            output.error.expect("error present").kind.as_str(),
+            "invalid_arguments"
+        );
+    }
+
+    #[tokio::test]
+    async fn ls_at_depth_returns_workspace_relative_paths() {
         let tmp = TestDir::new();
         fs::create_dir_all(tmp.path().join("src/bin")).expect("directory should be created");
         fs::write(tmp.path().join("src/bin/main.rs"), "").expect("file should be written");
         fs::write(tmp.path().join("README.md"), "").expect("file should be written");
         let tool = Ls::new(tmp.workspace().await);
 
-        let output = call(
-            tool,
-            serde_json::json!({ "path": "src", "recursive": true }),
-        )
-        .await;
+        let output = call(tool, serde_json::json!({ "path": "src", "depth": 64 })).await;
 
         assert!(output.ok);
         let data = output.data.expect("data present");
@@ -671,7 +710,7 @@ mod tests {
 
         let output = call(
             Ls::new(workspace.clone()),
-            serde_json::json!({ "path": "src", "recursive": true }),
+            serde_json::json!({ "path": "src", "depth": 64 }),
         )
         .await;
 
@@ -686,7 +725,7 @@ mod tests {
 
         let escaped = call(
             Ls::new(workspace),
-            serde_json::json!({ "path": "src", "recursive": true, "include_ignored": true }),
+            serde_json::json!({ "path": "src", "depth": 64, "include_ignored": true }),
         )
         .await;
 
@@ -847,7 +886,7 @@ mod tests {
         let tmp = TestDir::new();
         let preparation = Tool::prepare(
             Arc::new(Ls::new(tmp.workspace().await)),
-            serde_json::json!({ "recursive": true, "include_ignored": true }),
+            serde_json::json!({ "depth": 64, "include_ignored": true }),
             &PreparationContext::new(),
         )
         .await
@@ -856,7 +895,7 @@ mod tests {
         // The summary is the only free text an approver sees; granting the
         // bypass must not look like an ordinary listing.
         let summary = preparation.display().summary();
-        assert!(summary.contains("recursive"), "summary was: {summary}");
+        assert!(summary.contains("64 levels deep"), "summary was: {summary}");
         assert!(
             summary.contains("ignored and hidden"),
             "summary was: {summary}"
@@ -969,7 +1008,7 @@ mod tests {
         // reach are filtered as they are produced.
         for args in [
             serde_json::json!({ "path": "secrets" }),
-            serde_json::json!({ "path": "secrets", "recursive": true }),
+            serde_json::json!({ "path": "secrets", "depth": 64 }),
         ] {
             assert_eq!(
                 authorized_path(workspace.clone(), args).await,
@@ -994,7 +1033,7 @@ mod tests {
         fs::write(tmp.path().join("weird/name.rs"), "").expect("file should be written");
         let tool = Ls::new(tmp.workspace().await);
 
-        let output = call(tool, serde_json::json!({ "recursive": true })).await;
+        let output = call(tool, serde_json::json!({ "depth": 64 })).await;
 
         let data = output.data.expect("data present");
         let paths = data["entries"]

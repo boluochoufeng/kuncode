@@ -72,7 +72,11 @@ impl Glob {
         Self {
             definition: definition_for::<GlobArgs>(
                 "glob",
-                "Find workspace paths matching a glob pattern",
+                "Find workspace files by name, using a glob pattern such as \
+                 `**/*.rs` or `src/**/mod.rs`. Returns paths sorted by name, \
+                 usable as-is with read_file and edit_file. Use grep to search \
+                 what is inside the files, ls to see how a directory is \
+                 organized, and prefer this over find through bash.",
             ),
             workspace,
         }
@@ -104,6 +108,19 @@ impl TypedTool for Glob {
         }
         validate_glob_pattern(pattern)
             .map_err(|message| ToolOutput::failure("invalid_arguments", message))?;
+        // Checked before `normalize_pattern`, which turns `\` into `/` and
+        // would erase the escape sequences this looks for.
+        if let Some(construct) = regex_construct(pattern) {
+            return Err(ToolOutput::failure(
+                "invalid_arguments",
+                format!(
+                    "`pattern` contains `{construct}`, which is regular-expression \
+                     syntax; this tool matches glob patterns, where only `*`, `?`, \
+                     and `**` are special. Use `**/*.rs` to match by name, or the \
+                     grep tool to search file contents.",
+                ),
+            ));
+        }
         let limit = args.limit.unwrap_or(DEFAULT_GLOB_LIMIT).min(MAX_GLOB_LIMIT);
         if limit == 0 {
             return Err(ToolOutput::failure(
@@ -223,6 +240,25 @@ fn anchor(pattern: &str) -> PathBuf {
     // that name rather than a directory the search stays inside.
     let directories = literal.min(segments.len().saturating_sub(1));
     segments[..directories].iter().collect()
+}
+
+/// Returns the regex-only construct a pattern contains, if any.
+///
+/// A regex handed to this tool would be matched literally and find nothing,
+/// which reads as "no such file" — the most expensive possible answer, since
+/// the caller concludes the file is absent and moves on. Naming the construct
+/// turns that silence into something the caller can act on.
+///
+/// The list is deliberately short: every entry is meaningless in a glob *and*
+/// vanishingly rare in a real file name, so a legitimate pattern is not
+/// rejected. `+`, `|`, and `[a-z]` are left out for the opposite reason —
+/// they do occur in file names.
+fn regex_construct(pattern: &str) -> Option<&'static str> {
+    const REGEX_ONLY: [&str; 9] = [r"\s", r"\w", r"\d", r"\S", r"\W", r"\D", r"\b", ".*", ".+"];
+    REGEX_ONLY
+        .into_iter()
+        .find(|construct| pattern.contains(construct))
+        .or_else(|| pattern.contains("(?").then_some("(?"))
 }
 
 fn validate_glob_pattern(pattern: &str) -> Result<(), String> {
@@ -562,6 +598,43 @@ mod tests {
         let data = output.data.expect("data present");
         assert_eq!(data["matches"], serde_json::json!([]));
         assert_eq!(data["unrepresentable_paths"], 1);
+    }
+
+    #[tokio::test]
+    async fn a_regex_is_refused_instead_of_matching_nothing() {
+        let tmp = TestDir::new();
+        fs::write(tmp.path().join("main.rs"), "").expect("file should be written");
+        let tool = Glob::new(tmp.workspace().await);
+
+        for pattern in [r"fn\s+\w+", ".*\\.rs", "(?i)main"] {
+            let output = call(tool.clone(), serde_json::json!({ "pattern": pattern })).await;
+
+            // Matched literally, each of these would find nothing — and an
+            // empty result reads as "no such file", which is the one answer
+            // that stops a caller from trying again.
+            assert!(!output.ok, "{pattern} should be refused");
+            let error = output.error.expect("error present");
+            assert_eq!(error.kind.as_str(), "invalid_arguments");
+            assert!(error.message.contains("grep"), "{}", error.message);
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_globs_are_not_mistaken_for_regexes() {
+        let tmp = TestDir::new();
+        fs::create_dir_all(tmp.path().join("src")).expect("directory should be created");
+        fs::write(tmp.path().join("src/a+b.rs"), "").expect("file should be written");
+        let tool = Glob::new(tmp.workspace().await);
+
+        // `+` is a regex quantifier but an ordinary character in a file name,
+        // so the refusal above must not reach it.
+        let output = call(tool, serde_json::json!({ "pattern": "src/*.rs" })).await;
+
+        assert!(output.ok);
+        assert_eq!(
+            output.data.expect("data present")["matches"],
+            serde_json::json!(["src/a+b.rs"])
+        );
     }
 
     #[tokio::test]

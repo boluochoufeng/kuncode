@@ -94,7 +94,13 @@ impl ReadFile {
     /// Creates a file reader bound to a workspace.
     pub fn new(workspace: Workspace) -> Self {
         Self {
-            definition: definition_for::<ReadFileArgs>("read_file", "Read a UTF-8 workspace file"),
+            definition: definition_for::<ReadFileArgs>(
+                "read_file",
+                "Read a UTF-8 workspace file as numbered lines. A file too long \
+                 for one reply is paginated rather than silently cut, so a \
+                 result reports how to read on. Use grep to find which file to \
+                 read, and prefer this over cat, head, or tail through bash.",
+            ),
             workspace,
         }
     }
