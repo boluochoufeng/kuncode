@@ -19,7 +19,9 @@ use std::{
 
 use async_trait::async_trait;
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
-use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContext, SinkMatch};
+use grep_searcher::{
+    BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContext, SinkContextKind, SinkMatch,
+};
 use kuncode_core::completion::ToolDefinition;
 use kuncode_core::non_empty_vec::NonEmptyVec;
 use schemars::JsonSchema;
@@ -46,11 +48,6 @@ use crate::{
 const DEFAULT_LIMIT: usize = 100;
 const MAX_LIMIT: usize = 1_000;
 const MAX_CONTEXT_LINES: usize = 5;
-
-/// Per-file ceiling on collected matches, so one dense file cannot spend the
-/// whole budget and leave the rest of the workspace unrepresented. The file's
-/// own `match_count` still reports the true total.
-const MAX_MATCHES_PER_FILE: usize = 50;
 
 /// Per-line ceiling. A matching line in a minified bundle or a base64 blob can
 /// be megabytes long, and `read_file` caps lines for the same reason — lower
@@ -112,6 +109,12 @@ pub struct GrepArgs {
     /// `files_with_matches` and `count`, matching lines for `content`.
     #[serde(default)]
     limit: Option<usize>,
+    /// How many results to skip before returning any, in the same unit as
+    /// `limit`. Defaults to `0`. Feed back the `next_offset` from a previous
+    /// result to continue where it left off; results are ordered by path, so
+    /// the same pattern paginates consistently.
+    #[serde(default)]
+    offset: Option<usize>,
     /// Also search files hidden or excluded by `.gitignore`. The VCS store
     /// (`.git`) is always skipped. Defaults to `false`.
     #[serde(default)]
@@ -144,8 +147,8 @@ pub struct GrepFile {
     /// search stops at the first hit and never learns the total.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub match_count: Option<usize>,
-    /// Matching lines, present only in `content` mode. Capped at
-    /// `MAX_MATCHES_PER_FILE` matches even when `match_count` is higher.
+    /// Matching lines, present only in `content` mode. Holds fewer than
+    /// `match_count` entries when `limit` runs out partway through the file.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub lines: Vec<GrepLine>,
 }
@@ -166,6 +169,11 @@ pub struct GrepOutput {
     /// never counts the rest.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_matches: Option<usize>,
+    /// Offset to pass back as `offset` to continue after the last result
+    /// returned here, in the same unit as `limit`. Present only when more
+    /// results remain.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_offset: Option<usize>,
     /// Files actually opened and searched. A surprisingly small number here
     /// usually means `glob` or `path` narrowed the search more than intended.
     pub searched_files: usize,
@@ -203,6 +211,7 @@ pub struct PreparedGrep {
     context_lines: usize,
     multiline: bool,
     limit: usize,
+    offset: usize,
     include_ignored: bool,
 }
 
@@ -226,8 +235,10 @@ impl Grep {
                  output_mode to \"content\" for the matching lines themselves. \
                  Every reported path is usable as-is with read_file and edit_file. \
                  Use the `glob` argument to restrict which files are searched \
-                 rather than writing file names into the pattern, and prefer \
-                 this over running grep or rg through bash.",
+                 rather than writing file names into the pattern. A result too \
+                 long for one reply reports a `next_offset` to pass back as \
+                 `offset` and read on. Prefer this over running grep or rg \
+                 through bash.",
             ),
             workspace,
         }
@@ -312,6 +323,7 @@ impl TypedTool for Grep {
             "context_lines": context_lines,
             "multiline": args.multiline,
             "limit": limit,
+            "offset": args.offset.unwrap_or(0),
             "include_ignored": args.include_ignored,
         }));
         // Same shape as `glob` and `ls`: the searched directory is the whole
@@ -342,6 +354,7 @@ impl TypedTool for Grep {
                 context_lines,
                 multiline: args.multiline,
                 limit,
+                offset: args.offset.unwrap_or(0),
                 include_ignored: args.include_ignored,
             },
             canonical_input,
@@ -486,10 +499,15 @@ fn search(
     candidates.sort_by(|left, right| left.relative.cmp(&right.relative));
 
     let mut searcher = build_searcher(prepared.mode, prepared.context_lines, prepared.multiline);
+    let by_line = matches!(prepared.mode, GrepOutputMode::Content);
     let mut files = Vec::new();
     let mut total_files = 0usize;
     let mut total_matches = 0usize;
     let mut collected_matches = 0usize;
+    let mut skipped_files = 0usize;
+    // Counted down across files, because `offset` is a position in the whole
+    // result sequence and one file rarely spans it exactly.
+    let mut pending_skip = if by_line { prepared.offset } else { 0 };
     let mut skipped_binary = 0usize;
     let mut unreadable_files = 0usize;
     let searched_files = candidates.len();
@@ -502,48 +520,80 @@ fn search(
             return ToolOutput::failure(ToolErrorKind::Cancelled, "search was cancelled");
         }
 
-        let room = prepared.limit.saturating_sub(collected_matches);
-        let collect = match prepared.mode {
-            GrepOutputMode::Content => room.min(MAX_MATCHES_PER_FILE),
-            GrepOutputMode::FilesWithMatches | GrepOutputMode::Count => 0,
+        // Only `content` mode collects lines; the other modes need the count
+        // alone, so they ask for none and let the searcher stop early.
+        let collect = if by_line {
+            prepared.limit.saturating_sub(collected_matches)
+        } else {
+            0
         };
-        let outcome = search_one(&mut searcher, &prepared, &candidate, collect);
+        let outcome = search_one(&mut searcher, &prepared, &candidate, pending_skip, collect);
 
-        match outcome {
-            Outcome::NoMatch => {}
-            Outcome::Binary => skipped_binary += 1,
-            Outcome::Unreadable => unreadable_files += 1,
-            Outcome::Matched { matches, lines } => {
-                total_files += 1;
-                total_matches += matches;
-                let within_cap = match prepared.mode {
-                    GrepOutputMode::Content => collected_matches < prepared.limit,
-                    GrepOutputMode::FilesWithMatches | GrepOutputMode::Count => {
-                        files.len() < prepared.limit
-                    }
-                };
-                if within_cap {
-                    collected_matches += matches.min(collect);
-                    files.push(GrepFile {
-                        path: candidate.relative,
-                        match_count: match prepared.mode {
-                            // First-match-and-stop never learns the real count,
-                            // and reporting the `1` it stopped at would read as
-                            // a file with exactly one match.
-                            GrepOutputMode::FilesWithMatches => None,
-                            GrepOutputMode::Content | GrepOutputMode::Count => Some(matches),
-                        },
-                        lines,
-                    });
-                }
+        let Outcome::Matched {
+            matches,
+            collected,
+            lines,
+        } = outcome
+        else {
+            match outcome {
+                Outcome::Binary => skipped_binary += 1,
+                Outcome::Unreadable => unreadable_files += 1,
+                Outcome::NoMatch | Outcome::Matched { .. } => {}
             }
+            continue;
+        };
+
+        total_files += 1;
+        total_matches += matches;
+
+        if by_line {
+            pending_skip = pending_skip.saturating_sub(matches);
+            // A file wholly consumed by the offset, or reached after the limit
+            // was already spent, contributes nothing to show.
+            if collected == 0 {
+                continue;
+            }
+            collected_matches += collected;
+        } else if skipped_files < prepared.offset {
+            skipped_files += 1;
+            continue;
+        } else if files.len() >= prepared.limit {
+            continue;
         }
+
+        files.push(GrepFile {
+            path: candidate.relative,
+            match_count: match prepared.mode {
+                // First-match-and-stop never learns the real count, and
+                // reporting the `1` it stopped at would read as a file with
+                // exactly one match.
+                GrepOutputMode::FilesWithMatches => None,
+                GrepOutputMode::Content | GrepOutputMode::Count => Some(matches),
+            },
+            lines,
+        });
     }
 
-    let truncated = match prepared.mode {
-        GrepOutputMode::Content => total_matches > collected_matches,
-        GrepOutputMode::FilesWithMatches | GrepOutputMode::Count => total_files > files.len(),
+    let (consumed, total) = if by_line {
+        (prepared.offset + collected_matches, total_matches)
+    } else {
+        (prepared.offset + files.len(), total_files)
     };
+    // An offset past the end would otherwise return an empty list, which reads
+    // as "the pattern matches nothing" — the one conclusion that stops a caller
+    // from simply asking again from a valid position.
+    if files.is_empty() && prepared.offset > 0 && total > 0 {
+        let unit = if by_line { "matches" } else { "matching files" };
+        return ToolOutput::failure(
+            "offset_past_end",
+            format!(
+                "`offset` {} is past the last of {total} {unit}; \
+                 search again from 0 or a smaller offset",
+                prepared.offset,
+            ),
+        );
+    }
+
     let output = ToolOutput::success(GrepOutput {
         pattern: prepared.pattern,
         mode: prepared.mode,
@@ -553,6 +603,7 @@ fn search(
             GrepOutputMode::FilesWithMatches => None,
             GrepOutputMode::Content | GrepOutputMode::Count => Some(total_matches),
         },
+        next_offset: (consumed < total).then_some(consumed),
         searched_files,
         skipped_binary,
         unreadable_files,
@@ -560,7 +611,7 @@ fn search(
         hidden_by_policy: hidden,
     });
 
-    if truncated {
+    if consumed < total {
         output.truncated()
     } else {
         output
@@ -625,18 +676,24 @@ fn build_searcher(mode: GrepOutputMode, context_lines: usize, multiline: bool) -
 enum Outcome {
     NoMatch,
     Matched {
+        /// Every match in the file, regardless of what was skipped or kept, so
+        /// the reported totals stay exact under pagination.
         matches: usize,
+        /// How many of them contributed lines.
+        collected: usize,
         lines: Vec<GrepLine>,
     },
     Binary,
     Unreadable,
 }
 
-/// Searches one candidate, collecting at most `collect` matches' worth of lines.
+/// Searches one candidate, skipping the first `skip` matches and then
+/// collecting at most `collect` matches' worth of lines.
 fn search_one(
     searcher: &mut Searcher,
     prepared: &PreparedGrep,
     candidate: &Candidate,
+    skip: usize,
     collect: usize,
 ) -> Outcome {
     let Ok(file) = open_no_follow(&candidate.path) else {
@@ -646,6 +703,8 @@ fn search_one(
     let mut collector = MatchCollector {
         lines: Vec::new(),
         matches: 0,
+        collected: 0,
+        skip,
         collect,
         stop_at_first: matches!(prepared.mode, GrepOutputMode::FilesWithMatches),
         binary: false,
@@ -668,6 +727,7 @@ fn search_one(
     }
     Outcome::Matched {
         matches: collector.matches,
+        collected: collector.collected,
         lines: collector.lines,
     }
 }
@@ -678,11 +738,26 @@ fn search_one(
 /// that helper discards context lines and this tool reports them.
 struct MatchCollector {
     lines: Vec<GrepLine>,
+    /// Matches seen so far, counted even while skipping so that the file's
+    /// reported total does not depend on the page being asked for.
     matches: usize,
-    /// How many matches may contribute lines; `0` counts without collecting.
+    collected: usize,
+    /// Matches to pass over before collecting anything, carried in from the
+    /// caller's remaining `offset`.
+    skip: usize,
+    /// How many matches past `skip` may contribute lines; `0` counts without
+    /// collecting.
     collect: usize,
     stop_at_first: bool,
     binary: bool,
+}
+
+impl MatchCollector {
+    /// Whether the `ordinal`-th match of this file lands on the page being
+    /// built, which is the window `(skip, skip + collect]`.
+    fn wants(&self, ordinal: usize) -> bool {
+        ordinal > self.skip && ordinal <= self.skip.saturating_add(self.collect)
+    }
 }
 
 impl Sink for MatchCollector {
@@ -693,7 +768,8 @@ impl Sink for MatchCollector {
         if self.stop_at_first {
             return Ok(false);
         }
-        if self.matches <= self.collect {
+        if self.wants(self.matches) {
+            self.collected += 1;
             // In multi-line mode one match can span several lines; the reported
             // number is the first line's, so the rest count up from it.
             let first = mat.line_number().unwrap_or(0);
@@ -706,7 +782,14 @@ impl Sink for MatchCollector {
     }
 
     fn context(&mut self, _searcher: &Searcher, ctx: &SinkContext<'_>) -> Result<bool, io::Error> {
-        if self.matches < self.collect {
+        // A context line is only worth keeping when the match it belongs to is
+        // on this page — otherwise a skipped match would still leak its
+        // surroundings into the results.
+        let ordinal = match ctx.kind() {
+            SinkContextKind::Before => self.matches + 1,
+            SinkContextKind::After | SinkContextKind::Other => self.matches,
+        };
+        if self.wants(ordinal) {
             self.lines
                 .push(grep_line(ctx.line_number().unwrap_or(0), ctx.bytes(), true));
         }
@@ -1000,6 +1083,180 @@ mod tests {
         );
         // The total is still exact, so the caller can tell how much it is missing.
         assert_eq!(data["total_matches"], 10);
+    }
+
+    #[tokio::test]
+    async fn content_pages_across_files_without_gaps_or_repeats() {
+        let tmp = TestDir::new();
+        // Two files, so a page boundary has to fall inside one of them.
+        fs::write(tmp.path().join("a.txt"), "x1\nx2\nx3\n").expect("file should be written");
+        fs::write(tmp.path().join("b.txt"), "x4\nx5\n").expect("file should be written");
+        let tool = Grep::new(tmp.workspace().await);
+
+        let mut seen = Vec::new();
+        let mut offset = Some(0);
+        while let Some(next) = offset {
+            let output = call(
+                tool.clone(),
+                serde_json::json!({
+                    "pattern": "^x", "output_mode": "content", "limit": 2, "offset": next,
+                }),
+            )
+            .await;
+            let data = output.data.expect("data present");
+            // The total is the whole search every time, not the page.
+            assert_eq!(data["total_matches"], 5);
+            for file in data["files"].as_array().expect("files is an array") {
+                for line in file["lines"].as_array().expect("lines is an array") {
+                    seen.push(line["text"].as_str().expect("text").to_string());
+                }
+            }
+            offset = data["next_offset"].as_u64().map(|value| value as usize);
+        }
+
+        // Paging reassembles the search exactly once through, in order.
+        assert_eq!(seen, ["x1", "x2", "x3", "x4", "x5"]);
+    }
+
+    #[tokio::test]
+    async fn a_dense_file_keeps_every_match_across_pages() {
+        let tmp = TestDir::new();
+        // More matches in one file than a page holds, so the file spans pages.
+        // Any per-file ceiling below `limit` would drop the matches between
+        // that ceiling and the page boundary: they are neither collected nor
+        // reachable from the next `offset`, which counts them as consumed.
+        let dense: String = (1..=10).map(|n| format!("x{n:02}\n")).collect();
+        fs::write(tmp.path().join("dense.txt"), dense).expect("file should be written");
+        fs::write(tmp.path().join("tail.txt"), "x11\nx12\n").expect("file should be written");
+        let tool = Grep::new(tmp.workspace().await);
+
+        let mut seen = Vec::new();
+        let mut offset = Some(0);
+        while let Some(next) = offset {
+            let output = call(
+                tool.clone(),
+                serde_json::json!({
+                    "pattern": "^x", "output_mode": "content", "limit": 4, "offset": next,
+                }),
+            )
+            .await;
+            let data = output.data.expect("data present");
+            for file in data["files"].as_array().expect("files is an array") {
+                for line in file["lines"].as_array().expect("lines is an array") {
+                    seen.push(line["text"].as_str().expect("text").to_string());
+                }
+            }
+            offset = data["next_offset"].as_u64().map(|value| value as usize);
+        }
+
+        assert_eq!(
+            seen,
+            [
+                "x01", "x02", "x03", "x04", "x05", "x06", "x07", "x08", "x09", "x10", "x11", "x12"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn files_mode_pages_by_file() {
+        let tmp = TestDir::new();
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            fs::write(tmp.path().join(name), "needle\n").expect("file should be written");
+        }
+        let tool = Grep::new(tmp.workspace().await);
+
+        let first = call(
+            tool.clone(),
+            serde_json::json!({ "pattern": "needle", "limit": 2 }),
+        )
+        .await;
+        let second = call(
+            tool,
+            serde_json::json!({ "pattern": "needle", "limit": 2, "offset": 2 }),
+        )
+        .await;
+
+        let first = first.data.expect("data present");
+        assert_eq!(
+            first["files"],
+            serde_json::json!([{ "path": "a.txt" }, { "path": "b.txt" }])
+        );
+        assert_eq!(first["next_offset"], 2);
+        let second = second.data.expect("data present");
+        assert_eq!(second["files"], serde_json::json!([{ "path": "c.txt" }]));
+        // The last page says so by leaving the offset out.
+        assert!(second.get("next_offset").is_none());
+    }
+
+    #[tokio::test]
+    async fn context_lines_do_not_leak_from_skipped_matches() {
+        let tmp = TestDir::new();
+        fs::write(
+            tmp.path().join("a.txt"),
+            "before1\nMATCH1\nafter1\nbefore2\nMATCH2\nafter2\n",
+        )
+        .expect("file should be written");
+        let tool = Grep::new(tmp.workspace().await);
+
+        let output = call(
+            tool,
+            serde_json::json!({
+                "pattern": "MATCH", "output_mode": "content",
+                "context_lines": 1, "offset": 1,
+            }),
+        )
+        .await;
+
+        // Only the second match is on this page, so only its neighbours come
+        // with it — the skipped match must not drag its context along.
+        assert_eq!(
+            output.data.expect("data present")["files"][0]["lines"],
+            serde_json::json!([
+                { "line_number": 4, "text": "before2", "context": true },
+                { "line_number": 5, "text": "MATCH2" },
+                { "line_number": 6, "text": "after2", "context": true },
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn an_offset_past_the_end_is_reported_rather_than_returned_empty() {
+        let tmp = TestDir::new();
+        fs::write(tmp.path().join("a.txt"), "needle\n").expect("file should be written");
+        let tool = Grep::new(tmp.workspace().await);
+
+        let output = call(
+            tool,
+            serde_json::json!({ "pattern": "needle", "offset": 10 }),
+        )
+        .await;
+
+        // An empty success here would read as "the pattern matches nothing",
+        // which is exactly the wrong conclusion to hand back.
+        assert!(!output.ok);
+        let error = output.error.expect("error present");
+        assert_eq!(error.kind.as_str(), "offset_past_end");
+        assert!(error.message.contains('1'), "{}", error.message);
+    }
+
+    #[tokio::test]
+    async fn an_offset_finds_nothing_when_the_pattern_itself_does_not_match() {
+        let tmp = TestDir::new();
+        fs::write(tmp.path().join("a.txt"), "needle\n").expect("file should be written");
+        let tool = Grep::new(tmp.workspace().await);
+
+        let output = call(
+            tool,
+            serde_json::json!({ "pattern": "absent", "offset": 10 }),
+        )
+        .await;
+
+        // Nothing matched at all, so "past the end" would be misleading: the
+        // honest answer is an empty result.
+        assert!(output.ok);
+        let data = output.data.expect("data present");
+        assert_eq!(data["files"], serde_json::json!([]));
+        assert_eq!(data["total_files"], 0);
     }
 
     #[tokio::test]
