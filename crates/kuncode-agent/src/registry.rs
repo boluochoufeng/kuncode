@@ -19,7 +19,7 @@ use crate::{
     tool::{
         Tool,
         bash::Bash,
-        filesystem::{EditFile, Glob, Ls, ReadFile, WriteFile},
+        filesystem::{EditFile, Glob, Grep, Ls, ReadFile, WriteFile},
         todo_write::TodoWrite,
         web_fetch::{WebFetch, WebFetchError},
     },
@@ -176,7 +176,7 @@ impl ToolRegistry {
         // tools: the definition list is a provider cache prefix, so a new tool
         // goes at the end instead of shifting the tools already there.
         self.register_with_profile(
-            Ls::new(workspace),
+            Ls::new(workspace.clone()),
             ToolPermissionProfile::new(
                 "ls",
                 [
@@ -188,7 +188,7 @@ impl ToolRegistry {
                 ],
                 true,
             )?
-            .constrain_paths_to(workspace_root)?,
+            .constrain_paths_to(workspace_root.clone())?,
         )?;
         // Reaching the network is the one built-in capability with no workspace
         // root to constrain it, so the origin is the only thing a rule can
@@ -203,6 +203,26 @@ impl ToolRegistry {
                 )],
                 false,
             )?,
+        )?;
+        // Same profile shape as the other walking tools, and appended for the
+        // same cache-prefix reason as `ls`. `grep` reads file *contents* rather
+        // than names, which raises the stakes of the Read namespace here but not
+        // its shape: the search is constrained to the workspace root, and the
+        // walk filters its own output against the effective policy.
+        self.register_with_profile(
+            Grep::new(workspace),
+            ToolPermissionProfile::new(
+                "grep",
+                [
+                    (PermissionNamespace::Read, ProfileDefault::Allow),
+                    (
+                        PermissionNamespace::ExactTool,
+                        ProfileDefault::RequireApproval,
+                    ),
+                ],
+                true,
+            )?
+            .constrain_paths_to(workspace_root)?,
         )?;
         Ok(())
     }
@@ -480,7 +500,8 @@ mod tests {
                 "glob",
                 "todo_write",
                 "ls",
-                "web_fetch"
+                "web_fetch",
+                "grep"
             ]
         );
     }

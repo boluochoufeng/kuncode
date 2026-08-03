@@ -25,6 +25,12 @@ reqwest = { version = "0.13.3", default-features = false }
 thiserror = "2.0.18"
 async-trait = "0.1.89"
 ignore = "0.4.23"
+# ripgrep's search core, as libraries. The `ripgrep` package itself publishes no
+# lib target, and the `grep` facade crate would additionally pull in
+# `grep-printer` (terminal rendering) and `grep-cli` (pager, tty probing) — both
+# useless to a tool that returns a structured payload rather than terminal text.
+grep-regex = "0.1.14"
+grep-searcher = "0.1.17"
 libc = "0.2.186"
 tracing = "0.1.44"
 tracing-appender = "0.2.5"
