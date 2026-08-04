@@ -22,6 +22,7 @@ use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::{
     BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContext, SinkContextKind, SinkMatch,
 };
+use ignore::types::{Types, TypesBuilder};
 use kuncode_core::completion::ToolDefinition;
 use kuncode_core::non_empty_vec::NonEmptyVec;
 use schemars::JsonSchema;
@@ -88,6 +89,12 @@ pub struct GrepArgs {
     /// uses.
     #[serde(default)]
     glob: Option<String>,
+    /// Restrict the search to one language, by ripgrep type name: `rust`, `py`,
+    /// `js`, `ts`, `go`, `java`, `md`. Prefer this over spelling extensions into
+    /// `glob`, since one language often has several (`py` also covers `.pyi`,
+    /// `ts` also covers `.tsx`). Combined with `glob`, a file must satisfy both.
+    #[serde(default)]
+    r#type: Option<String>,
     /// How much of each match to return. Defaults to `files_with_matches`,
     /// which is by far the cheapest; ask for `content` once the interesting
     /// files are known.
@@ -207,6 +214,7 @@ pub struct PreparedGrep {
     pattern: String,
     root: PathBuf,
     glob: Option<String>,
+    types: Option<Types>,
     mode: GrepOutputMode,
     context_lines: usize,
     multiline: bool,
@@ -234,8 +242,9 @@ impl Grep {
                  Returns the paths of matching files by default; set \
                  output_mode to \"content\" for the matching lines themselves. \
                  Every reported path is usable as-is with read_file and edit_file. \
-                 Use the `glob` argument to restrict which files are searched \
-                 rather than writing file names into the pattern. A result too \
+                 Use the `type` argument to search one language and the `glob` \
+                 argument to restrict which files are searched, rather than \
+                 writing file names into the pattern. A result too \
                  long for one reply reports a `next_offset` to pass back as \
                  `offset` and read on. Prefer this over running grep or rg \
                  through bash.",
@@ -297,6 +306,24 @@ impl TypedTool for Grep {
             None => None,
         };
 
+        let file_type = match args.r#type.as_deref().map(str::trim) {
+            Some("") => {
+                return Err(ToolOutput::failure(
+                    "invalid_arguments",
+                    "`type` must not be empty; omit it to search every file type",
+                ));
+            }
+            Some(name) => Some(name.to_string()),
+            None => None,
+        };
+        let types = match file_type.as_deref() {
+            Some(name) => Some(
+                build_types(name)
+                    .map_err(|message| ToolOutput::failure("invalid_arguments", message))?,
+            ),
+            None => None,
+        };
+
         let limit = args.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
         if limit == 0 {
             return Err(ToolOutput::failure(
@@ -318,6 +345,7 @@ impl TypedTool for Grep {
             "pattern": pattern,
             "path": canonical_path.as_str(),
             "glob": glob,
+            "type": file_type,
             "output_mode": args.output_mode,
             "case_insensitive": args.case_insensitive,
             "context_lines": context_lines,
@@ -342,6 +370,7 @@ impl TypedTool for Grep {
             pattern,
             &self.workspace.relative_display(&resolved),
             glob.as_deref(),
+            file_type.as_deref(),
             args.include_ignored,
         );
         Ok(TypedPreparation::new(
@@ -350,6 +379,7 @@ impl TypedTool for Grep {
                 pattern: pattern.to_string(),
                 root: resolved,
                 glob,
+                types,
                 mode: args.output_mode,
                 context_lines,
                 multiline: args.multiline,
@@ -454,11 +484,15 @@ fn search_summary(
     pattern: &str,
     directory: &str,
     glob: Option<&str>,
+    file_type: Option<&str>,
     include_ignored: bool,
 ) -> String {
     let mut summary = format!("Search file contents in `{directory}` for: {pattern}");
     if let Some(glob) = glob {
         summary.push_str(&format!(" (files matching {glob})"));
+    }
+    if let Some(file_type) = file_type {
+        summary.push_str(&format!(" ({file_type} files)"));
     }
     if include_ignored {
         summary.push_str(" (including ignored and hidden files)");
@@ -486,6 +520,7 @@ fn search(
         &prepared.root,
         prepared.include_ignored,
         prepared.glob.as_deref(),
+        prepared.types.as_ref(),
         visibility,
     );
     let Walked {
@@ -618,12 +653,61 @@ fn search(
     }
 }
 
+/// Builds a matcher for one ripgrep type name, e.g. `rust` or `py`.
+///
+/// An unknown name is an error rather than a filter that matches nothing: the
+/// empty result would read as "the pattern is not in this language", which is
+/// the one answer that stops a caller from retrying with a name that exists.
+fn build_types(name: &str) -> Result<Types, String> {
+    let mut builder = TypesBuilder::new();
+    builder.add_defaults();
+    builder.select(name);
+    builder.build().map_err(|_| {
+        let known = TypesBuilder::new().add_defaults().definitions();
+        // The full list is ~220 names, too long to be worth reading back. Two
+        // guesses cover how this is usually wrong. The common one is naming the
+        // extension instead of the type, which the type's own globs answer
+        // exactly: `rs` finds `rust`, `yml` finds `yaml`. Note that the
+        // extension is rarely a prefix of the name it belongs to, so this has
+        // to be tried before any prefix match, not after.
+        let extension = format!("*.{name}");
+        let mut near: Vec<&str> = known
+            .iter()
+            .filter(|def| def.globs().contains(&extension))
+            .map(|def| def.name())
+            .collect();
+        // Otherwise a longer spelling of a short name: `golang` for `go`,
+        // `shell` for `sh`. Both directions, since either side can be the input.
+        if near.is_empty() {
+            near = known
+                .iter()
+                .map(|def| def.name())
+                .filter(|known| {
+                    known.starts_with(name) || (known.len() > 1 && name.starts_with(known))
+                })
+                .collect();
+        }
+        near.truncate(8);
+        match near.as_slice() {
+            [] => format!(
+                "`{name}` is not a known file type; common ones are \
+                 rust, py, js, ts, go, java, c, cpp, md, json, yaml"
+            ),
+            near => format!(
+                "`{name}` is not a known file type; did you mean {}?",
+                near.join(", ")
+            ),
+        }
+    })
+}
+
 /// Walks the search root, keeping the regular files a search may open.
 fn collect_candidates(
     workspace: &Workspace,
     root: &Path,
     include_ignored: bool,
     glob: Option<&str>,
+    types: Option<&Types>,
     visibility: &PathVisibility,
 ) -> Walked<Candidate> {
     walk_entries(
@@ -643,6 +727,14 @@ fn collect_candidates(
             }
             if let Some(glob) = glob
                 && !glob_match(glob, &entry.relative)
+            {
+                return None;
+            }
+            // `Types` reports a non-match as `Ignore` once a type is selected,
+            // so this is the file failing the language filter rather than any
+            // ignore rule. Both filters have to pass: they narrow, never widen.
+            if let Some(types) = types
+                && types.matched(&entry.relative, false).is_ignore()
             {
                 return None;
             }
@@ -991,6 +1083,78 @@ mod tests {
         assert_eq!(data["files"], serde_json::json!([{ "path": "src/lib.rs" }]));
         // The `.md` file was never opened, which is what `glob` is for.
         assert_eq!(data["searched_files"], 1);
+    }
+
+    #[tokio::test]
+    async fn type_covers_every_extension_of_one_language() {
+        let tmp = TestDir::new();
+        // `.pyi` is the reason `type` earns its place beside `glob`: a caller
+        // reaching for Python would write `**/*.py` and silently miss the stub.
+        fs::write(tmp.path().join("app.py"), "needle\n").expect("file should be written");
+        fs::write(tmp.path().join("app.pyi"), "needle\n").expect("file should be written");
+        fs::write(tmp.path().join("app.rs"), "needle\n").expect("file should be written");
+        let tool = Grep::new(tmp.workspace().await);
+
+        let output = call(
+            tool,
+            serde_json::json!({ "pattern": "needle", "type": "py" }),
+        )
+        .await;
+
+        let data = output.data.expect("data present");
+        assert_eq!(
+            data["files"],
+            serde_json::json!([{ "path": "app.py" }, { "path": "app.pyi" }])
+        );
+        assert_eq!(data["searched_files"], 2);
+    }
+
+    #[tokio::test]
+    async fn type_and_glob_both_have_to_pass() {
+        let tmp = TestDir::new();
+        fs::create_dir_all(tmp.path().join("src")).expect("directory should be created");
+        fs::write(tmp.path().join("src/lib.rs"), "needle\n").expect("file should be written");
+        fs::write(tmp.path().join("build.rs"), "needle\n").expect("file should be written");
+        fs::write(tmp.path().join("src/notes.md"), "needle\n").expect("file should be written");
+        let tool = Grep::new(tmp.workspace().await);
+
+        let output = call(
+            tool,
+            serde_json::json!({ "pattern": "needle", "type": "rust", "glob": "src/**" }),
+        )
+        .await;
+
+        // Each filter narrows; neither widens what the other let through.
+        let data = output.data.expect("data present");
+        assert_eq!(data["files"], serde_json::json!([{ "path": "src/lib.rs" }]));
+    }
+
+    #[tokio::test]
+    async fn an_unknown_type_names_the_one_ripgrep_uses() {
+        let tmp = TestDir::new();
+        fs::write(tmp.path().join("lib.rs"), "needle\n").expect("file should be written");
+        let tool = Grep::new(tmp.workspace().await);
+
+        // `rs` is the extension, not the type name; `golang` is a longer
+        // spelling of one. Each reaches the real name by a different route.
+        for (wrong, real) in [("rs", "rust"), ("golang", "go")] {
+            let output = call(
+                tool.clone(),
+                serde_json::json!({ "pattern": "needle", "type": wrong }),
+            )
+            .await;
+
+            let error = output.error.expect("error present");
+            assert_eq!(error.kind.as_str(), "invalid_arguments");
+            assert!(
+                error.message.contains(real),
+                "`{wrong}` should point at `{real}`, got: {}",
+                error.message
+            );
+            // Reporting it as an argument error is the point: an empty result
+            // would read as the pattern being absent from the language.
+            assert!(output.data.is_none());
+        }
     }
 
     #[tokio::test]
