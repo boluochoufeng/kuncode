@@ -265,13 +265,16 @@ impl TypedTool for ReadFile {
         let next_line = has_more.then_some(start_line + returned_lines);
         let truncated = !truncated_lines.is_empty();
 
-        // Only a read that returned the file whole licenses a later whole-file
-        // write. A page of it, or a line whose tail was dropped, leaves content
-        // the caller has not seen and would overwrite unknowingly.
+        // Only reads that together covered the whole file license a later
+        // whole-file write. Pages accumulate, so paginating through a long file
+        // eventually qualifies — a single page of it never does.
         ctx.reads.record_read(
             &resolved,
             modified,
-            start_line == 1 && !has_more && !truncated,
+            start_line,
+            returned_lines,
+            has_more,
+            truncated,
         );
 
         let output = ToolOutput::success(ReadFileOutput {
