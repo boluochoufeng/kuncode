@@ -38,7 +38,9 @@ where
         let mut feedback = Vec::new();
 
         for index in 0..tool_calls.len() {
-            let ctx = ToolContext::with_cancel(cancel.clone()).with_todos(session.todo_handle());
+            let ctx = ToolContext::with_cancel(cancel.clone())
+                .with_todos(session.todo_handle())
+                .with_reads(session.read_ledger());
             let id = tool_calls[index].id.clone();
             let call_id = tool_calls[index].call_id.clone();
             let name = tool_calls[index].name.clone();

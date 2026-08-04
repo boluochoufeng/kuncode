@@ -169,7 +169,7 @@ impl TypedTool for ReadFile {
     async fn run_prepared(
         &self,
         prepared: PreparedReadFile,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
     ) -> ToolOutput<ReadFileOutput> {
         let PreparedReadFile {
             args,
@@ -180,6 +180,13 @@ impl TypedTool for ReadFile {
             Ok(file) => file,
             Err(err) => return open_error("read", &resolved, err, &self.workspace),
         };
+        // Taken before the contents, so a write landing mid-read leaves a newer
+        // timestamp than the one recorded and is caught as a change later.
+        let modified = file
+            .metadata()
+            .await
+            .ok()
+            .and_then(|metadata| metadata.modified().ok());
         let mut lines = BufReader::new(file).lines();
 
         // Skip the lines before `start_line` without keeping them. Cost is
@@ -257,6 +264,15 @@ impl TypedTool for ReadFile {
         let returned_lines = collected.len();
         let next_line = has_more.then_some(start_line + returned_lines);
         let truncated = !truncated_lines.is_empty();
+
+        // Only a read that returned the file whole licenses a later whole-file
+        // write. A page of it, or a line whose tail was dropped, leaves content
+        // the caller has not seen and would overwrite unknowingly.
+        ctx.reads.record_read(
+            &resolved,
+            modified,
+            start_line == 1 && !has_more && !truncated,
+        );
 
         let output = ToolOutput::success(ReadFileOutput {
             path: self.workspace.relative_display(&resolved),

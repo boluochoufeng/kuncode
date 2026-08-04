@@ -11,7 +11,7 @@ use crate::compaction::summary::ContinuitySummary;
 use crate::permission::{PermissionMode, SessionPolicyOverlay};
 use crate::session_store::{Seq, SessionId};
 use crate::todo::{TodoHandle, TodoItem};
-use crate::tool::ToolResultRetention;
+use crate::tool::{ReadLedger, ToolResultRetention};
 
 mod compaction;
 mod lineage;
@@ -49,6 +49,10 @@ pub struct AgentSession {
     /// state. The runner clones this handle into each
     /// [`ToolContext`](crate::tool::ToolContext) so `todo_write` writes here.
     todos: TodoHandle,
+    /// Files read during this session. The runner clones this handle into each
+    /// [`ToolContext`](crate::tool::ToolContext) so `write_file` can tell a
+    /// considered replacement from a blind one.
+    reads: ReadLedger,
     session_id: Option<SessionId>,
     last_durable_seq: Option<Seq>,
     persistence_error: Option<String>,
@@ -74,6 +78,7 @@ impl Clone for AgentSession {
             permissions: self.permissions.clone(),
             seq: AtomicU64::new(self.seq.load(Ordering::Relaxed)),
             todos: self.todos.deep_clone(),
+            reads: self.reads.deep_clone(),
             session_id: None,
             last_durable_seq: None,
             persistence_error: None,
@@ -127,6 +132,13 @@ impl AgentSession {
     /// `todo_write` call writes back to this session.
     pub fn todo_handle(&self) -> TodoHandle {
         self.todos.clone()
+    }
+
+    /// A handle to this session's reading history, for the runner to clone into
+    /// each [`ToolContext`](crate::tool::ToolContext). Shares the same records,
+    /// so a `read_file` in one call is visible to a `write_file` in the next.
+    pub fn read_ledger(&self) -> ReadLedger {
+        self.reads.clone()
     }
 
     /// The plan's write counter, for the runner to detect a change across a tool
@@ -258,6 +270,46 @@ impl AgentSession {
 mod tests {
     use super::*;
     use crate::session_store::CommittedCompaction;
+
+    #[test]
+    fn the_read_ledger_handle_writes_back_to_the_session() {
+        let session = AgentSession::new();
+        let path = std::path::Path::new("/a");
+
+        session.read_ledger().record_write(path, None);
+
+        // The runner hands this handle to every tool call in the session, so a
+        // read in one call has to be visible to a write in the next.
+        assert_eq!(
+            session.read_ledger().state(path, None),
+            crate::tool::ReadState::Current
+        );
+    }
+
+    #[test]
+    fn a_cloned_session_does_not_inherit_the_right_to_overwrite() {
+        let session = AgentSession::new();
+        let path = std::path::Path::new("/a");
+        session.read_ledger().record_write(path, None);
+
+        let clone = session.clone();
+        clone
+            .read_ledger()
+            .record_write(std::path::Path::new("/b"), None);
+
+        // A clone is a separate timeline: it starts with what was read so far,
+        // and what it reads afterwards must not license writes in the original.
+        assert_eq!(
+            clone.read_ledger().state(path, None),
+            crate::tool::ReadState::Current
+        );
+        assert_eq!(
+            session
+                .read_ledger()
+                .state(std::path::Path::new("/b"), None),
+            crate::tool::ReadState::Never
+        );
+    }
 
     #[test]
     fn push_user_routes_through_push() {

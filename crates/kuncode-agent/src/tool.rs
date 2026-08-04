@@ -20,8 +20,10 @@ pub mod todo_write;
 pub mod web_fetch;
 
 mod output;
+mod read_ledger;
 
 pub use output::{ToolError, ToolErrorKind, ToolErrorPayload, ToolOutput, ToolResultRetention};
+pub use read_ledger::{ReadLedger, ReadState};
 
 /// Stable, capability-free context available while preparing a call.
 #[derive(Clone, Debug, Default)]
@@ -207,6 +209,11 @@ pub struct ToolContext {
     ///
     /// [`AuthorizationEngine::execute`]: crate::permission::AuthorizationEngine::execute
     pub visibility: PathVisibility,
+    /// Files this session has read, consulted by `write_file` before it
+    /// truncates one. Like [`todos`](Self::todos), the runner clones in the
+    /// session's handle; the default is standalone, so a tool that ignores it
+    /// still gets a valid target.
+    pub reads: ReadLedger,
 }
 
 impl ToolContext {
@@ -228,6 +235,13 @@ impl ToolContext {
     /// plan rather than the standalone default.
     pub fn with_todos(mut self, todos: TodoHandle) -> Self {
         self.todos = todos;
+        self
+    }
+
+    /// Attaches the session's reading history, so `write_file` sees what
+    /// earlier calls in the same session read rather than a fresh empty ledger.
+    pub fn with_reads(mut self, reads: ReadLedger) -> Self {
+        self.reads = reads;
         self
     }
 
