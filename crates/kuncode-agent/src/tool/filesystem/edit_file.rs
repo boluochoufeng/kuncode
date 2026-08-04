@@ -1,6 +1,6 @@
 //! The `edit_file` tool: replace one unique occurrence of text in a file.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use kuncode_core::completion::ToolDefinition;
@@ -16,7 +16,8 @@ use super::helpers::{
 };
 use crate::{
     permission::{
-        CanonicalPath, CanonicalToolInput, PermissionCheckSpec, PermissionTarget, ToolDisplay,
+        CanonicalPath, CanonicalToolInput, ChangePreview, PermissionCheckSpec, PermissionTarget,
+        ToolDisplay,
     },
     tool::{
         PreparationContext, PreparedInvocationState, ToolContext, ToolError, ToolOutput,
@@ -117,6 +118,12 @@ impl TypedTool for EditFile {
             "old_text": args.old_text,
             "new_text": args.new_text,
         }));
+        // Applied here only to show it. The edit is redone against the file as
+        // it stands at execution, so what runs is never this copy — a preview
+        // that went stale in between misleads about the change, but cannot
+        // become the change.
+        let display = ToolDisplay::new(format!("Edit file: {display_path}"))
+            .with_preview(preview_replacement(&resolved, &args.old_text, &args.new_text).await);
         Ok(TypedPreparation::new(
             PreparedEditFile {
                 args,
@@ -126,7 +133,7 @@ impl TypedTool for EditFile {
             NonEmptyVec::new(PermissionCheckSpec::new(PermissionTarget::Edit(
                 canonical_path,
             ))),
-            ToolDisplay::new(format!("Edit file: {display_path}")),
+            display,
         ))
     }
 
@@ -190,6 +197,19 @@ impl TypedTool for EditFile {
     ) -> Result<PreparedInvocationState, ToolError> {
         revalidate_path(&self.workspace, &prepared.path).await
     }
+}
+
+/// Shows what replacing `old_text` with `new_text` would do to the file.
+///
+/// Returns nothing when the file cannot be read, is not UTF-8, or does not
+/// contain `old_text` exactly once — the same conditions [`EditFile`] refuses on
+/// at execution, reported there with a message rather than guessed at here.
+async fn preview_replacement(path: &Path, old_text: &str, new_text: &str) -> Option<ChangePreview> {
+    let content = String::from_utf8(tokio::fs::read(path).await.ok()?).ok()?;
+    if content.matches(old_text).count() != 1 {
+        return None;
+    }
+    ChangePreview::between(&content, &content.replacen(old_text, new_text, 1))
 }
 
 #[cfg(test)]

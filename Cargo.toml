@@ -31,6 +31,10 @@ ignore = "0.4.23"
 # useless to a tool that returns a structured payload rather than terminal text.
 grep-regex = "0.1.14"
 grep-searcher = "0.1.17"
+# Line diffing for change previews. `default-features = false` drops the
+# unicode segmentation tables, which only matter for intra-line highlighting —
+# a preview shown a whole line at a time never asks for them.
+similar = { version = "3.1.1", default-features = false, features = ["std", "text"] }
 libc = "0.2.186"
 tracing = "0.1.44"
 tracing-appender = "0.2.5"

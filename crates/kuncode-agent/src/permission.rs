@@ -9,6 +9,7 @@ pub mod check;
 pub mod contribution;
 pub mod engine;
 pub mod policy;
+pub mod preview;
 pub mod profile;
 pub mod receipt;
 pub mod request;
@@ -34,6 +35,7 @@ pub use engine::{
     ExecutionOutcome, PendingToolCall as PendingAuthorizationCall, RejectedToolCall,
 };
 pub use policy::{PathVisibility, PolicySet, PolicySetError, PolicySetRevision, WorkspaceTrust};
+pub use preview::{ChangePreview, PreviewLine, PreviewLineKind};
 pub use profile::{ToolPermissionProfile, ToolProfileError, ToolProfileRevision};
 pub use receipt::{
     ApprovalReceipt, AuthorizationContextRevision, AuthorizedToolCall, CheckResolutionReceipt,

@@ -16,7 +16,8 @@ use super::helpers::{
 };
 use crate::{
     permission::{
-        CanonicalPath, CanonicalToolInput, PermissionCheckSpec, PermissionTarget, ToolDisplay,
+        CanonicalPath, CanonicalToolInput, ChangePreview, PermissionCheckSpec, PermissionTarget,
+        ToolDisplay,
     },
     tool::{
         PreparationContext, PreparedInvocationState, ReadState, ToolContext, ToolError, ToolOutput,
@@ -108,6 +109,11 @@ impl TypedTool for WriteFile {
             "path": canonical_path.as_str(),
             "content": args.content,
         }));
+        // Built here, while approval is still ahead: what makes this write worth
+        // confirming is the part being dropped, and that is only visible against
+        // what is on disk now.
+        let display = ToolDisplay::new(format!("Write file: {display_path}"))
+            .with_preview(preview_against_disk(&resolved, &args.content).await);
         Ok(TypedPreparation::new(
             PreparedWriteFile {
                 args,
@@ -117,7 +123,7 @@ impl TypedTool for WriteFile {
             NonEmptyVec::new(PermissionCheckSpec::new(PermissionTarget::Edit(
                 canonical_path,
             ))),
-            ToolDisplay::new(format!("Write file: {display_path}")),
+            display,
         ))
     }
 
@@ -149,6 +155,19 @@ impl TypedTool for WriteFile {
     ) -> Result<PreparedInvocationState, ToolError> {
         revalidate_path(&self.workspace, &prepared.path).await
     }
+}
+
+/// Diffs what is on disk against what is about to replace it.
+///
+/// A missing or unreadable file previews as nothing rather than as an error:
+/// this runs before authorization, so it must not be able to turn a call the
+/// policy would have allowed into a failure. Non-UTF-8 contents fall in the same
+/// bucket — there is no line diff to show, and the write itself still reports
+/// what happened.
+async fn preview_against_disk(path: &Path, content: &str) -> Option<ChangePreview> {
+    let existing = tokio::fs::read(path).await.ok()?;
+    let existing = String::from_utf8(existing).ok()?;
+    ChangePreview::between(&existing, content)
 }
 
 /// The file's modification time, or `None` if it has none to report.

@@ -13,6 +13,7 @@ encoding_rs = { workspace = true }
 futures-util = { workspace = true }
 grep-regex = { workspace = true }
 grep-searcher = { workspace = true }
+similar = { workspace = true }
 html5ever = { workspace = true }
 ignore = { workspace = true }
 kuncode-core = { path = "../kuncode-core" }

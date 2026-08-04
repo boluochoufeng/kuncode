@@ -7,6 +7,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use super::check::{PermissionCheck, hex_digest};
+use super::preview::ChangePreview;
 use super::profile::ToolProfileRevision;
 const INPUT_FINGERPRINT_DOMAIN: &[u8] = b"kuncode.tool-input.v1\0";
 const REQUEST_FINGERPRINT_DOMAIN: &[u8] = b"kuncode.authorization-request.v1\0";
@@ -65,6 +66,11 @@ impl CanonicalToolInput {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ToolDisplay {
     summary: String,
+    /// Lines the tool proposes to change, when it has a file's contents to
+    /// show. Carried beside the summary rather than inside it because the
+    /// summary is collapsed to one line — see [`ChangePreview`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    preview: Option<ChangePreview>,
 }
 
 impl ToolDisplay {
@@ -82,12 +88,27 @@ impl ToolDisplay {
             .chars()
             .take(512)
             .collect();
-        Self { summary }
+        Self {
+            summary,
+            preview: None,
+        }
+    }
+
+    /// Attaches the change this call proposes, for an approver to show before
+    /// the call is allowed to make it.
+    pub fn with_preview(mut self, preview: Option<ChangePreview>) -> Self {
+        self.preview = preview;
+        self
     }
 
     /// Returns the safe display summary.
     pub fn summary(&self) -> &str {
         &self.summary
+    }
+
+    /// Returns the proposed change, when the tool supplied one.
+    pub fn preview(&self) -> Option<&ChangePreview> {
+        self.preview.as_ref()
     }
 }
 
