@@ -270,7 +270,11 @@ impl TypedTool for Grep {
         _canonical_input: CanonicalToolInput,
         _ctx: &PreparationContext,
     ) -> Result<TypedPreparation<Self::Prepared>, ToolOutput> {
-        let pattern = args.pattern.trim();
+        // Taken exactly as given: whitespace is part of regex syntax, so
+        // trimming would silently turn `fn ` into `fn` and answer a different
+        // question than the one asked. Only a genuinely empty string is
+        // refused — `   ` is a valid pattern that matches three spaces.
+        let pattern = args.pattern.as_str();
         if pattern.is_empty() {
             return Err(ToolOutput::failure(
                 "invalid_arguments",
@@ -1083,6 +1087,37 @@ mod tests {
         assert_eq!(data["files"], serde_json::json!([{ "path": "src/lib.rs" }]));
         // The `.md` file was never opened, which is what `glob` is for.
         assert_eq!(data["searched_files"], 1);
+    }
+
+    #[tokio::test]
+    async fn a_pattern_keeps_the_whitespace_it_was_given() {
+        let tmp = TestDir::new();
+        // `fn ` and `fn` are different searches: the second also matches
+        // `fnmatch`. Trimming the argument would answer the wrong question
+        // without saying so.
+        fs::write(tmp.path().join("lib.rs"), "fn alpha() {}\nfnmatch();\n")
+            .expect("file should be written");
+        let tool = Grep::new(tmp.workspace().await);
+
+        let output = call(
+            tool.clone(),
+            serde_json::json!({ "pattern": "fn ", "output_mode": "content" }),
+        )
+        .await;
+
+        let data = output.data.expect("data present");
+        assert_eq!(
+            data["files"][0]["lines"],
+            serde_json::json!([{ "line_number": 1, "text": "fn alpha() {}" }])
+        );
+
+        // Whitespace on its own is a valid pattern; only an empty string is not.
+        let output = call(tool, serde_json::json!({ "pattern": " " })).await;
+        assert_eq!(
+            output.data.expect("data present")["total_files"],
+            1,
+            "a space should match the line that contains one"
+        );
     }
 
     #[tokio::test]
