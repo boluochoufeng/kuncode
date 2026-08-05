@@ -47,7 +47,7 @@ pub struct PreviewLine {
     /// the old content for `Removed`.
     pub number: usize,
     /// The line, with control characters removed and the tail dropped past
-    /// [`MAX_LINE_CHARS`].
+    /// `MAX_LINE_CHARS`.
     pub text: String,
     /// `true` when the tail was dropped to fit.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -59,7 +59,7 @@ pub struct PreviewLine {
 pub struct ChangePreview {
     /// Changed lines with their surrounding context, in file order.
     pub lines: Vec<PreviewLine>,
-    /// Lines the preview left out to stay within [`MAX_PREVIEW_LINES`].
+    /// Lines the preview left out to stay within `MAX_PREVIEW_LINES`.
     #[serde(skip_serializing_if = "is_zero")]
     pub elided: usize,
     /// Total lines added by the change, including any not shown.
