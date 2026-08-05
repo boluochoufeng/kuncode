@@ -182,11 +182,21 @@ impl<'a> AuthorizationEngine<'a> {
         messages: &[Message],
         iteration: usize,
         cancel: &CancellationToken,
+        preparation: &PreparationContext,
     ) -> Result<AuthorizationOutcome, AuthorizationError> {
-        self.authorize_with_progress(pending, overlay, messages, iteration, cancel, |_| {})
-            .await
+        self.authorize_with_progress(
+            pending,
+            overlay,
+            messages,
+            iteration,
+            cancel,
+            preparation,
+            |_| {},
+        )
+        .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn authorize_with_progress<F>(
         &self,
         pending: PendingToolCall,
@@ -194,12 +204,13 @@ impl<'a> AuthorizationEngine<'a> {
         messages: &[Message],
         iteration: usize,
         cancel: &CancellationToken,
+        preparation: &PreparationContext,
         mut on_stable: F,
     ) -> Result<AuthorizationOutcome, AuthorizationError>
     where
         F: FnMut(&AuthorizationRequest),
     {
-        let mut prepared = match self.prepare(&pending, 0).await? {
+        let mut prepared = match self.prepare(&pending, 0, preparation).await? {
             PreparationResult::Ready(prepared) => prepared,
             PreparationResult::Rejected(output) => {
                 return Ok(AuthorizationOutcome::Rejected(
@@ -225,6 +236,7 @@ impl<'a> AuthorizationEngine<'a> {
                     messages,
                     iteration,
                     cancel,
+                    preparation,
                     &mut rewrites,
                 )
                 .await?
@@ -387,6 +399,7 @@ impl<'a> AuthorizationEngine<'a> {
                         .prepare(
                             &replacement_pending,
                             stabilized.prepared.request.generation().saturating_add(1),
+                            preparation,
                         )
                         .await?
                     {
@@ -572,6 +585,7 @@ impl<'a> AuthorizationEngine<'a> {
         &self,
         pending: &PendingToolCall,
         generation: u8,
+        preparation: &PreparationContext,
     ) -> Result<PreparationResult, AuthorizationError> {
         let Some(registered) = self.registry.registered(pending.tool_name()) else {
             tracing::warn!(
@@ -588,11 +602,8 @@ impl<'a> AuthorizationEngine<'a> {
         };
         let tool = registered.tool().clone();
         let profile = registered.profile().clone();
-        let preparation = match tool
-            .prepare(pending.raw_input().clone(), &PreparationContext::new())
-            .await
-        {
-            Ok(preparation) => preparation,
+        let prepared = match tool.prepare(pending.raw_input().clone(), preparation).await {
+            Ok(prepared) => prepared,
             Err(output) => {
                 tracing::info!(
                     target: "kuncode::authorization",
@@ -605,7 +616,7 @@ impl<'a> AuthorizationEngine<'a> {
                 return Ok(PreparationResult::Rejected(output));
             }
         };
-        let (canonical_input, invocation, specs, display) = preparation.into_parts();
+        let (canonical_input, invocation, specs, display) = prepared.into_parts();
         let checks = match profile.validate(specs.into_vec()) {
             Ok(checks) => checks,
             Err(error) => {
@@ -646,6 +657,7 @@ impl<'a> AuthorizationEngine<'a> {
         }))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn stabilize(
         &self,
         mut prepared: PreparedCall,
@@ -653,6 +665,7 @@ impl<'a> AuthorizationEngine<'a> {
         messages: &[Message],
         iteration: usize,
         cancel: &CancellationToken,
+        preparation: &PreparationContext,
         rewrites: &mut RewriteState,
     ) -> Result<StabilizationResult, AuthorizationError> {
         loop {
@@ -690,6 +703,7 @@ impl<'a> AuthorizationEngine<'a> {
                     .prepare(
                         &replacement_pending,
                         prepared.request.generation().saturating_add(1),
+                        preparation,
                     )
                     .await?
                 {
@@ -1334,6 +1348,7 @@ mod tests {
                 &[],
                 0,
                 &CancellationToken::new(),
+                &PreparationContext::new(),
             )
             .await
             .expect("authorization succeeds");
@@ -1374,6 +1389,7 @@ mod tests {
                 &[],
                 0,
                 &CancellationToken::new(),
+                &PreparationContext::new(),
             )
             .await
             .expect("authorization resolves");
@@ -1412,6 +1428,7 @@ mod tests {
                 &[],
                 0,
                 &CancellationToken::new(),
+                &PreparationContext::new(),
             )
             .await
             .expect("authorization resolves");
@@ -1445,6 +1462,7 @@ mod tests {
                 &[],
                 0,
                 &CancellationToken::new(),
+                &PreparationContext::new(),
             )
             .await
             .expect("authorization resolves");
@@ -1468,6 +1486,7 @@ mod tests {
                 &[],
                 0,
                 &CancellationToken::new(),
+                &PreparationContext::new(),
             )
             .await
             .expect("authorization resolves");
@@ -1500,6 +1519,7 @@ mod tests {
                 &[],
                 0,
                 &CancellationToken::new(),
+                &PreparationContext::new(),
             )
             .await
             .expect("authorization resolves");
@@ -1539,6 +1559,7 @@ mod tests {
                 &[],
                 0,
                 &CancellationToken::new(),
+                &PreparationContext::new(),
             )
             .await
             .expect("authorization resolves");
@@ -1581,6 +1602,7 @@ mod tests {
                 &[],
                 0,
                 &CancellationToken::new(),
+                &PreparationContext::new(),
             )
             .await
             .expect("authorization resolves");
@@ -1617,6 +1639,7 @@ mod tests {
                     &[],
                     0,
                     &CancellationToken::new(),
+                    &PreparationContext::new(),
                 )
                 .await
                 .expect("authorization resolves");
@@ -1653,6 +1676,7 @@ mod tests {
                 &[],
                 0,
                 &CancellationToken::new(),
+                &PreparationContext::new(),
             )
             .await
             .expect("authorization resolves");
@@ -1692,6 +1716,7 @@ mod tests {
                     &[],
                     0,
                     &CancellationToken::new(),
+                    &PreparationContext::new(),
                 )
                 .await
                 .expect("authorization resolves");
@@ -1748,6 +1773,7 @@ mod tests {
                     &[],
                     0,
                     &CancellationToken::new(),
+                    &PreparationContext::new(),
                 )
                 .await
                 .expect("authorization resolves");
@@ -1793,6 +1819,7 @@ mod tests {
                     &[],
                     0,
                     &CancellationToken::new(),
+                    &PreparationContext::new(),
                 )
                 .await
                 .expect("authorization resolves");
@@ -1826,6 +1853,7 @@ mod tests {
                 &[],
                 0,
                 &CancellationToken::new(),
+                &PreparationContext::new(),
             )
             .await
             .expect("authorization resolves");
@@ -1851,6 +1879,7 @@ mod tests {
                 &[],
                 0,
                 &CancellationToken::new(),
+                &PreparationContext::new(),
             )
             .await
             .expect("authorization resolves");
@@ -1877,6 +1906,7 @@ mod tests {
                 &[],
                 0,
                 &CancellationToken::new(),
+                &PreparationContext::new(),
             )
             .await
             .expect("authorization resolves");
@@ -1918,6 +1948,7 @@ mod tests {
                 &[],
                 0,
                 &CancellationToken::new(),
+                &PreparationContext::new(),
             )
             .await
             .expect("authorization resolves");
@@ -1958,6 +1989,7 @@ mod tests {
                 &[],
                 0,
                 &CancellationToken::new(),
+                &PreparationContext::new(),
             )
             .await
             .expect("authorization resolves");
@@ -1975,7 +2007,14 @@ mod tests {
             panic!("changed path must invalidate authorization");
         };
         let retried = engine
-            .authorize(stale, overlay, &[], 0, &CancellationToken::new())
+            .authorize(
+                stale,
+                overlay,
+                &[],
+                0,
+                &CancellationToken::new(),
+                &PreparationContext::new(),
+            )
             .await
             .expect("retry resolves safely");
 

@@ -70,6 +70,7 @@ where
                     session.messages(),
                     iteration,
                     &context.cancel,
+                    &context.preparation(),
                     |request| {
                         if !start_emitted {
                             self.emit(

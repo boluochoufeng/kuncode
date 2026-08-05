@@ -25,14 +25,37 @@ mod read_ledger;
 pub use output::{ToolError, ToolErrorKind, ToolErrorPayload, ToolOutput, ToolResultRetention};
 pub use read_ledger::{ReadLedger, ReadState};
 
-/// Stable, capability-free context available while preparing a call.
+/// Stable context available while preparing a call, before it is authorized.
+///
+/// Preparation must stay side-effect-free — it runs before any check has
+/// passed, and its result is what hooks inspect and fingerprints cover — so
+/// what belongs here is read-only session knowledge a tool needs in order to
+/// describe or refuse a call, never a capability to act on one.
+///
+/// A refusal a tool can already reach at this point belongs at this point: the
+/// alternative is asking the user to approve a call that was never going to
+/// run.
 #[derive(Clone, Debug, Default)]
-pub struct PreparationContext;
+pub struct PreparationContext {
+    /// Files this session has read, so a tool that would destroy contents
+    /// nobody has seen can say so before the approval prompt rather than after
+    /// it. The same ledger reaches execution through
+    /// [`ToolContext::reads`], where the check runs again against the file as
+    /// it stands once approval is done.
+    pub reads: ReadLedger,
+}
 
 impl PreparationContext {
-    /// Creates an empty preparation context.
-    pub const fn new() -> Self {
-        Self
+    /// Creates a preparation context with a standalone ledger, which is what
+    /// tests and non-interactive callers want.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Attaches the session's reading history.
+    pub fn with_reads(mut self, reads: ReadLedger) -> Self {
+        self.reads = reads;
+        self
     }
 }
 
@@ -249,6 +272,16 @@ impl ToolContext {
         self.visibility = visibility;
         self
     }
+
+    /// The part of this context a tool may consult before its call is
+    /// authorized.
+    ///
+    /// Derived here rather than assembled by the caller so the two contexts
+    /// cannot drift: whatever the session hands to execution is what
+    /// preparation sees a read-only view of.
+    pub fn preparation(&self) -> PreparationContext {
+        PreparationContext::new().with_reads(self.reads.clone())
+    }
 }
 
 /// Object-safe tool interface used to register and dispatch tools.
@@ -425,7 +458,7 @@ pub(crate) async fn execute_for_test<T: Tool>(
     args: serde_json::Value,
     ctx: &ToolContext,
 ) -> Result<ToolOutput, ToolError> {
-    let preparation = match tool.prepare(args, &PreparationContext::new()).await {
+    let preparation = match tool.prepare(args, &ctx.preparation()).await {
         Ok(preparation) => preparation,
         Err(output) => return Ok(output),
     };

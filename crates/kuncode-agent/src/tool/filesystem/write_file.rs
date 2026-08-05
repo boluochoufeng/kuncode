@@ -17,8 +17,8 @@ use crate::{
         ToolDisplay,
     },
     tool::{
-        PreparationContext, PreparedInvocationState, ReadState, ToolContext, ToolError, ToolOutput,
-        TypedPreparation, TypedTool, definition_for,
+        PreparationContext, PreparedInvocationState, ReadLedger, ReadState, ToolContext, ToolError,
+        ToolOutput, TypedPreparation, TypedTool, definition_for,
     },
     workspace::Workspace,
 };
@@ -89,7 +89,7 @@ impl TypedTool for WriteFile {
         &self,
         mut args: WriteFileArgs,
         _canonical_input: CanonicalToolInput,
-        _ctx: &PreparationContext,
+        ctx: &PreparationContext,
     ) -> Result<TypedPreparation<Self::Prepared>, ToolOutput> {
         let path = non_empty_path(&args.path)?;
         let resolved = self
@@ -97,6 +97,13 @@ impl TypedTool for WriteFile {
             .resolve_target(path)
             .await
             .map_err(workspace_error)?;
+        // Asked and answered before authorization, so a call that cannot run
+        // never costs the user an approval decision — being prompted about a
+        // change that then fails anyway teaches them the prompt means nothing.
+        // Execution asks again: the file can change while the prompt is open.
+        if let Some(refusal) = refuse_blind_overwrite(&ctx.reads, &resolved).await {
+            return Err(refusal);
+        }
 
         let canonical_path = CanonicalPath::from_absolute(&resolved)
             .map_err(|error| ToolOutput::failure("invalid_arguments", error.to_string()))?;
@@ -130,9 +137,11 @@ impl TypedTool for WriteFile {
         ctx: &ToolContext,
     ) -> ToolOutput<WriteFileOutput> {
         let PreparedWriteFile { args, path } = prepared;
-        // Only an existing file has contents to lose. Creating one discards
-        // nothing, so nothing has to have been read first.
-        if let Some(refusal) = refuse_blind_overwrite(ctx, &path).await {
+        // Preparation already refused the calls it could see coming. This is
+        // the second half of that check, against the file as it stands now: the
+        // approval prompt was open for as long as the user took to answer it,
+        // and the guard is worth nothing if that window is a way through.
+        if let Some(refusal) = refuse_blind_overwrite(&ctx.reads, &path).await {
             return refusal;
         }
         if let Err(error) = write_no_follow(&path, args.content.as_bytes()).await {
@@ -177,7 +186,11 @@ async fn preview_against_disk(path: &Path, content: &str) -> Option<ChangePrevie
 /// the file and is choosing what to keep, and data loss when it is writing from
 /// memory or assumption — and the two are indistinguishable from the arguments
 /// alone, which is why the session's reading history decides it.
-async fn refuse_blind_overwrite<D>(ctx: &ToolContext, path: &Path) -> Option<ToolOutput<D>> {
+///
+/// Run once while preparing and once while executing, which is why it takes the
+/// ledger rather than either context: the first refusal spares the user a
+/// pointless approval, and the second covers what changed while they answered.
+async fn refuse_blind_overwrite<D>(reads: &ReadLedger, path: &Path) -> Option<ToolOutput<D>> {
     // No metadata means no file yet, and creating one loses nothing. Symlinks
     // are read without following, both to avoid stat-ing a target outside the
     // workspace and because `write_no_follow` refuses them anyway — with a far
@@ -186,7 +199,7 @@ async fn refuse_blind_overwrite<D>(ctx: &ToolContext, path: &Path) -> Option<Too
     if !metadata.is_file() {
         return None;
     }
-    match ctx.reads.state(path, metadata.modified().ok()) {
+    match reads.state(path, metadata.modified().ok()) {
         ReadState::Current => None,
         ReadState::Never => Some(ToolOutput::failure(
             "unread_file",
@@ -209,7 +222,7 @@ mod tests {
     use super::WriteFile;
     use crate::test_support::TestDir;
     use crate::tool::filesystem::{EditFile, ReadFile};
-    use crate::tool::{ToolContext, execute_for_test};
+    use crate::tool::{Tool, ToolContext, execute_for_test};
 
     /// Runs `write_file` against `ctx`, so a test can share one session's
     /// reading history across several calls.
@@ -388,6 +401,59 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&path).expect("file should be readable"),
             "edited by someone else\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_blind_overwrite_is_refused_before_anyone_is_asked_to_approve_it() {
+        let tmp = TestDir::new();
+        fs::write(tmp.path().join("a.txt"), "original").expect("file should be written");
+        let workspace = tmp.workspace().await;
+        let ctx = ToolContext::new();
+
+        // Preparation only — the stage that runs before the permission prompt.
+        // A call refused here never reaches the user, which is the point:
+        // approving a write that then fails anyway spends a decision on
+        // nothing and teaches that the prompt is not worth reading.
+        let prepared = Arc::new(WriteFile::new(workspace))
+            .prepare(
+                serde_json::json!({ "path": "a.txt", "content": "replacement" }),
+                &ctx.preparation(),
+            )
+            .await;
+
+        let output = prepared.err().expect("preparation should refuse");
+        assert_eq!(
+            output.error.expect("error present").kind.as_str(),
+            "unread_file"
+        );
+    }
+
+    #[tokio::test]
+    async fn preparation_sees_what_the_session_has_read() {
+        let tmp = TestDir::new();
+        fs::write(tmp.path().join("a.txt"), "original\n").expect("file should be written");
+        let workspace = tmp.workspace().await;
+        let ctx = ToolContext::new();
+
+        assert!(
+            read(&workspace, &ctx, serde_json::json!({ "path": "a.txt" }))
+                .await
+                .ok
+        );
+        // The reading history has to survive the trip from the session's
+        // execution context into the preparation one, or the guard would refuse
+        // every overwrite regardless of what was read.
+        let prepared = Arc::new(WriteFile::new(workspace))
+            .prepare(
+                serde_json::json!({ "path": "a.txt", "content": "replacement" }),
+                &ctx.preparation(),
+            )
+            .await;
+
+        assert!(
+            prepared.is_ok(),
+            "preparation refused a file this session read"
         );
     }
 
