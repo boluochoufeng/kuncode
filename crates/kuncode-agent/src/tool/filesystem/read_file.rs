@@ -20,7 +20,7 @@ use crate::{
         CanonicalPath, CanonicalToolInput, PermissionCheckSpec, PermissionTarget, ToolDisplay,
     },
     tool::{
-        PreparationContext, PreparedInvocationState, ToolContext, ToolError, ToolOutput,
+        FileStamp, PreparationContext, PreparedInvocationState, ToolContext, ToolError, ToolOutput,
         TypedPreparation, TypedTool, definition_for, output::truncate_utf8,
     },
     workspace::Workspace,
@@ -180,13 +180,14 @@ impl TypedTool for ReadFile {
             Ok(file) => file,
             Err(err) => return open_error("read", &resolved, err, &self.workspace),
         };
-        // Taken before the contents, so a write landing mid-read leaves a newer
-        // timestamp than the one recorded and is caught as a change later.
-        let modified = file
+        // Taken before the contents, so a write landing mid-read leaves the file
+        // no longer matching what was recorded and is caught as a change later.
+        let stamp = file
             .metadata()
             .await
-            .ok()
-            .and_then(|metadata| metadata.modified().ok());
+            .as_ref()
+            .map(FileStamp::from_metadata)
+            .unwrap_or_default();
         let mut lines = BufReader::new(file).lines();
 
         // Skip the lines before `start_line` without keeping them. Cost is
@@ -268,7 +269,7 @@ impl TypedTool for ReadFile {
         // Any read licenses a later whole-file write, including a single page
         // of a long file — see [`ReadLedger`](crate::tool::ReadLedger) for why
         // the bar is deliberately this low.
-        ctx.reads.record(&resolved, modified);
+        ctx.reads.record(&resolved, stamp);
 
         let output = ToolOutput::success(ReadFileOutput {
             path: self.workspace.relative_display(&resolved),

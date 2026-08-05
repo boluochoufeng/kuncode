@@ -23,7 +23,7 @@ mod output;
 mod read_ledger;
 
 pub use output::{ToolError, ToolErrorKind, ToolErrorPayload, ToolOutput, ToolResultRetention};
-pub use read_ledger::{ReadLedger, ReadState};
+pub use read_ledger::{FileStamp, ReadLedger, ReadState};
 
 /// Stable context available while preparing a call, before it is authorized.
 ///

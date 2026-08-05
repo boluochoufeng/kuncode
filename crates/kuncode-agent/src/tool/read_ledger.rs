@@ -17,6 +17,7 @@
 
 use std::{
     collections::HashMap,
+    fs::Metadata,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, PoisonError},
     time::SystemTime,
@@ -33,6 +34,44 @@ pub enum ReadState {
     Current,
 }
 
+/// How a file stood at the moment the session looked at it.
+///
+/// Two dimensions rather than one, because neither settles the question alone.
+/// A modification time can be coarser than the edit-format-edit cycle that
+/// rewrites a file twice within its resolution, and it can move *backwards*
+/// when a change restores an older timestamp — `rsync -t`, `cp -p`, and
+/// archives unpacked with times preserved all do that, so treating only a
+/// *newer* time as a change would miss them. A size, meanwhile, says nothing
+/// whenever an edit happens to preserve the byte count.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FileStamp {
+    modified: Option<SystemTime>,
+    size: Option<u64>,
+}
+
+impl FileStamp {
+    /// Takes both dimensions off filesystem metadata.
+    pub fn from_metadata(metadata: &Metadata) -> Self {
+        Self {
+            modified: metadata.modified().ok(),
+            size: Some(metadata.len()),
+        }
+    }
+
+    /// Whether these two stamps describe demonstrably different files.
+    ///
+    /// A dimension missing on either side abstains rather than voting either
+    /// way: a filesystem that reports no modification times cannot support that
+    /// half of the check, and neither refusing every write there nor allowing
+    /// every write there is something its absence actually argues for.
+    fn differs_from(&self, other: &Self) -> bool {
+        fn conflicts<T: PartialEq>(left: Option<T>, right: Option<T>) -> bool {
+            matches!((left, right), (Some(left), Some(right)) if left != right)
+        }
+        conflicts(self.modified, other.modified) || conflicts(self.size, other.size)
+    }
+}
+
 /// Shared record of the files a session has seen, and how each stood when it
 /// saw them.
 ///
@@ -43,56 +82,53 @@ pub enum ReadState {
 /// ledger attached to no session, so tests and non-interactive callers get a
 /// usable target that simply records nothing anyone else will read.
 #[derive(Clone, Debug, Default)]
-pub struct ReadLedger(Arc<Mutex<HashMap<PathBuf, Option<SystemTime>>>>);
+pub struct ReadLedger(Arc<Mutex<HashMap<PathBuf, FileStamp>>>);
 
 impl ReadLedger {
     /// Recovers the guard even if a previous holder panicked, for the reason
     /// [`TodoHandle::lock`](crate::todo::TodoHandle) does: the critical sections
     /// are trivial, and a poison error is not something a caller could act on.
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<PathBuf, Option<SystemTime>>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<PathBuf, FileStamp>> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Notes that the session has seen `path` as it stood at `modified`.
+    /// Notes that the session has seen `path` as `stamp` describes it.
     ///
-    /// Callers pass the modification time observed *before* taking the
-    /// contents, so a write landing between the two leaves a newer time on disk
-    /// than the one recorded and is caught as a change rather than absorbed.
+    /// Callers stamp the file *before* taking its contents, so a write landing
+    /// between the two leaves the file no longer matching what was recorded and
+    /// is caught as a change rather than absorbed.
     ///
     /// Writing counts as seeing: a caller that supplied a file's contents whole
     /// knows them as surely as one that read them, and without this, writing the
     /// same file twice in a session would be refused the second time.
-    pub fn record(&self, path: &Path, modified: Option<SystemTime>) {
-        self.lock().insert(path.to_path_buf(), modified);
+    pub fn record(&self, path: &Path, stamp: FileStamp) {
+        self.lock().insert(path.to_path_buf(), stamp);
     }
 
-    /// Notes that `path` now stands at `modified` after a call that changed
-    /// part of it, without claiming the session has seen the whole.
+    /// Notes that `path` now stands at `stamp` after a call that changed part
+    /// of it, without claiming the session has seen the whole.
     ///
     /// `edit_file` names the text it replaces and leaves the rest alone, so it
     /// proves nothing about the parts of a file nobody looked at — a file it
     /// edits sight-unseen stays unseen, or editing one character would license
-    /// replacing the whole. What it must not do is leave the baseline pointing
-    /// at a modification time its own write invalidated, which would report the
-    /// session's own edit back to it as somebody else's change.
-    pub fn touch(&self, path: &Path, modified: Option<SystemTime>) {
+    /// replacing the whole. What it must not do is leave the baseline
+    /// describing a file its own write just changed, which would report the
+    /// session's own edit back to it as somebody else's.
+    pub fn touch(&self, path: &Path, stamp: FileStamp) {
         if let Some(baseline) = self.lock().get_mut(path) {
-            *baseline = modified;
+            *baseline = stamp;
         }
     }
 
-    /// What is known about `path`, given its modification time right now.
-    ///
-    /// `modified` of `None` on either side is treated as unchanged: a
-    /// filesystem that does not report modification times cannot support this
-    /// check, and refusing every write there would be worse than not checking.
-    pub fn state(&self, path: &Path, modified: Option<SystemTime>) -> ReadState {
+    /// What is known about `path`, given how it stands right now.
+    pub fn state(&self, path: &Path, now: FileStamp) -> ReadState {
         let Some(seen) = self.lock().get(path).copied() else {
             return ReadState::Never;
         };
-        match (seen, modified) {
-            (Some(seen), Some(now)) if now > seen => ReadState::Stale,
-            _ => ReadState::Current,
+        if seen.differs_from(&now) {
+            ReadState::Stale
+        } else {
+            ReadState::Current
         }
     }
 
@@ -115,47 +151,113 @@ mod tests {
 
     use super::*;
 
-    fn at(secs: u64) -> Option<SystemTime> {
-        Some(SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
+    /// A stamp with both dimensions known.
+    fn stamp(secs: u64, size: u64) -> FileStamp {
+        FileStamp {
+            modified: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(secs)),
+            size: Some(size),
+        }
     }
 
     #[test]
     fn an_unseen_file_is_never() {
         let ledger = ReadLedger::default();
-        assert_eq!(ledger.state(Path::new("/a"), at(1)), ReadState::Never);
+        assert_eq!(
+            ledger.state(Path::new("/a"), stamp(1, 10)),
+            ReadState::Never
+        );
     }
 
     #[test]
     fn a_file_seen_and_unchanged_is_current() {
         let ledger = ReadLedger::default();
-        ledger.record(Path::new("/a"), at(1));
-        assert_eq!(ledger.state(Path::new("/a"), at(1)), ReadState::Current);
+        ledger.record(Path::new("/a"), stamp(1, 10));
+        assert_eq!(
+            ledger.state(Path::new("/a"), stamp(1, 10)),
+            ReadState::Current
+        );
     }
 
     #[test]
     fn a_later_modification_makes_the_reading_stale() {
         let ledger = ReadLedger::default();
-        ledger.record(Path::new("/a"), at(1));
-        assert_eq!(ledger.state(Path::new("/a"), at(2)), ReadState::Stale);
+        ledger.record(Path::new("/a"), stamp(1, 10));
+        assert_eq!(
+            ledger.state(Path::new("/a"), stamp(2, 10)),
+            ReadState::Stale
+        );
     }
 
     #[test]
-    fn a_missing_modification_time_does_not_read_as_a_change() {
+    fn a_modification_time_moved_backwards_is_still_a_change() {
         let ledger = ReadLedger::default();
-        ledger.record(Path::new("/a"), None);
-        assert_eq!(ledger.state(Path::new("/a"), None), ReadState::Current);
-        assert_eq!(ledger.state(Path::new("/a"), at(9)), ReadState::Current);
+        ledger.record(Path::new("/a"), stamp(5, 10));
+        // What `rsync -t`, `cp -p`, or an archive unpacked with times preserved
+        // leaves behind. The file is not the one that was read, and which
+        // direction its clock went says nothing about that.
+        assert_eq!(
+            ledger.state(Path::new("/a"), stamp(1, 10)),
+            ReadState::Stale
+        );
+    }
+
+    #[test]
+    fn a_size_change_is_caught_even_when_the_clock_did_not_move() {
+        let ledger = ReadLedger::default();
+        ledger.record(Path::new("/a"), stamp(1, 10));
+        // A second write inside the filesystem's timestamp resolution — the
+        // edit-then-format cycle does this routinely on a coarse clock.
+        assert_eq!(
+            ledger.state(Path::new("/a"), stamp(1, 40)),
+            ReadState::Stale
+        );
+    }
+
+    #[test]
+    fn a_dimension_nobody_can_report_does_not_vote() {
+        let ledger = ReadLedger::default();
+        let no_clock = FileStamp {
+            modified: None,
+            size: Some(10),
+        };
+        ledger.record(Path::new("/a"), no_clock);
+
+        // The size still decides on its own where it can.
+        assert_eq!(ledger.state(Path::new("/a"), no_clock), ReadState::Current);
+        assert_eq!(
+            ledger.state(Path::new("/a"), stamp(9, 10)),
+            ReadState::Current
+        );
+        assert_eq!(
+            ledger.state(Path::new("/a"), stamp(9, 40)),
+            ReadState::Stale
+        );
+    }
+
+    #[test]
+    fn a_stamp_with_nothing_in_it_can_never_be_stale() {
+        let ledger = ReadLedger::default();
+        ledger.record(Path::new("/a"), FileStamp::default());
+        // Refusing every write on a filesystem that reports neither dimension
+        // would make the tool unusable there, which is worse than not checking.
+        assert_eq!(
+            ledger.state(Path::new("/a"), FileStamp::default()),
+            ReadState::Current
+        );
     }
 
     #[test]
     fn touching_a_seen_file_moves_its_baseline_forward() {
         let ledger = ReadLedger::default();
-        ledger.record(Path::new("/a"), at(1));
+        ledger.record(Path::new("/a"), stamp(1, 10));
         // What `edit_file` does to a file this session had already read: the
         // change is the session's own, so it must not read back as somebody
         // else's.
-        ledger.touch(Path::new("/a"), at(2));
-        assert_eq!(ledger.state(Path::new("/a"), at(2)), ReadState::Current);
+        ledger.touch(Path::new("/a"), stamp(2, 40));
+        assert_eq!(
+            ledger.state(Path::new("/a"), stamp(2, 40)),
+            ReadState::Current
+        );
     }
 
     #[test]
@@ -165,27 +267,39 @@ mod tests {
         // it. Recording it here would turn `edit_file` into a way around the
         // guard: one trivial edit, then a whole-file write over contents the
         // session never saw.
-        ledger.touch(Path::new("/a"), at(1));
-        assert_eq!(ledger.state(Path::new("/a"), at(1)), ReadState::Never);
+        ledger.touch(Path::new("/a"), stamp(1, 10));
+        assert_eq!(
+            ledger.state(Path::new("/a"), stamp(1, 10)),
+            ReadState::Never
+        );
     }
 
     #[test]
     fn clones_share_one_record() {
         let ledger = ReadLedger::default();
         let other = ledger.clone();
-        other.record(Path::new("/a"), at(1));
-        assert_eq!(ledger.state(Path::new("/a"), at(1)), ReadState::Current);
+        other.record(Path::new("/a"), stamp(1, 10));
+        assert_eq!(
+            ledger.state(Path::new("/a"), stamp(1, 10)),
+            ReadState::Current
+        );
     }
 
     #[test]
     fn a_deep_clone_keeps_what_was_recorded_and_diverges_after() {
         let ledger = ReadLedger::default();
-        ledger.record(Path::new("/a"), at(1));
+        ledger.record(Path::new("/a"), stamp(1, 10));
         let forked = ledger.deep_clone();
 
-        forked.record(Path::new("/b"), at(1));
+        forked.record(Path::new("/b"), stamp(1, 10));
 
-        assert_eq!(forked.state(Path::new("/a"), at(1)), ReadState::Current);
-        assert_eq!(ledger.state(Path::new("/b"), at(1)), ReadState::Never);
+        assert_eq!(
+            forked.state(Path::new("/a"), stamp(1, 10)),
+            ReadState::Current
+        );
+        assert_eq!(
+            ledger.state(Path::new("/b"), stamp(1, 10)),
+            ReadState::Never
+        );
     }
 }

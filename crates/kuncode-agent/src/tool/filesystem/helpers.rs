@@ -14,7 +14,6 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
-    time::SystemTime,
 };
 
 use ignore::{
@@ -28,7 +27,7 @@ use tokio::{
 
 use crate::{
     permission::{CanonicalPath, PathVisibility},
-    tool::{PreparedInvocationState, ToolError, ToolOutput},
+    tool::{FileStamp, PreparedInvocationState, ToolError, ToolOutput},
     workspace::{Workspace, WorkspaceError},
 };
 
@@ -148,17 +147,18 @@ pub(super) async fn write_no_follow(path: &Path, content: &[u8]) -> Result<(), O
     file.flush().await.map_err(OpenError::Io)
 }
 
-/// The file's modification time, or `None` when it has none to report.
+/// How `path` stands right now, or an empty stamp when it cannot be read.
 ///
-/// Read without following symlinks, matching how `write_file` takes the time it
-/// compares a recorded reading against: a baseline and the check that consumes
-/// it have to describe the same filesystem object, or a link would let the two
-/// disagree about which file changed.
-pub(super) async fn modified_time(path: &Path) -> Option<SystemTime> {
+/// Taken without following symlinks, matching how `write_file` stamps the file
+/// it compares a recorded reading against: a baseline and the check that
+/// consumes it have to describe the same filesystem object, or a link would let
+/// the two disagree about which file changed.
+pub(super) async fn file_stamp(path: &Path) -> FileStamp {
     tokio::fs::symlink_metadata(path)
         .await
-        .ok()
-        .and_then(|metadata| metadata.modified().ok())
+        .as_ref()
+        .map(FileStamp::from_metadata)
+        .unwrap_or_default()
 }
 
 /// Shapes an [`OpenError`] into the model-facing failure for `kind`.

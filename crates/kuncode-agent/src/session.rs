@@ -276,12 +276,16 @@ mod tests {
         let session = AgentSession::new();
         let path = std::path::Path::new("/a");
 
-        session.read_ledger().record(path, None);
+        session
+            .read_ledger()
+            .record(path, crate::tool::FileStamp::default());
 
         // The runner hands this handle to every tool call in the session, so a
         // read in one call has to be visible to a write in the next.
         assert_eq!(
-            session.read_ledger().state(path, None),
+            session
+                .read_ledger()
+                .state(path, crate::tool::FileStamp::default()),
             crate::tool::ReadState::Current
         );
     }
@@ -290,21 +294,29 @@ mod tests {
     fn a_cloned_session_does_not_inherit_the_right_to_overwrite() {
         let session = AgentSession::new();
         let path = std::path::Path::new("/a");
-        session.read_ledger().record(path, None);
+        session
+            .read_ledger()
+            .record(path, crate::tool::FileStamp::default());
 
         let clone = session.clone();
-        clone.read_ledger().record(std::path::Path::new("/b"), None);
+        clone.read_ledger().record(
+            std::path::Path::new("/b"),
+            crate::tool::FileStamp::default(),
+        );
 
         // A clone is a separate timeline: it starts with what was read so far,
         // and what it reads afterwards must not license writes in the original.
         assert_eq!(
-            clone.read_ledger().state(path, None),
+            clone
+                .read_ledger()
+                .state(path, crate::tool::FileStamp::default()),
             crate::tool::ReadState::Current
         );
         assert_eq!(
-            session
-                .read_ledger()
-                .state(std::path::Path::new("/b"), None),
+            session.read_ledger().state(
+                std::path::Path::new("/b"),
+                crate::tool::FileStamp::default()
+            ),
             crate::tool::ReadState::Never
         );
     }

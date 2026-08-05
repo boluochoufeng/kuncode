@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{fs::OpenOptions, io::AsyncReadExt};
 
 use super::helpers::{
-    io_error, modified_time, non_empty_path, open_error, open_no_follow, revalidate_path,
+    file_stamp, io_error, non_empty_path, open_error, open_no_follow, revalidate_path,
     workspace_error, write_no_follow,
 };
 use crate::{
@@ -186,7 +186,7 @@ impl TypedTool for EditFile {
         // `write_file` as somebody else's. Only an existing baseline moves —
         // editing a file nobody read leaves it unread, since replacing one
         // known snippet says nothing about the lines around it.
-        ctx.reads.touch(&path, modified_time(&path).await);
+        ctx.reads.touch(&path, file_stamp(&path).await);
 
         ToolOutput::success(EditFileOutput {
             path: self.workspace.relative_display(&path),
