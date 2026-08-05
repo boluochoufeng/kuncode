@@ -218,7 +218,7 @@ pub(super) struct Walked<T> {
 /// `max_depth` of `Some(1)` restricts the walk to the root's own children;
 /// `None` walks the whole tree. The root itself is never visited, and an
 /// unreadable entry is skipped rather than aborting the walk, matching
-/// ripgrep's resilience. Ignore handling and the `.git` skip come from
+/// ripgrep's resilience. Ignore handling and the VCS-store skip come from
 /// [`workspace_walk_builder`], including the ignore rules declared above a
 /// `root` deeper than the workspace — so listing a subdirectory filters
 /// exactly as the same paths would when seen from the workspace root.
@@ -228,7 +228,7 @@ pub(super) fn walk_entries<T>(
     workspace: &Workspace,
     root: &Path,
     max_depth: Option<usize>,
-    include_ignored: bool,
+    honor_ignore_files: bool,
     visibility: &PathVisibility,
     mut visit: impl FnMut(WalkedEntry<'_>) -> Option<T>,
 ) -> Walked<T> {
@@ -236,7 +236,7 @@ pub(super) fn walk_entries<T>(
     let mut builder = workspace_walk_builder(
         workspace,
         root,
-        include_ignored,
+        honor_ignore_files,
         WithheldPaths::new(visibility, root, Arc::clone(&hidden)),
     );
     builder.max_depth(max_depth);
@@ -285,18 +285,26 @@ pub(super) fn walk_entries<T>(
     }
 }
 
-/// Builds a walker over `walk_root` honoring the project's own notion of noise.
+/// Builds a walker over `walk_root`, optionally honoring the project's own
+/// notion of noise.
 ///
 /// Which paths are noise is delegated to the project rather than a hardcoded
-/// name list: `.gitignore` / `.ignore` / `.git/info/exclude` are honored and
-/// hidden dotfiles are skipped; `include_ignored` turns all of that off. The
-/// user's global gitignore and ignore files *above the workspace* are
-/// deliberately not consulted, so behavior is reproducible and scoped to the
-/// workspace.
+/// name list: with `honor_ignore_files`, `.gitignore` / `.ignore` /
+/// `.git/info/exclude` all apply. The user's global gitignore and ignore files
+/// *above the workspace* are deliberately not consulted, so behavior is
+/// reproducible and scoped to the workspace.
 ///
-/// `.git` entries are never traversed. Note that the walker exempts its own
-/// root from every filter — including this one — so a caller that lets
-/// `walk_root` be user-supplied must reject a root inside the VCS store itself.
+/// Hidden entries are always walked, which those rules are not asked about.
+/// A leading dot marks a file as uninteresting to a human browsing a directory;
+/// it says nothing about whether the file is source. `.github/workflows`,
+/// `.cargo/config.toml`, and `.eslintrc` are as much a part of a project as
+/// anything under `src`, and a search that cannot see them answers the wrong
+/// question in silence.
+///
+/// Version-control stores are never traversed — see [`VCS_STORES`]. Note that
+/// the walker exempts its own root from every filter, including that one, so a
+/// caller that lets `walk_root` be user-supplied must reject a root inside a
+/// store itself.
 ///
 /// Permission filtering is folded in here rather than layered on by the caller:
 /// [`WalkBuilder::filter_entry`] keeps only the predicate it was given last, so
@@ -308,30 +316,29 @@ pub(super) fn walk_entries<T>(
 fn workspace_walk_builder(
     workspace: &Workspace,
     walk_root: &Path,
-    include_ignored: bool,
+    honor_ignore_files: bool,
     withheld: WithheldPaths,
 ) -> WalkBuilder {
-    let enabled = !include_ignored;
     // `WalkBuilder` reads ignore files only from the tree it walks, so a walk
     // rooted below the workspace would escape every rule the project declares
     // higher up. Supplying those rules separately keeps a subdirectory listing
     // filtered exactly like the same paths seen from the workspace root.
-    let ancestors = if enabled && walk_root != workspace.root() {
+    let ancestors = if honor_ignore_files && walk_root != workspace.root() {
         AncestorIgnore::between(workspace.root(), walk_root)
     } else {
         AncestorIgnore::default()
     };
     let mut builder = WalkBuilder::new(walk_root);
     builder
-        .hidden(enabled)
-        .git_ignore(enabled)
-        .git_exclude(enabled)
-        .ignore(enabled)
+        .hidden(false)
+        .git_ignore(honor_ignore_files)
+        .git_exclude(honor_ignore_files)
+        .ignore(honor_ignore_files)
         .git_global(false)
         .parents(false)
         .require_git(false)
         .filter_entry(move |entry| {
-            entry.file_name() != OsStr::new(".git")
+            !is_vcs_store(entry.file_name())
                 && !ancestors.is_ignored(
                     entry.path(),
                     entry
@@ -341,6 +348,17 @@ fn workspace_walk_builder(
                 && withheld.admits(entry.path())
         });
     builder
+}
+
+/// Directories holding version-control metadata rather than project content.
+///
+/// One name was enough while every hidden entry was skipped wholesale. Walking
+/// them means each of these would otherwise be descended into, and an object
+/// database is machine data that no search over a project wants back.
+const VCS_STORES: [&str; 6] = [".git", ".hg", ".svn", ".bzr", ".jj", ".sl"];
+
+fn is_vcs_store(name: &OsStr) -> bool {
+    VCS_STORES.iter().any(|store| name == OsStr::new(store))
 }
 
 /// Read paths a walk must not surface, and the tally of what it dropped.
@@ -480,15 +498,15 @@ pub(super) fn symlink_target(path: &Path, workspace: &Workspace) -> SymlinkTarge
     }
 }
 
-/// Whether `path` names the VCS store or something inside it.
+/// Whether `path` names a VCS store or something inside one.
 ///
-/// The walk filter drops `.git` entries, but never its own root, so any tool
-/// taking a caller-supplied directory has to reject one there itself.
+/// The walk filter drops [`VCS_STORES`] entries, but never its own root, so any
+/// tool taking a caller-supplied directory has to reject one there itself.
 pub(super) fn is_inside_vcs_store(workspace: &Workspace, path: &Path) -> bool {
     path.strip_prefix(workspace.root()).is_ok_and(|relative| {
         relative
             .components()
-            .any(|component| component.as_os_str() == OsStr::new(".git"))
+            .any(|component| is_vcs_store(component.as_os_str()))
     })
 }
 

@@ -32,10 +32,6 @@ pub struct GlobArgs {
     /// Maximum number of matches to return.
     #[serde(default)]
     limit: Option<usize>,
-    /// Also search files hidden or excluded by `.gitignore`. The VCS store
-    /// (`.git`) is always skipped. Defaults to `false`.
-    #[serde(default)]
-    include_ignored: bool,
 }
 
 /// Filesystem entries matched by a glob pattern.
@@ -74,9 +70,12 @@ impl Glob {
                 "glob",
                 "Find workspace files by name, using a glob pattern such as \
                  `**/*.rs` or `src/**/mod.rs`. Returns paths sorted by name, \
-                 usable as-is with read_file and edit_file. Use grep to search \
-                 what is inside the files, ls to see how a directory is \
-                 organized, and prefer this over find through bash.",
+                 usable as-is with read_file and edit_file. Searches the whole \
+                 workspace, build output and other `.gitignore`d paths \
+                 included — asking for a name is how one of those gets found. \
+                 Use grep to search what is inside the files, ls to see how a \
+                 directory is organized, and prefer this over find through \
+                 bash.",
             ),
             workspace,
         }
@@ -139,20 +138,18 @@ impl TypedTool for Glob {
         let canonical_input = CanonicalToolInput::new(serde_json::json!({
             "pattern": pattern,
             "limit": limit,
-            "include_ignored": args.include_ignored,
         }));
-        let mut checks = NonEmptyVec::new(PermissionCheckSpec::new(PermissionTarget::Read(anchor)));
-        if args.include_ignored {
-            let target = PermissionTarget::exact_tool("glob")
-                .map_err(|error| ToolOutput::failure("invalid_arguments", error.to_string()))?;
-            checks.push(PermissionCheckSpec::new(target));
-        }
-        let summary = search_summary(&pattern, args.include_ignored);
+        // One check, for the anchor. Reaching `.gitignore`d paths needed a
+        // second one while it was opt-in; now that matching by name always
+        // reaches them, gating it would gate every call. What a caller may see
+        // is decided by Read rules, which filter this walk entry by entry —
+        // `.gitignore` marks noise, and was never a permission boundary.
+        let checks = NonEmptyVec::new(PermissionCheckSpec::new(PermissionTarget::Read(anchor)));
         Ok(TypedPreparation::new(
             args,
             canonical_input,
             checks,
-            ToolDisplay::new(summary),
+            ToolDisplay::new(search_summary(&pattern)),
         ))
     }
 
@@ -166,10 +163,9 @@ impl TypedTool for Glob {
         // The `ignore` walker is synchronous and thread-based, so the whole
         // tree walk runs on the blocking pool to keep the async runtime free.
         let workspace = self.workspace.clone();
-        let include_ignored = prepared.include_ignored;
         let visibility = ctx.visibility.clone();
         let walked = match tokio::task::spawn_blocking(move || {
-            walk_workspace(&workspace, include_ignored, &visibility)
+            walk_workspace(&workspace, &visibility)
         })
         .await
         {
@@ -214,15 +210,9 @@ impl TypedTool for Glob {
 ///
 /// The pattern is named because the authorized target is only the directory the
 /// search cannot leave — "Search workspace paths" alone would leave an approver
-/// guessing what is being looked for inside it. `include_ignored` is named for
-/// the same reason `ls` names it: the bypass rides on a separate `ExactTool`
-/// check that reads as nothing in particular.
-fn search_summary(pattern: &str, include_ignored: bool) -> String {
-    let mut summary = format!("Search workspace paths: {pattern}");
-    if include_ignored {
-        summary.push_str(" (including ignored and hidden entries)");
-    }
-    summary
+/// guessing what is being looked for inside it.
+fn search_summary(pattern: &str) -> String {
+    format!("Search workspace paths: {pattern}")
 }
 
 /// Returns the leading wildcard-free segments of a pattern: the directory the
@@ -286,18 +276,22 @@ fn validate_glob_pattern(pattern: &str) -> Result<(), String> {
 /// tested against the pattern at all — hence the count, so that an empty result
 /// does not read as "no such file" while something stands there unnamed.
 ///
+/// Ignore files are not consulted. Matching by name is how a caller goes after
+/// a specific path it already has in mind, and `.gitignore` marking that path
+/// as not-for-committing says nothing about whether it is the one being looked
+/// for — build output, `.env`, and generated sources are exactly what a name
+/// search is usually reaching for. The results are paths only, and Read rules
+/// still filter them entry by entry. Content search makes the opposite trade;
+/// see `grep`.
+///
 /// Traversal order is irrelevant: the caller sorts matches before returning.
 /// Synchronous and thread-based; callers run it on the blocking pool.
-fn walk_workspace(
-    workspace: &Workspace,
-    include_ignored: bool,
-    visibility: &PathVisibility,
-) -> Walked<String> {
+fn walk_workspace(workspace: &Workspace, visibility: &PathVisibility) -> Walked<String> {
     walk_entries(
         workspace,
         workspace.root(),
         None,
-        include_ignored,
+        false,
         visibility,
         |entry| {
             // A search advertises only links it could actually hand to
@@ -354,7 +348,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn glob_respects_gitignore() {
+    async fn glob_finds_names_the_project_ignores() {
         let tmp = TestDir::new();
         fs::write(tmp.path().join(".gitignore"), "target/\nnode_modules/\n")
             .expect("gitignore should be written");
@@ -371,9 +365,59 @@ mod tests {
 
         assert!(output.ok);
         let data = output.data.expect("data present");
-        // The project's own `.gitignore` prunes `target/` and `node_modules/`.
-        assert_eq!(data["matches"], serde_json::json!(["src.rs"]));
-        assert_eq!(data["total_matches"], 1);
+        // Asking for a name is how a caller goes after a path it already has in
+        // mind, and `.gitignore` saying "do not commit this" is no answer to
+        // "where is it". Content search makes the opposite trade; see `grep`.
+        assert_eq!(
+            data["matches"],
+            serde_json::json!([
+                "node_modules/pkg/index.rs",
+                "src.rs",
+                "target/debug/built.rs"
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn glob_finds_files_under_a_dot_directory() {
+        let tmp = TestDir::new();
+        fs::create_dir_all(tmp.path().join(".github/workflows"))
+            .expect("directory should be created");
+        fs::write(tmp.path().join(".github/workflows/ci.yml"), "").expect("file should be written");
+        let tool = Glob::new(tmp.workspace().await);
+
+        let output = call(tool, serde_json::json!({ "pattern": "**/*.yml" })).await;
+
+        assert!(output.ok);
+        // A leading dot marks a directory as uninteresting to browse, not as
+        // something other than source. CI config is as much part of a project
+        // as anything under `src`.
+        assert_eq!(
+            output.data.expect("data present")["matches"],
+            serde_json::json!([".github/workflows/ci.yml"])
+        );
+    }
+
+    #[tokio::test]
+    async fn glob_never_descends_into_a_version_control_store() {
+        let tmp = TestDir::new();
+        for store in [".git", ".jj", ".hg"] {
+            fs::create_dir_all(tmp.path().join(store)).expect("directory should be created");
+            fs::write(tmp.path().join(store).join("objects.rs"), "")
+                .expect("file should be written");
+        }
+        fs::write(tmp.path().join("kept.rs"), "").expect("file should be written");
+        let tool = Glob::new(tmp.workspace().await);
+
+        let output = call(tool, serde_json::json!({ "pattern": "**/*.rs" })).await;
+
+        assert!(output.ok);
+        // Walking dotfiles brought every VCS store into range at once, and an
+        // object database is machine data no search over a project wants back.
+        assert_eq!(
+            output.data.expect("data present")["matches"],
+            serde_json::json!(["kept.rs"])
+        );
     }
 
     #[tokio::test]
@@ -484,11 +528,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approval_summary_names_the_pattern_and_the_escape_hatch() {
+    async fn approval_summary_names_the_pattern() {
         let tmp = TestDir::new();
         let preparation = Tool::prepare(
             Arc::new(Glob::new(tmp.workspace().await)),
-            serde_json::json!({ "pattern": "src/**/*.rs", "include_ignored": true }),
+            serde_json::json!({ "pattern": "src/**/*.rs" }),
             &PreparationContext::new(),
         )
         .await
@@ -498,29 +542,28 @@ mod tests {
         // so what is being looked for inside it has to come from the summary.
         let summary = preparation.display().summary();
         assert!(summary.contains("src/**/*.rs"), "summary was: {summary}");
-        assert!(
-            summary.contains("ignored and hidden"),
-            "summary was: {summary}"
-        );
     }
 
     #[tokio::test]
-    async fn include_ignored_adds_a_separate_approval_check() {
+    async fn a_search_asks_only_about_the_directory_it_cannot_leave() {
         let tmp = TestDir::new();
         let preparation = Tool::prepare(
             Arc::new(Glob::new(tmp.workspace().await)),
-            serde_json::json!({ "pattern": "**/*", "include_ignored": true }),
+            serde_json::json!({ "pattern": "**/*" }),
             &PreparationContext::new(),
         )
         .await
         .expect("glob preparation succeeds");
 
-        assert_eq!(preparation.checks().len(), 2);
+        // Reaching ignored paths took a second `ExactTool` check while it was
+        // opt-in. Now that every search reaches them, that check would fire on
+        // every call and mean nothing. Read rules still filter the output.
+        assert_eq!(preparation.checks().len(), 1);
         assert!(
             preparation
                 .checks()
                 .iter()
-                .any(|check| check.target().namespace() == PermissionNamespace::ExactTool)
+                .all(|check| check.target().namespace() == PermissionNamespace::Read)
         );
     }
 

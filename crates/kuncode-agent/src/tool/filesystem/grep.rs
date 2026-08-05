@@ -122,8 +122,9 @@ pub struct GrepArgs {
     /// the same pattern paginates consistently.
     #[serde(default)]
     offset: Option<usize>,
-    /// Also search files hidden or excluded by `.gitignore`. The VCS store
-    /// (`.git`) is always skipped. Defaults to `false`.
+    /// Also search files excluded by `.gitignore`, such as build output.
+    /// Dotfiles are searched either way; version-control stores never are.
+    /// Defaults to `false`.
     #[serde(default)]
     include_ignored: bool,
 }
@@ -718,7 +719,11 @@ fn collect_candidates(
         workspace,
         root,
         None,
-        include_ignored,
+        // Content search opens every candidate, so the project's own notion of
+        // noise is worth honoring by default: build output dwarfs source by
+        // orders of magnitude, and a match inside it buries the ones that
+        // matter. `glob` trades the other way — it only returns names.
+        !include_ignored,
         visibility,
         |entry| {
             // Symlinks are skipped outright, matching ripgrep's default of not
@@ -1204,6 +1209,30 @@ mod tests {
         let data = output.data.expect("data present");
         assert_eq!(data["files"], serde_json::json!([{ "path": "plain.txt" }]));
         assert_eq!(data["skipped_binary"], 1);
+    }
+
+    #[tokio::test]
+    async fn dot_directories_are_searched_but_version_control_stores_are_not() {
+        let tmp = TestDir::new();
+        fs::create_dir_all(tmp.path().join(".github/workflows"))
+            .expect("directory should be created");
+        fs::write(
+            tmp.path().join(".github/workflows/ci.yml"),
+            "run: cargo needle\n",
+        )
+        .expect("file should be written");
+        fs::create_dir_all(tmp.path().join(".jj")).expect("directory should be created");
+        fs::write(tmp.path().join(".jj/op.txt"), "needle\n").expect("file should be written");
+        let tool = Grep::new(tmp.workspace().await);
+
+        let output = call(tool, serde_json::json!({ "pattern": "needle" })).await;
+
+        // CI config is source; an operation log is not. The dot they share says
+        // nothing about which is which, so the VCS stores are named outright.
+        assert_eq!(
+            output.data.expect("data present")["files"],
+            serde_json::json!([{ "path": ".github/workflows/ci.yml" }])
+        );
     }
 
     #[tokio::test]

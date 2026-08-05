@@ -50,9 +50,9 @@ pub struct LsArgs {
     /// files by name at any depth, use `glob` instead.
     #[serde(default)]
     depth: Option<usize>,
-    /// Also list entries hidden or excluded by `.gitignore`. The VCS store
-    /// (`.git`) is never listed and cannot be listed directly. Defaults to
-    /// `false`.
+    /// Also list entries excluded by `.gitignore`, such as build output.
+    /// Dotfiles are listed either way; version-control stores are never listed
+    /// and cannot be listed directly. Defaults to `false`.
     #[serde(default)]
     include_ignored: bool,
 }
@@ -373,7 +373,10 @@ fn walk_directory(
         workspace,
         directory,
         Some(depth),
-        include_ignored,
+        // A listing describes how a directory is organized, so the project's
+        // own notion of noise applies by default — a deep `ls` that pulled in
+        // build output would bury the structure it was asked to show.
+        !include_ignored,
         visibility,
         |entry| {
             let kind = if entry.file_type.is_dir() {
@@ -807,7 +810,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ls_hides_ignored_and_hidden_entries_by_default() {
+    async fn ls_hides_ignored_entries_but_shows_dotfiles() {
         let tmp = TestDir::new();
         fs::write(tmp.path().join(".gitignore"), "build/\n").expect("gitignore should be written");
         fs::create_dir_all(tmp.path().join("build")).expect("directory should be created");
@@ -819,10 +822,15 @@ mod tests {
 
         assert!(output.ok);
         let data = output.data.expect("data present");
-        // `build/` is ignored by the project and `.gitignore` itself is hidden.
+        // `build/` is noise the project declared. `.gitignore` is not: a
+        // listing that omitted it would be describing a directory that does not
+        // exist, and the rules it holds are usually what a caller is after.
         assert_eq!(
             data["entries"],
-            serde_json::json!([{ "path": "keep.rs", "kind": "file", "size": 0 }])
+            serde_json::json!([
+                { "path": ".gitignore", "kind": "file", "size": 7 },
+                { "path": "keep.rs", "kind": "file", "size": 0 }
+            ])
         );
     }
 
