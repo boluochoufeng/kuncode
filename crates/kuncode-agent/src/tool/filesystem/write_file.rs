@@ -1,9 +1,6 @@
 //! The `write_file` tool: write a UTF-8 file inside the workspace.
 
-use std::{
-    path::{Path, PathBuf},
-    time::SystemTime,
-};
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use kuncode_core::completion::ToolDefinition;
@@ -12,7 +9,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::helpers::{
-    non_empty_path, open_error, revalidate_path, workspace_error, write_no_follow,
+    modified_time, non_empty_path, open_error, revalidate_path, workspace_error, write_no_follow,
 };
 use crate::{
     permission::{
@@ -69,8 +66,8 @@ impl WriteFile {
                 "Create a UTF-8 workspace file, or replace one entirely. An \
                  existing file is truncated first, so whatever is not in \
                  `content` is gone — replacing one is therefore refused unless \
-                 read_file has already returned it in full during this session. \
-                 To change part of a file, use edit_file instead: it names only \
+                 read_file has already returned it during this session. To \
+                 change part of a file, use edit_file instead: it names only \
                  the text being replaced and so cannot lose the rest.",
             ),
             workspace,
@@ -141,7 +138,10 @@ impl TypedTool for WriteFile {
         if let Err(error) = write_no_follow(&path, args.content.as_bytes()).await {
             return open_error("write", &path, error, &self.workspace);
         }
-        ctx.reads.record_write(&path, modified_time(&path).await);
+        // Supplying the contents whole is knowing them whole, so this counts as
+        // a reading — without it, writing the same file twice in one session
+        // would be refused the second time.
+        ctx.reads.record(&path, modified_time(&path).await);
         ToolOutput::success(WriteFileOutput {
             path: self.workspace.relative_display(&path),
             bytes: args.content.len(),
@@ -170,14 +170,6 @@ async fn preview_against_disk(path: &Path, content: &str) -> Option<ChangePrevie
     ChangePreview::between(&existing, content)
 }
 
-/// The file's modification time, or `None` if it has none to report.
-async fn modified_time(path: &Path) -> Option<SystemTime> {
-    tokio::fs::metadata(path)
-        .await
-        .ok()
-        .and_then(|metadata| metadata.modified().ok())
-}
-
 /// Refuses to truncate a file whose current contents the session has not seen.
 ///
 /// `write_file` replaces a file wholesale, so anything the caller omits is gone
@@ -202,11 +194,6 @@ async fn refuse_blind_overwrite<D>(ctx: &ToolContext, path: &Path) -> Option<Too
              read_file it first, or use edit_file to change part of it without \
              replacing the rest",
         )),
-        ReadState::Partial => Some(ToolOutput::failure(
-            "unread_file",
-            "only part of this file has been read, so writing it whole would \
-             discard the rest; read it in full first, or use edit_file",
-        )),
         ReadState::Stale => Some(ToolOutput::failure(
             "stale_read",
             "this file changed on disk after it was read, so writing it now \
@@ -221,7 +208,7 @@ mod tests {
 
     use super::WriteFile;
     use crate::test_support::TestDir;
-    use crate::tool::filesystem::ReadFile;
+    use crate::tool::filesystem::{EditFile, ReadFile};
     use crate::tool::{ToolContext, execute_for_test};
 
     /// Runs `write_file` against `ctx`, so a test can share one session's
@@ -242,6 +229,16 @@ mod tests {
         args: serde_json::Value,
     ) -> crate::tool::ToolOutput {
         execute_for_test(Arc::new(ReadFile::new(workspace.clone())), args, ctx)
+            .await
+            .expect("no harness-level error")
+    }
+
+    async fn edit(
+        workspace: &crate::workspace::Workspace,
+        ctx: &ToolContext,
+        args: serde_json::Value,
+    ) -> crate::tool::ToolOutput {
+        execute_for_test(Arc::new(EditFile::new(workspace.clone())), args, ctx)
             .await
             .expect("no harness-level error")
     }
@@ -298,13 +295,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reading_one_page_does_not_license_replacing_the_whole_file() {
+    async fn reading_one_page_licenses_replacing_the_whole_file() {
         let tmp = TestDir::new();
         fs::write(tmp.path().join("a.txt"), "one\ntwo\nthree\n").expect("file should be written");
         let workspace = tmp.workspace().await;
         let ctx = ToolContext::new();
 
-        // Everything past line 1 is unseen, and a whole-file write drops it.
+        // Lines 2 and 3 were never returned, and this write does drop them. The
+        // guard asks whether the caller looked at the file at all, not whether
+        // it looked at every line — a per-line bar is unsatisfiable for the
+        // files below, and what a write discards is shown in the approval diff.
         assert!(
             read(
                 &workspace,
@@ -321,10 +321,39 @@ mod tests {
         )
         .await;
 
-        assert_eq!(
-            output.error.expect("error present").kind.as_str(),
-            "unread_file"
+        assert!(output.ok, "error: {:?}", output.error);
+    }
+
+    #[tokio::test]
+    async fn a_file_with_an_over_long_line_can_still_be_rewritten() {
+        let tmp = TestDir::new();
+        // Past `read_file`'s per-line cap, so the line comes back clipped and
+        // every re-read clips it identically. Demanding an unclipped reading
+        // would leave this file permanently unwritable, with no call the caller
+        // could make to change that.
+        fs::write(tmp.path().join("a.txt"), "x".repeat(3_000)).expect("file should be written");
+        let workspace = tmp.workspace().await;
+        let ctx = ToolContext::new();
+
+        let seen = read(&workspace, &ctx, serde_json::json!({ "path": "a.txt" })).await;
+        assert!(seen.ok);
+        // The loss is still reported to the caller; it just is not treated as
+        // grounds to refuse every later write.
+        assert!(
+            !seen.data.expect("data present")["truncated_lines"]
+                .as_array()
+                .expect("truncated lines present")
+                .is_empty()
         );
+
+        let output = write(
+            &workspace,
+            &ctx,
+            serde_json::json!({ "path": "a.txt", "content": "replacement" }),
+        )
+        .await;
+
+        assert!(output.ok, "error: {:?}", output.error);
     }
 
     #[tokio::test]
@@ -359,6 +388,81 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&path).expect("file should be readable"),
             "edited by someone else\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_edit_does_not_make_a_read_file_look_stale() {
+        let tmp = TestDir::new();
+        let path = tmp.path().join("a.txt");
+        fs::write(&path, "one\ntwo\n").expect("file should be written");
+        let workspace = tmp.workspace().await;
+        let ctx = ToolContext::new();
+
+        assert!(
+            read(&workspace, &ctx, serde_json::json!({ "path": "a.txt" }))
+                .await
+                .ok
+        );
+        // Long enough for the edit to land on a later timestamp than the read.
+        // Unrecorded, that gap would report the session's own change back to it
+        // as an outside one — the read-edit-write sequence is routine, and it
+        // has to work.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert!(
+            edit(
+                &workspace,
+                &ctx,
+                serde_json::json!({ "path": "a.txt", "old_text": "one", "new_text": "1" })
+            )
+            .await
+            .ok
+        );
+
+        let output = write(
+            &workspace,
+            &ctx,
+            serde_json::json!({ "path": "a.txt", "content": "replacement" }),
+        )
+        .await;
+
+        assert!(output.ok, "error: {:?}", output.error);
+    }
+
+    #[tokio::test]
+    async fn editing_an_unread_file_does_not_license_replacing_it() {
+        let tmp = TestDir::new();
+        fs::write(tmp.path().join("a.txt"), "one\ntwo\n").expect("file should be written");
+        let workspace = tmp.workspace().await;
+        let ctx = ToolContext::new();
+
+        // `edit_file` needs no prior read, since it names the text it replaces.
+        // That must not become a way around this guard: knowing one snippet
+        // says nothing about the lines around it.
+        assert!(
+            edit(
+                &workspace,
+                &ctx,
+                serde_json::json!({ "path": "a.txt", "old_text": "one", "new_text": "1" })
+            )
+            .await
+            .ok
+        );
+
+        let output = write(
+            &workspace,
+            &ctx,
+            serde_json::json!({ "path": "a.txt", "content": "replacement" }),
+        )
+        .await;
+
+        assert_eq!(
+            output.error.expect("error present").kind.as_str(),
+            "unread_file"
+        );
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("a.txt")).expect("file should be readable"),
+            "1\ntwo\n"
         );
     }
 

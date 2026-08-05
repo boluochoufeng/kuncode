@@ -1,4 +1,4 @@
-//! Records which files a session has read, so a whole-file write cannot
+//! Records which files a session has seen, so a whole-file write cannot
 //! silently discard content nobody looked at.
 //!
 //! `write_file` truncates before writing: whatever the caller left out is gone.
@@ -6,6 +6,14 @@
 //! keep, and unrecoverable when it is writing from a guess. Only the session
 //! knows which of the two happened, which is why this lives beside the plan on
 //! [`ToolContext`](crate::tool::ToolContext) rather than inside either tool.
+//!
+//! "Seen" is deliberately coarse: one page of a long file counts, and so does a
+//! read whose over-long lines came back clipped. Requiring every line, to the
+//! end, unclipped was tried first and turned out to be a trap — a file holding
+//! one line past the read cap could never satisfy it, because reading it again
+//! clipped the same line again, so no sequence of calls left the file writable.
+//! A guard meant to be satisfied by the caller's next move has to leave a move
+//! that satisfies it.
 
 use std::{
     collections::HashMap,
@@ -17,49 +25,16 @@ use std::{
 /// What the ledger knows about a file that is about to be overwritten.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReadState {
-    /// Never read in this session. Its current contents are unknown here.
+    /// Not seen in this session, so its contents are unknown here.
     Never,
-    /// Read, but not all of it — a page was requested, or a long line was cut
-    /// short. The unseen part would still be overwritten blind.
-    Partial,
-    /// Read in full, but modified on disk afterwards, so what was read is no
-    /// longer what is there.
+    /// Seen, then changed on disk, so what was seen is no longer what is there.
     Stale,
-    /// Read in full and unchanged since.
+    /// Seen, and unchanged since.
     Current,
 }
 
-/// What one file's reads have covered so far.
-///
-/// A large file is read a page at a time, and reading it *whole* is what
-/// licenses replacing it whole — so pages have to accumulate. Tracking only the
-/// most recent one would deadlock the caller: every page after the first starts
-/// past line 1, so no sequence of reads could ever satisfy the check.
-#[derive(Clone, Copy, Debug)]
-struct Entry {
-    /// Modification time observed *before* the contents were read, so a write
-    /// that lands between the two is caught rather than absorbed.
-    modified: Option<SystemTime>,
-    /// Last line of an unbroken run of pages starting at line 1: `Some(n)` means
-    /// lines `1..=n` have been seen. `None` once a page starts past where the
-    /// previous one ended, since the gap between them was never returned.
-    covered: Option<usize>,
-    /// A line's tail was dropped somewhere in that run, so even a run reaching
-    /// the end of the file has not shown all of its bytes.
-    lossy: bool,
-    /// The most recent page ran to the end of the file.
-    at_eof: bool,
-}
-
-impl Entry {
-    /// Whether the file has been seen in full: an unbroken run from line 1, to
-    /// the end, with no line's tail dropped along the way.
-    fn complete(&self) -> bool {
-        self.covered.is_some() && self.at_eof && !self.lossy
-    }
-}
-
-/// Shared record of files read during a session.
+/// Shared record of the files a session has seen, and how each stood when it
+/// saw them.
 ///
 /// Cloning shares the underlying map, mirroring
 /// [`TodoHandle`](crate::todo::TodoHandle): the runner keeps one clone on the
@@ -68,77 +43,42 @@ impl Entry {
 /// ledger attached to no session, so tests and non-interactive callers get a
 /// usable target that simply records nothing anyone else will read.
 #[derive(Clone, Debug, Default)]
-pub struct ReadLedger(Arc<Mutex<HashMap<PathBuf, Entry>>>);
+pub struct ReadLedger(Arc<Mutex<HashMap<PathBuf, Option<SystemTime>>>>);
 
 impl ReadLedger {
     /// Recovers the guard even if a previous holder panicked, for the reason
     /// [`TodoHandle::lock`](crate::todo::TodoHandle) does: the critical sections
     /// are trivial, and a poison error is not something a caller could act on.
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<PathBuf, Entry>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<PathBuf, Option<SystemTime>>> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Notes that one page of `path` was returned: `returned` lines starting at
-    /// `start_line`, with `has_more` lines after it and `lossy` set when some
-    /// line's tail was dropped to fit a size cap.
+    /// Notes that the session has seen `path` as it stood at `modified`.
     ///
-    /// Pages join onto the previous run when they start exactly where it ended,
-    /// which is what lets a file read in several calls count as read in full.
-    pub fn record_read(
-        &self,
-        path: &Path,
-        modified: Option<SystemTime>,
-        start_line: usize,
-        returned: usize,
-        has_more: bool,
-        lossy: bool,
-    ) {
-        let mut records = self.lock();
-        let entry = records.entry(path.to_path_buf()).or_insert(Entry {
-            modified,
-            covered: None,
-            lossy: false,
-            at_eof: false,
-        });
-        // Pages read before a change describe content that is no longer there,
-        // so the run restarts rather than extending across it.
-        if entry.modified != modified {
-            *entry = Entry {
-                modified,
-                covered: None,
-                lossy: false,
-                at_eof: false,
-            };
-        }
-        entry.covered = match (start_line, entry.covered) {
-            (1, _) => Some(returned),
-            (start, Some(covered)) if start == covered + 1 => Some(covered + returned),
-            // Starting anywhere else leaves lines nobody has seen behind it.
-            _ => None,
-        };
-        entry.lossy = if start_line == 1 {
-            lossy
-        } else {
-            entry.lossy || lossy
-        };
-        entry.at_eof = !has_more;
+    /// Callers pass the modification time observed *before* taking the
+    /// contents, so a write landing between the two leaves a newer time on disk
+    /// than the one recorded and is caught as a change rather than absorbed.
+    ///
+    /// Writing counts as seeing: a caller that supplied a file's contents whole
+    /// knows them as surely as one that read them, and without this, writing the
+    /// same file twice in a session would be refused the second time.
+    pub fn record(&self, path: &Path, modified: Option<SystemTime>) {
+        self.lock().insert(path.to_path_buf(), modified);
     }
 
-    /// Notes that `path` was written with contents the caller supplied whole.
+    /// Notes that `path` now stands at `modified` after a call that changed
+    /// part of it, without claiming the session has seen the whole.
     ///
-    /// A writer knows what it just wrote as surely as a reader knows what it
-    /// read, so this counts as a complete reading. Without it, writing the same
-    /// file twice in one session would be refused the second time.
-    pub fn record_write(&self, path: &Path, modified: Option<SystemTime>) {
-        self.lock().insert(
-            path.to_path_buf(),
-            Entry {
-                modified,
-                covered: Some(0),
-                lossy: false,
-                at_eof: true,
-            },
-        );
+    /// `edit_file` names the text it replaces and leaves the rest alone, so it
+    /// proves nothing about the parts of a file nobody looked at — a file it
+    /// edits sight-unseen stays unseen, or editing one character would license
+    /// replacing the whole. What it must not do is leave the baseline pointing
+    /// at a modification time its own write invalidated, which would report the
+    /// session's own edit back to it as somebody else's change.
+    pub fn touch(&self, path: &Path, modified: Option<SystemTime>) {
+        if let Some(baseline) = self.lock().get_mut(path) {
+            *baseline = modified;
+        }
     }
 
     /// What is known about `path`, given its modification time right now.
@@ -147,13 +87,10 @@ impl ReadLedger {
     /// filesystem that does not report modification times cannot support this
     /// check, and refusing every write there would be worse than not checking.
     pub fn state(&self, path: &Path, modified: Option<SystemTime>) -> ReadState {
-        let Some(entry) = self.lock().get(path).copied() else {
+        let Some(seen) = self.lock().get(path).copied() else {
             return ReadState::Never;
         };
-        if !entry.complete() {
-            return ReadState::Partial;
-        }
-        match (entry.modified, modified) {
+        match (seen, modified) {
             (Some(seen), Some(now)) if now > seen => ReadState::Stale,
             _ => ReadState::Current,
         }
@@ -183,119 +120,72 @@ mod tests {
     }
 
     #[test]
-    fn an_unread_file_is_never() {
+    fn an_unseen_file_is_never() {
         let ledger = ReadLedger::default();
         assert_eq!(ledger.state(Path::new("/a"), at(1)), ReadState::Never);
     }
 
-    /// One page: `start_line`, `returned`, `has_more`, and no dropped tails.
-    fn page(ledger: &ReadLedger, at_time: Option<SystemTime>, page: (usize, usize, bool)) {
-        let (start_line, returned, has_more) = page;
-        ledger.record_read(
-            Path::new("/a"),
-            at_time,
-            start_line,
-            returned,
-            has_more,
-            false,
-        );
-    }
-
     #[test]
-    fn a_full_read_of_an_unchanged_file_is_current() {
+    fn a_file_seen_and_unchanged_is_current() {
         let ledger = ReadLedger::default();
-        page(&ledger, at(1), (1, 10, false));
+        ledger.record(Path::new("/a"), at(1));
         assert_eq!(ledger.state(Path::new("/a"), at(1)), ReadState::Current);
     }
 
     #[test]
     fn a_later_modification_makes_the_reading_stale() {
         let ledger = ReadLedger::default();
-        page(&ledger, at(1), (1, 10, false));
+        ledger.record(Path::new("/a"), at(1));
         assert_eq!(ledger.state(Path::new("/a"), at(2)), ReadState::Stale);
-    }
-
-    #[test]
-    fn one_page_of_a_longer_file_is_partial() {
-        let ledger = ReadLedger::default();
-        page(&ledger, at(1), (1, 10, true));
-        assert_eq!(ledger.state(Path::new("/a"), at(1)), ReadState::Partial);
-    }
-
-    #[test]
-    fn pages_read_end_to_end_add_up_to_a_whole_file() {
-        let ledger = ReadLedger::default();
-        // What a caller does with a file too long for one reply. Every page
-        // after the first starts past line 1, so judging pages one at a time
-        // would leave this file permanently unwritable.
-        page(&ledger, at(1), (1, 1000, true));
-        page(&ledger, at(1), (1001, 1000, true));
-        page(&ledger, at(1), (2001, 1000, false));
-        assert_eq!(ledger.state(Path::new("/a"), at(1)), ReadState::Current);
-    }
-
-    #[test]
-    fn a_gap_between_pages_leaves_the_file_partial() {
-        let ledger = ReadLedger::default();
-        page(&ledger, at(1), (1, 1000, true));
-        // Resuming past the gap: lines 1001..=1500 were never returned.
-        page(&ledger, at(1), (1501, 500, false));
-        assert_eq!(ledger.state(Path::new("/a"), at(1)), ReadState::Partial);
-    }
-
-    #[test]
-    fn a_change_partway_through_paging_restarts_the_run() {
-        let ledger = ReadLedger::default();
-        page(&ledger, at(1), (1, 1000, true));
-        // The tail belongs to a different file than the head did.
-        page(&ledger, at(2), (1001, 1000, false));
-        assert_eq!(ledger.state(Path::new("/a"), at(2)), ReadState::Partial);
-    }
-
-    #[test]
-    fn a_dropped_line_tail_anywhere_in_the_run_keeps_it_partial() {
-        let ledger = ReadLedger::default();
-        ledger.record_read(Path::new("/a"), at(1), 1, 1000, true, true);
-        page(&ledger, at(1), (1001, 1000, false));
-        assert_eq!(ledger.state(Path::new("/a"), at(1)), ReadState::Partial);
-    }
-
-    #[test]
-    fn an_empty_file_is_read_in_full_by_returning_nothing() {
-        let ledger = ReadLedger::default();
-        page(&ledger, at(1), (1, 0, false));
-        assert_eq!(ledger.state(Path::new("/a"), at(1)), ReadState::Current);
-    }
-
-    #[test]
-    fn re_reading_from_the_top_starts_a_fresh_run() {
-        let ledger = ReadLedger::default();
-        ledger.record_read(Path::new("/a"), at(1), 1, 1000, true, true);
-        // A second pass from line 1 replaces the first, dropped tails included.
-        page(&ledger, at(1), (1, 1000, false));
-        assert_eq!(ledger.state(Path::new("/a"), at(1)), ReadState::Current);
-    }
-
-    #[test]
-    fn a_write_counts_as_having_read_the_file() {
-        let ledger = ReadLedger::default();
-        ledger.record_write(Path::new("/a"), at(5));
-        assert_eq!(ledger.state(Path::new("/a"), at(5)), ReadState::Current);
     }
 
     #[test]
     fn a_missing_modification_time_does_not_read_as_a_change() {
         let ledger = ReadLedger::default();
-        page(&ledger, None, (1, 10, false));
+        ledger.record(Path::new("/a"), None);
         assert_eq!(ledger.state(Path::new("/a"), None), ReadState::Current);
         assert_eq!(ledger.state(Path::new("/a"), at(9)), ReadState::Current);
+    }
+
+    #[test]
+    fn touching_a_seen_file_moves_its_baseline_forward() {
+        let ledger = ReadLedger::default();
+        ledger.record(Path::new("/a"), at(1));
+        // What `edit_file` does to a file this session had already read: the
+        // change is the session's own, so it must not read back as somebody
+        // else's.
+        ledger.touch(Path::new("/a"), at(2));
+        assert_eq!(ledger.state(Path::new("/a"), at(2)), ReadState::Current);
+    }
+
+    #[test]
+    fn touching_an_unseen_file_leaves_it_unseen() {
+        let ledger = ReadLedger::default();
+        // Editing one line of a file nobody read says nothing about the rest of
+        // it. Recording it here would turn `edit_file` into a way around the
+        // guard: one trivial edit, then a whole-file write over contents the
+        // session never saw.
+        ledger.touch(Path::new("/a"), at(1));
+        assert_eq!(ledger.state(Path::new("/a"), at(1)), ReadState::Never);
     }
 
     #[test]
     fn clones_share_one_record() {
         let ledger = ReadLedger::default();
         let other = ledger.clone();
-        page(&other, at(1), (1, 10, false));
+        other.record(Path::new("/a"), at(1));
         assert_eq!(ledger.state(Path::new("/a"), at(1)), ReadState::Current);
+    }
+
+    #[test]
+    fn a_deep_clone_keeps_what_was_recorded_and_diverges_after() {
+        let ledger = ReadLedger::default();
+        ledger.record(Path::new("/a"), at(1));
+        let forked = ledger.deep_clone();
+
+        forked.record(Path::new("/b"), at(1));
+
+        assert_eq!(forked.state(Path::new("/a"), at(1)), ReadState::Current);
+        assert_eq!(ledger.state(Path::new("/b"), at(1)), ReadState::Never);
     }
 }

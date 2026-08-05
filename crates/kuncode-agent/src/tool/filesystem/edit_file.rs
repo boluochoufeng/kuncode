@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use tokio::{fs::OpenOptions, io::AsyncReadExt};
 
 use super::helpers::{
-    io_error, non_empty_path, open_error, open_no_follow, revalidate_path, workspace_error,
-    write_no_follow,
+    io_error, modified_time, non_empty_path, open_error, open_no_follow, revalidate_path,
+    workspace_error, write_no_follow,
 };
 use crate::{
     permission::{
@@ -140,7 +140,7 @@ impl TypedTool for EditFile {
     async fn run_prepared(
         &self,
         prepared: PreparedEditFile,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
     ) -> ToolOutput<EditFileOutput> {
         let PreparedEditFile { args, path } = prepared;
         let mut file = match open_no_follow(&path, OpenOptions::new().read(true)).await {
@@ -182,6 +182,11 @@ impl TypedTool for EditFile {
         if let Err(err) = write_no_follow(&path, edited.as_bytes()).await {
             return open_error("write", &path, err, &self.workspace);
         }
+        // The change is the session's own, so it must not come back to
+        // `write_file` as somebody else's. Only an existing baseline moves —
+        // editing a file nobody read leaves it unread, since replacing one
+        // known snippet says nothing about the lines around it.
+        ctx.reads.touch(&path, modified_time(&path).await);
 
         ToolOutput::success(EditFileOutput {
             path: self.workspace.relative_display(&path),

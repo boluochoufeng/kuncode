@@ -276,7 +276,7 @@ mod tests {
         let session = AgentSession::new();
         let path = std::path::Path::new("/a");
 
-        session.read_ledger().record_write(path, None);
+        session.read_ledger().record(path, None);
 
         // The runner hands this handle to every tool call in the session, so a
         // read in one call has to be visible to a write in the next.
@@ -290,12 +290,10 @@ mod tests {
     fn a_cloned_session_does_not_inherit_the_right_to_overwrite() {
         let session = AgentSession::new();
         let path = std::path::Path::new("/a");
-        session.read_ledger().record_write(path, None);
+        session.read_ledger().record(path, None);
 
         let clone = session.clone();
-        clone
-            .read_ledger()
-            .record_write(std::path::Path::new("/b"), None);
+        clone.read_ledger().record(std::path::Path::new("/b"), None);
 
         // A clone is a separate timeline: it starts with what was read so far,
         // and what it reads afterwards must not license writes in the original.

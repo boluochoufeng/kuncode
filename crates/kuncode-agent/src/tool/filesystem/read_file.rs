@@ -265,17 +265,10 @@ impl TypedTool for ReadFile {
         let next_line = has_more.then_some(start_line + returned_lines);
         let truncated = !truncated_lines.is_empty();
 
-        // Only reads that together covered the whole file license a later
-        // whole-file write. Pages accumulate, so paginating through a long file
-        // eventually qualifies — a single page of it never does.
-        ctx.reads.record_read(
-            &resolved,
-            modified,
-            start_line,
-            returned_lines,
-            has_more,
-            truncated,
-        );
+        // Any read licenses a later whole-file write, including a single page
+        // of a long file — see [`ReadLedger`](crate::tool::ReadLedger) for why
+        // the bar is deliberately this low.
+        ctx.reads.record(&resolved, modified);
 
         let output = ToolOutput::success(ReadFileOutput {
             path: self.workspace.relative_display(&resolved),
