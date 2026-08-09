@@ -5,7 +5,8 @@
 //!
 //! - **Which address may be dialed.** The private `address` module vets the
 //!   resolved address, not the hostname, keeping the tool off cloud metadata and
-//!   private networks.
+//!   private networks. This client's system proxy discovery is disabled so every
+//!   target still passes through that resolver.
 //! - **Which origin was authorized.** A call is approved for one
 //!   [`CanonicalOrigin`], so a redirect that leaves it is reported back instead
 //!   of followed — the model can ask again for the new origin, and the user
@@ -170,7 +171,8 @@ impl WebFetch {
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
             .default_headers(headers)
-            .dns_resolver(address::GuardedResolver::from_environment())
+            .no_proxy()
+            .dns_resolver(address::GuardedResolver::new())
             .redirect(same_origin_redirects())
             .build()?;
         Ok(Self {

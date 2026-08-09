@@ -1231,7 +1231,8 @@ mod tests {
         assert_eq!(paths, ["weird", "weird/name.rs", "weird\\name.rs"]);
     }
 
-    #[cfg(unix)]
+    // Darwin rejects arbitrary non-UTF-8 path bytes before the tool can observe them.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn names_that_are_not_utf8_are_counted_instead_of_listed() {
         use std::{ffi::OsStr, os::unix::ffi::OsStrExt};

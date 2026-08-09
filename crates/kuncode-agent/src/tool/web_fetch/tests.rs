@@ -156,6 +156,92 @@ async fn fetch_with(arguments: serde_json::Value) -> ToolOutput {
         .expect("no harness-level error")
 }
 
+#[test]
+fn system_proxy_environment_is_ignored() {
+    const CHILD_ENV: &str = "KUNCODE_WEB_FETCH_NO_PROXY_TEST_CHILD";
+    const TEST_NAME: &str = "tool::web_fetch::tests::system_proxy_environment_is_ignored";
+
+    if std::env::var_os(CHILD_ENV).is_some() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime builds");
+        let output = runtime.block_on(fetch("http://kuncode-proxy-test.invalid/"));
+        assert!(!output.ok, "the reserved hostname must not reach a proxy");
+        return;
+    }
+
+    use std::io::{ErrorKind, Read as _, Write as _};
+    use std::process::Command;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
+    use std::time::Duration;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("proxy port binds");
+    listener
+        .set_nonblocking(true)
+        .expect("proxy listener becomes non-blocking");
+    let proxy_url = format!(
+        "http://{}",
+        listener.local_addr().expect("proxy has an address")
+    );
+    let contacted = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+    let server = {
+        let contacted = contacted.clone();
+        let stop = stop.clone();
+        thread::spawn(move || {
+            while !stop.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        contacted.store(true, Ordering::Release);
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(1)))
+                            .expect("proxy stream timeout is configured");
+                        let mut request = [0; 1024];
+                        let _ = stream.read(&mut request);
+                        let _ = stream.write_all(&response("200 OK", "text/plain", "proxied"));
+                        return;
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("proxy listener failed: {error}"),
+                }
+            }
+        })
+    };
+
+    // Environment variables are process-global, so a child process proves the
+    // client contract without racing the rest of this test binary.
+    let result = Command::new(std::env::current_exe().expect("test executable exists"))
+        .args(["--exact", TEST_NAME, "--nocapture"])
+        .env(CHILD_ENV, "1")
+        .env("ALL_PROXY", &proxy_url)
+        .env("all_proxy", &proxy_url)
+        .env("HTTP_PROXY", &proxy_url)
+        .env("http_proxy", &proxy_url)
+        .env("HTTPS_PROXY", &proxy_url)
+        .env("https_proxy", &proxy_url)
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy")
+        .output()
+        .expect("isolated test process starts");
+    stop.store(true, Ordering::Release);
+    server.join().expect("proxy listener stops cleanly");
+
+    assert!(
+        result.status.success(),
+        "isolated test failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        !contacted.load(Ordering::Acquire),
+        "web_fetch must not contact a process-configured proxy"
+    );
+}
+
 #[tokio::test]
 async fn plain_text_comes_back_verbatim() {
     let server =

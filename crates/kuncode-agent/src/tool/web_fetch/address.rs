@@ -9,23 +9,9 @@
 //! than to the hostname, so a public name that resolves (or re-resolves) inward
 //! is refused too.
 
-use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
-use url::Url;
-
-/// Environment variables reqwest reads to discover a proxy. Their hosts are
-/// exempt from [`is_blocked`]: the user configured them, and a corporate proxy
-/// legitimately lives on a private address.
-const PROXY_ENVIRONMENT_VARIABLES: [&str; 6] = [
-    "ALL_PROXY",
-    "all_proxy",
-    "HTTPS_PROXY",
-    "https_proxy",
-    "HTTP_PROXY",
-    "http_proxy",
-];
 
 /// Reports whether `ip` names an address `web_fetch` must never dial.
 ///
@@ -98,41 +84,24 @@ fn embedded_ipv4(address: Ipv6Addr) -> Option<Ipv4Addr> {
 /// hold under a redirect chain or a DNS record that answers publicly once and
 /// privately next: reqwest dials exactly the addresses returned here, so there
 /// is no second lookup to rebind.
-///
-/// A proxy moves the boundary. Its hostname is exempt (see
-/// [`PROXY_ENVIRONMENT_VARIABLES`]), and a proxied request resolves the *target*
-/// on the proxy's side, so a hostname target is no longer vetted here at all —
-/// only an IP-literal one is, and `web_fetch` checks those before it asks for
-/// approval.
-pub(super) struct GuardedResolver {
-    trusted_hosts: BTreeSet<String>,
-}
+pub(super) struct GuardedResolver;
 
 impl GuardedResolver {
-    /// Builds a resolver that exempts the proxies configured for this process.
-    pub(super) fn from_environment() -> Self {
-        Self {
-            trusted_hosts: PROXY_ENVIRONMENT_VARIABLES
-                .iter()
-                .filter_map(|name| std::env::var(name).ok())
-                .filter_map(|value| proxy_host(&value))
-                .collect(),
-        }
+    /// Builds the resolver used by the direct-only `web_fetch` client.
+    pub(super) fn new() -> Self {
+        Self
     }
 }
 
 impl Resolve for GuardedResolver {
     fn resolve(&self, name: Name) -> Resolving {
         let host = name.as_str().to_ascii_lowercase();
-        let trusted = self.trusted_hosts.contains(&host);
         Box::pin(async move {
             // Port 0: reqwest substitutes the URL's port, or the scheme default.
             let resolved = tokio::net::lookup_host((host.as_str(), 0))
                 .await?
                 .collect::<Vec<SocketAddr>>();
-            if !trusted
-                && let Some(blocked) = resolved.iter().find(|address| is_blocked(address.ip()))
-            {
+            if let Some(blocked) = resolved.iter().find(|address| is_blocked(address.ip())) {
                 // One blocked answer fails the whole lookup instead of being
                 // filtered out, so a record that mixes a public address with an
                 // internal one cannot get the internal one dialed on a retry.
@@ -145,19 +114,6 @@ impl Resolve for GuardedResolver {
             Ok(Box::new(resolved.into_iter()) as Addrs)
         })
     }
-}
-
-/// Extracts the host from a proxy environment value, accepting the bare
-/// `host:port` form those variables are also written in.
-fn proxy_host(value: &str) -> Option<String> {
-    let value = value.trim();
-    if value.is_empty() {
-        return None;
-    }
-    let parsed = Url::parse(value)
-        .or_else(|_| Url::parse(&format!("http://{value}")))
-        .ok()?;
-    parsed.host_str().map(str::to_ascii_lowercase)
 }
 
 #[cfg(test)]
@@ -209,15 +165,5 @@ mod tests {
         ] {
             assert!(!blocked(address), "{address} should be reachable");
         }
-    }
-
-    #[test]
-    fn proxy_values_yield_a_host_in_both_spellings() {
-        assert_eq!(
-            proxy_host("http://Proxy.Corp.Internal:8080"),
-            Some("proxy.corp.internal".to_string())
-        );
-        assert_eq!(proxy_host("127.0.0.1:7890"), Some("127.0.0.1".to_string()));
-        assert_eq!(proxy_host("   "), None);
     }
 }

@@ -35,11 +35,8 @@ kuncode-cli ──▶ kuncode-agent ──▶ kuncode-core ──▶ LLM API
 export DEEPSEEK_API_KEY="your-api-key"
 ```
 
-项目会自动读取当前目录下的 `.env`，因此也可以将变量写入本地 `.env`：
-
-```dotenv
-DEEPSEEK_API_KEY=your-api-key
-```
+KunCode 只读取启动进程已有的环境变量，不会自动加载工作区中的 `.env`。
+请在 shell、终端配置或可信的进程管理器中注入密钥，避免未受信项目改变网络与运行时配置。
 
 使用 OpenAI 官方接口时，在 `.kuncode/settings.json` 配置：
 
