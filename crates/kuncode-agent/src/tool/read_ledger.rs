@@ -14,9 +14,18 @@
 //! clipped the same line again, so no sequence of calls left the file writable.
 //! A guard meant to be satisfied by the caller's next move has to leave a move
 //! that satisfies it.
+//!
+//! Seeing does not last forever: compaction can drop the tool result that
+//! carried a file's contents out of the active context, after which the session
+//! "knows" the file only as a summary's paraphrase. Each sighting therefore
+//! remembers the tool call that witnessed it, and when the active context is
+//! replaced the session [evicts](ReadLedger::evict_unwitnessed) every sighting
+//! whose witness is gone. Evicted entries are kept, not removed, so the refusal
+//! can say what actually happened — "read, then compacted away" — instead of
+//! the false "never read".
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::Metadata,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, PoisonError},
@@ -30,6 +39,9 @@ pub enum ReadState {
     Never,
     /// Seen, then changed on disk, so what was seen is no longer what is there.
     Stale,
+    /// Seen, and the disk still matches — but the reading itself was compacted
+    /// out of the conversation, so what was seen is no longer in view.
+    Evicted,
     /// Seen, and unchanged since.
     Current,
 }
@@ -72,6 +84,23 @@ impl FileStamp {
     }
 }
 
+/// One file the session has seen: how it stood, and which tool result still
+/// testifies to that in the conversation.
+#[derive(Clone, Debug)]
+struct Sighting {
+    stamp: FileStamp,
+    /// Id of the tool call whose result carried this sighting into the
+    /// conversation. Exchanges are compacted as closed units, so this id
+    /// appearing among the active tool results means the whole exchange —
+    /// a read's returned contents, or a write's supplied contents — is still
+    /// in view. `None` when the recording context named no call; such a
+    /// sighting has no testimony to point at and does not survive eviction.
+    witness: Option<Arc<str>>,
+    /// Set once the witnessing result left the active context: the file was
+    /// seen, but what was seen is no longer in view.
+    evicted: bool,
+}
+
 /// Shared record of the files a session has seen, and how each stood when it
 /// saw them.
 ///
@@ -82,14 +111,33 @@ impl FileStamp {
 /// ledger attached to no session, so tests and non-interactive callers get a
 /// usable target that simply records nothing anyone else will read.
 #[derive(Clone, Debug, Default)]
-pub struct ReadLedger(Arc<Mutex<HashMap<PathBuf, FileStamp>>>);
+pub struct ReadLedger {
+    seen: Arc<Mutex<HashMap<PathBuf, Sighting>>>,
+    /// Witness stamped into sightings recorded through this handle. The runner
+    /// binds each tool call's id via [`Self::witnessed_by`]; the session's own
+    /// handle, and plain [`Default`] ledgers, record without one.
+    witness: Option<Arc<str>>,
+}
 
 impl ReadLedger {
     /// Recovers the guard even if a previous holder panicked, for the reason
     /// [`TodoHandle::lock`](crate::todo::TodoHandle) does: the critical sections
     /// are trivial, and a poison error is not something a caller could act on.
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<PathBuf, FileStamp>> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<PathBuf, Sighting>> {
+        self.seen.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// A handle onto the same records whose future recordings name `call_id`
+    /// as their witness.
+    ///
+    /// The runner binds the id of the tool call it is about to execute, so a
+    /// sighting recorded by that call can later be matched against the tool
+    /// results still present in the active context.
+    pub fn witnessed_by(&self, call_id: &str) -> Self {
+        Self {
+            seen: Arc::clone(&self.seen),
+            witness: Some(Arc::from(call_id)),
+        }
     }
 
     /// Notes that the session has seen `path` as `stamp` describes it.
@@ -101,8 +149,18 @@ impl ReadLedger {
     /// Writing counts as seeing: a caller that supplied a file's contents whole
     /// knows them as surely as one that read them, and without this, writing the
     /// same file twice in a session would be refused the second time.
+    ///
+    /// Recording replaces the previous sighting outright, eviction included:
+    /// re-reading is precisely the move that answers an evicted entry.
     pub fn record(&self, path: &Path, stamp: FileStamp) {
-        self.lock().insert(path.to_path_buf(), stamp);
+        self.lock().insert(
+            path.to_path_buf(),
+            Sighting {
+                stamp,
+                witness: self.witness.clone(),
+                evicted: false,
+            },
+        );
     }
 
     /// Notes that `path` now stands at `stamp` after a call that changed part
@@ -114,21 +172,57 @@ impl ReadLedger {
     /// replacing the whole. What it must not do is leave the baseline
     /// describing a file its own write just changed, which would report the
     /// session's own edit back to it as somebody else's.
+    ///
+    /// Only the stamp moves. The witness stays with the read (or write) that
+    /// saw the file whole — an edit's exchange carries `old_text`, not the
+    /// file — and an eviction stays too, for the same reason: touching part of
+    /// a forgotten file does not bring the rest back into view.
     pub fn touch(&self, path: &Path, stamp: FileStamp) {
-        if let Some(baseline) = self.lock().get_mut(path) {
-            *baseline = stamp;
+        if let Some(sighting) = self.lock().get_mut(path) {
+            sighting.stamp = stamp;
         }
     }
 
     /// What is known about `path`, given how it stands right now.
+    ///
+    /// A change on disk outranks an eviction: both demand a re-read, but the
+    /// disk having moved is the fact the caller cannot infer from its own
+    /// history, so it is the one reported.
     pub fn state(&self, path: &Path, now: FileStamp) -> ReadState {
-        let Some(seen) = self.lock().get(path).copied() else {
+        let Some(sighting) = self.lock().get(path).cloned() else {
             return ReadState::Never;
         };
-        if seen.differs_from(&now) {
+        if sighting.stamp.differs_from(&now) {
             ReadState::Stale
+        } else if sighting.evicted {
+            ReadState::Evicted
         } else {
             ReadState::Current
+        }
+    }
+
+    /// Downgrades every sighting whose witness is not in `witnessed`.
+    ///
+    /// The session calls this after replacing its active context (compaction):
+    /// a sighting whose witnessing tool result no longer appears there — or
+    /// that never had a witness to look for — stops licensing whole-file
+    /// writes, because the contents it vouched for are now known only as a
+    /// summary's paraphrase. The entry itself stays, so the refusal can name
+    /// the eviction instead of denying the read ever happened, and so a later
+    /// disk change is still told apart as [`ReadState::Stale`].
+    ///
+    /// An id that does appear is trusted to carry its contents: lossy
+    /// slimming rewrites only `Slimmable` results, and no file-content tool
+    /// marks its results that way — a coupling this check depends on.
+    pub(crate) fn evict_unwitnessed(&self, witnessed: &HashSet<&str>) {
+        for sighting in self.lock().values_mut() {
+            let stands = sighting
+                .witness
+                .as_deref()
+                .is_some_and(|witness| witnessed.contains(witness));
+            if !stands {
+                sighting.evicted = true;
+            }
         }
     }
 
@@ -141,7 +235,10 @@ impl ReadLedger {
     /// cloned session is a separate timeline, and what one of them read says
     /// nothing about what the other may overwrite.
     pub fn deep_clone(&self) -> Self {
-        Self(Arc::new(Mutex::new(self.lock().clone())))
+        Self {
+            seen: Arc::new(Mutex::new(self.lock().clone())),
+            witness: self.witness.clone(),
+        }
     }
 }
 
@@ -271,6 +368,132 @@ mod tests {
         assert_eq!(
             ledger.state(Path::new("/a"), stamp(1, 10)),
             ReadState::Never
+        );
+    }
+
+    #[test]
+    fn eviction_downgrades_a_sighting_whose_witness_is_gone() {
+        let ledger = ReadLedger::default();
+        ledger
+            .witnessed_by("call-1")
+            .record(Path::new("/a"), stamp(1, 10));
+
+        // No tool result survived into the new active context.
+        ledger.evict_unwitnessed(&HashSet::new());
+
+        assert_eq!(
+            ledger.state(Path::new("/a"), stamp(1, 10)),
+            ReadState::Evicted
+        );
+    }
+
+    #[test]
+    fn a_sighting_whose_witness_survives_stays_current() {
+        let ledger = ReadLedger::default();
+        ledger
+            .witnessed_by("call-1")
+            .record(Path::new("/a"), stamp(1, 10));
+
+        ledger.evict_unwitnessed(&HashSet::from(["call-1"]));
+
+        assert_eq!(
+            ledger.state(Path::new("/a"), stamp(1, 10)),
+            ReadState::Current
+        );
+    }
+
+    #[test]
+    fn a_sighting_recorded_without_a_witness_does_not_survive_eviction() {
+        let ledger = ReadLedger::default();
+        // Recorded through an unbound handle: there is no testimony to look
+        // for, so a context replacement must stop it licensing whole writes.
+        ledger.record(Path::new("/a"), stamp(1, 10));
+
+        ledger.evict_unwitnessed(&HashSet::from(["call-1"]));
+
+        assert_eq!(
+            ledger.state(Path::new("/a"), stamp(1, 10)),
+            ReadState::Evicted
+        );
+    }
+
+    #[test]
+    fn re_reading_after_eviction_restores_current() {
+        let ledger = ReadLedger::default();
+        ledger
+            .witnessed_by("call-1")
+            .record(Path::new("/a"), stamp(1, 10));
+        ledger.evict_unwitnessed(&HashSet::new());
+
+        // The move an evicted refusal asks for.
+        ledger
+            .witnessed_by("call-2")
+            .record(Path::new("/a"), stamp(1, 10));
+
+        assert_eq!(
+            ledger.state(Path::new("/a"), stamp(1, 10)),
+            ReadState::Current
+        );
+    }
+
+    #[test]
+    fn a_disk_change_outranks_an_eviction() {
+        let ledger = ReadLedger::default();
+        ledger
+            .witnessed_by("call-1")
+            .record(Path::new("/a"), stamp(1, 10));
+        ledger.evict_unwitnessed(&HashSet::new());
+
+        // Both facts hold; the one the caller cannot infer from its own
+        // history is the one reported.
+        assert_eq!(
+            ledger.state(Path::new("/a"), stamp(2, 10)),
+            ReadState::Stale
+        );
+    }
+
+    #[test]
+    fn touching_an_evicted_sighting_does_not_bring_it_back() {
+        let ledger = ReadLedger::default();
+        ledger
+            .witnessed_by("call-1")
+            .record(Path::new("/a"), stamp(1, 10));
+        ledger.evict_unwitnessed(&HashSet::new());
+
+        // What `edit_file` does after compaction: the edit lands and moves the
+        // baseline, but the rest of the file is still out of view.
+        ledger.touch(Path::new("/a"), stamp(2, 40));
+
+        assert_eq!(
+            ledger.state(Path::new("/a"), stamp(2, 40)),
+            ReadState::Evicted
+        );
+    }
+
+    #[test]
+    fn touch_leaves_the_witness_with_the_original_read() {
+        let ledger = ReadLedger::default();
+        ledger
+            .witnessed_by("read-call")
+            .record(Path::new("/a"), stamp(1, 10));
+        // An edit exchange carries `old_text`, not the file, so touching
+        // through a differently-bound handle moves the stamp only.
+        ledger
+            .witnessed_by("edit-call")
+            .touch(Path::new("/a"), stamp(2, 40));
+
+        // The read's testimony keeps the sighting standing…
+        ledger.evict_unwitnessed(&HashSet::from(["read-call"]));
+        assert_eq!(
+            ledger.state(Path::new("/a"), stamp(2, 40)),
+            ReadState::Current
+        );
+
+        // …and the edit's alone does not.
+        ledger.evict_unwitnessed(&HashSet::from(["edit-call"]));
+        assert_eq!(
+            ledger.state(Path::new("/a"), stamp(2, 40)),
+            ReadState::Evicted
         );
     }
 

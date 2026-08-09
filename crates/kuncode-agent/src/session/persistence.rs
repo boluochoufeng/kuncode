@@ -4,6 +4,10 @@
 //! acknowledged frontiers remain observable for diagnostics, but cannot justify
 //! later compaction or reattachment.
 
+use std::collections::HashSet;
+
+use kuncode_core::completion::{Message, UserContent};
+
 use super::{AgentSession, PreparedActiveContext};
 use crate::session_store::{
     CommittedCompaction, NewSession, Seq, SessionId, SessionStore, SessionStoreError,
@@ -161,6 +165,13 @@ impl AgentSession {
         self.message_lineage = prepared.lineage;
         self.active_summary = prepared.summary;
         self.last_durable_seq = Some(committed_head);
+        // The lossy candidate just replaced the conversation, so a file whose
+        // reading went out with the summary is now known here only as a
+        // paraphrase — and a whole-file write from a paraphrase is exactly the
+        // blind overwrite the ledger exists to refuse. Downgrade every sighting
+        // whose witnessing tool result did not survive into the new context.
+        self.reads
+            .evict_unwitnessed(&witnessed_result_ids(&self.messages));
         Ok(())
     }
 
@@ -188,6 +199,27 @@ impl AgentSession {
     pub(crate) fn take_persistence_error(&mut self) -> Option<String> {
         self.persistence_error.take()
     }
+}
+
+/// Ids of the tool results present in `messages`.
+///
+/// Compaction retains or drops an assistant request and its results as one
+/// closed group, so a result id appearing here proves the whole exchange —
+/// including the contents a read returned or a write supplied — is still in
+/// the active context.
+fn witnessed_result_ids(messages: &[Message]) -> HashSet<&str> {
+    messages
+        .iter()
+        .filter_map(|message| match message {
+            Message::User { content } => Some(content.iter()),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|block| match block {
+            UserContent::ToolResult(result) => Some(result.id.as_str()),
+            UserContent::Text(_) => None,
+        })
+        .collect()
 }
 
 /// Rejects in-memory appends that would bypass an attached journal.

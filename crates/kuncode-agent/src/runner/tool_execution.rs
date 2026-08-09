@@ -38,10 +38,13 @@ where
         let mut feedback = Vec::new();
 
         for index in 0..tool_calls.len() {
+            let id = tool_calls[index].id.clone();
+            // The ledger handle is bound to this call's id, so a file sighting
+            // it records can later be matched against the tool results still in
+            // the active context — and evicted when compaction drops this one.
             let ctx = ToolContext::with_cancel(cancel.clone())
                 .with_todos(session.todo_handle())
-                .with_reads(session.read_ledger());
-            let id = tool_calls[index].id.clone();
+                .with_reads(session.read_ledger().witnessed_by(&id));
             let call_id = tool_calls[index].call_id.clone();
             let name = tool_calls[index].name.clone();
             let arguments = tool_calls[index].arguments.clone();
