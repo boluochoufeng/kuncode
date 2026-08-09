@@ -1,11 +1,22 @@
-use std::{process::Stdio, time::Duration};
+//! Executes approved shell commands with bounded output and descendant cleanup.
+
+use std::{
+    io,
+    process::{ExitStatus, Stdio},
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use kuncode_core::completion::ToolDefinition;
 use kuncode_core::non_empty_vec::NonEmptyVec;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use tokio::{process::Command, time::timeout};
+use thiserror::Error;
+use tokio::{
+    io::{AsyncRead, AsyncReadExt},
+    process::{Child, ChildStderr, ChildStdout, Command},
+    time::timeout,
+};
 
 use crate::{
     permission::{
@@ -67,6 +78,57 @@ impl Bash {
     pub fn workspace(&self) -> &Workspace {
         &self.workspace
     }
+
+    async fn run_command(&self, cmd: String, command_timeout: Duration) -> ToolOutput<BashOutput> {
+        let mut command = Command::new("bash");
+        command
+            .arg("-lc")
+            .arg(&cmd)
+            .current_dir(self.workspace.root())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+
+        let output = match capture_command(command, command_timeout).await {
+            Ok(output) => output,
+            Err(error) => {
+                let kind = match error {
+                    CommandExecutionError::Execution(_) => "execution",
+                    CommandExecutionError::Timeout { .. } => "timeout",
+                };
+                return ToolOutput::failure(kind, error.to_string());
+            }
+        };
+
+        let (stdout, stdout_truncated) = output_text("stdout", &output.stdout);
+        let (stderr, stderr_truncated) = output_text("stderr", &output.stderr);
+        let truncated = stdout_truncated || stderr_truncated;
+        let ok = output.status.success();
+        let exit_code = output.status.code();
+
+        ToolOutput {
+            ok,
+            data: Some(BashOutput {
+                cmd,
+                exit_code,
+                stdout,
+                stderr,
+            }),
+            error: if ok {
+                None
+            } else {
+                Some(ToolErrorPayload {
+                    kind: "non_zero_exit".into(),
+                    message: match exit_code {
+                        Some(code) => format!("command exited with status {code}"),
+                        None => "command terminated by signal".to_string(),
+                    },
+                })
+            },
+            truncated,
+        }
+    }
 }
 
 #[async_trait]
@@ -110,80 +172,202 @@ impl TypedTool for Bash {
     }
 
     async fn run_prepared(&self, prepared: BashArgs, _ctx: &ToolContext) -> ToolOutput<BashOutput> {
-        let cmd = prepared.cmd;
+        self.run_command(prepared.cmd, COMMAND_TIMEOUT).await
+    }
+}
 
-        let mut command = Command::new("bash");
-        command
-            .arg("-lc")
-            .arg(&cmd)
-            .current_dir(self.workspace.root())
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
+#[derive(Debug, Error)]
+enum CommandExecutionError {
+    #[error("failed to run command: {0}")]
+    Execution(#[source] io::Error),
+    #[error("command exceeded {seconds} seconds")]
+    Timeout { seconds: u64 },
+}
 
-        let output = match timeout(COMMAND_TIMEOUT, command.output()).await {
-            Ok(Ok(output)) => output,
-            Ok(Err(err)) => {
-                return ToolOutput::failure("execution", format!("failed to run command: {err}"));
-            }
-            Err(_) => {
-                return ToolOutput::failure(
-                    "timeout",
-                    format!("command exceeded {} seconds", COMMAND_TIMEOUT.as_secs()),
-                );
-            }
-        };
+#[derive(Debug)]
+struct CapturedCommand {
+    status: ExitStatus,
+    stdout: CapturedStream,
+    stderr: CapturedStream,
+}
 
-        let (stdout, stdout_truncated) = output_text("stdout", &output.stdout);
-        let (stderr, stderr_truncated) = output_text("stderr", &output.stderr);
-        let truncated = stdout_truncated || stderr_truncated;
-        let ok = output.status.success();
-        let exit_code = output.status.code();
+#[derive(Debug)]
+struct CapturedStream {
+    prefix: Vec<u8>,
+    total_bytes: u64,
+}
 
-        ToolOutput {
-            ok,
-            data: Some(BashOutput {
-                cmd,
-                exit_code,
-                stdout,
-                stderr,
-            }),
-            error: if ok {
-                None
-            } else {
-                Some(ToolErrorPayload {
-                    kind: "non_zero_exit".into(),
-                    message: match exit_code {
-                        Some(code) => format!("command exited with status {code}"),
-                        None => "command terminated by signal".to_string(),
-                    },
-                })
-            },
-            truncated,
+impl CapturedStream {
+    fn truncated(&self) -> bool {
+        self.total_bytes > self.prefix.len() as u64
+    }
+}
+
+struct ManagedChild {
+    child: Child,
+    cleanup_armed: bool,
+    #[cfg(unix)]
+    process_group: Option<libc::pid_t>,
+}
+
+impl ManagedChild {
+    fn new(child: Child) -> Self {
+        #[cfg(unix)]
+        let process_group = child.id().and_then(|id| libc::pid_t::try_from(id).ok());
+
+        Self {
+            child,
+            cleanup_armed: true,
+            #[cfg(unix)]
+            process_group,
+        }
+    }
+
+    fn take_stdout(&mut self) -> Option<ChildStdout> {
+        self.child.stdout.take()
+    }
+
+    fn take_stderr(&mut self) -> Option<ChildStderr> {
+        self.child.stderr.take()
+    }
+
+    async fn wait(&mut self) -> io::Result<ExitStatus> {
+        self.child.wait().await
+    }
+
+    fn signal_termination(&mut self) {
+        #[cfg(unix)]
+        if let Some(process_group) = self.process_group {
+            // SAFETY: `process_group` is the positive PID assigned by the OS to
+            // the child and configured as its PGID before spawn. `killpg` only
+            // reads these scalar arguments and targets that isolated group.
+            let _ = unsafe { libc::killpg(process_group, libc::SIGKILL) };
+        }
+
+        // Keep this fallback on Unix too: if the group signal races process
+        // setup or fails, Tokio can still terminate the direct child.
+        let _ = self.child.start_kill();
+    }
+
+    async fn terminate_and_reap(&mut self) {
+        self.signal_termination();
+        let _ = self.child.wait().await;
+        self.cleanup_armed = false;
+    }
+
+    fn disarm(&mut self) {
+        self.cleanup_armed = false;
+    }
+}
+
+impl Drop for ManagedChild {
+    fn drop(&mut self) {
+        if self.cleanup_armed {
+            self.signal_termination();
         }
     }
 }
 
-/// Decodes a captured stream, capping it at `OUTPUT_LIMIT_BYTES`. Bash output
-/// may not be valid UTF-8, so decoding is intentionally lossy (`from_utf8_lossy`).
+async fn capture_command(
+    mut command: Command,
+    command_timeout: Duration,
+) -> Result<CapturedCommand, CommandExecutionError> {
+    // A separate process group lets cancellation and timeout include shell
+    // pipelines, background jobs, and grandchildren rather than only `bash`.
+    #[cfg(unix)]
+    command.process_group(0);
+
+    let child = command.spawn().map_err(CommandExecutionError::Execution)?;
+    let mut child = ManagedChild::new(child);
+    let Some(stdout) = child.take_stdout() else {
+        child.terminate_and_reap().await;
+        return Err(CommandExecutionError::Execution(io::Error::other(
+            "stdout pipe was not captured",
+        )));
+    };
+    let Some(stderr) = child.take_stderr() else {
+        child.terminate_and_reap().await;
+        return Err(CommandExecutionError::Execution(io::Error::other(
+            "stderr pipe was not captured",
+        )));
+    };
+
+    let capture = async {
+        // Leave the direct child unreaped until both pipes reach EOF. Its PID
+        // therefore cannot be reused while cleanup still addresses the PGID.
+        let (stdout, stderr) = tokio::try_join!(capture_stream(stdout), capture_stream(stderr))?;
+        let status = child.wait().await?;
+        Ok::<_, io::Error>(CapturedCommand {
+            status,
+            stdout,
+            stderr,
+        })
+    };
+
+    match timeout(command_timeout, capture).await {
+        Ok(Ok(output)) => {
+            child.disarm();
+            Ok(output)
+        }
+        Ok(Err(error)) => {
+            child.terminate_and_reap().await;
+            Err(CommandExecutionError::Execution(error))
+        }
+        Err(_) => {
+            child.terminate_and_reap().await;
+            Err(CommandExecutionError::Timeout {
+                seconds: command_timeout.as_secs(),
+            })
+        }
+    }
+}
+
+async fn capture_stream<R>(mut reader: R) -> io::Result<CapturedStream>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut prefix = Vec::with_capacity(OUTPUT_LIMIT_BYTES);
+    let mut total_bytes = 0_u64;
+    let mut chunk = [0_u8; 8 * 1024];
+
+    loop {
+        let read = reader.read(&mut chunk).await?;
+        if read == 0 {
+            break;
+        }
+        total_bytes = total_bytes.saturating_add(read as u64);
+        let retained = (OUTPUT_LIMIT_BYTES - prefix.len()).min(read);
+        prefix.extend_from_slice(&chunk[..retained]);
+    }
+
+    Ok(CapturedStream {
+        prefix,
+        total_bytes,
+    })
+}
+
+/// Decodes a stream whose retained prefix is capped at `OUTPUT_LIMIT_BYTES`.
+/// Bash output may not be valid UTF-8, so decoding is intentionally lossy
+/// (`from_utf8_lossy`).
 ///
 /// When the cap trips, a visible marker is appended naming the stream and the
 /// byte scale, so the model knows it holds only the head of the stream and must
 /// not assume it saw everything. How to get the rest (filter, redirect, re-run)
 /// is left to the model — bash is a general shell.
-fn output_text(stream: &str, bytes: &[u8]) -> (String, bool) {
-    if bytes.len() <= OUTPUT_LIMIT_BYTES {
-        return (String::from_utf8_lossy(bytes).into_owned(), false);
+fn output_text(stream: &str, captured: &CapturedStream) -> (String, bool) {
+    if !captured.truncated() {
+        return (
+            String::from_utf8_lossy(&captured.prefix).into_owned(),
+            false,
+        );
     }
 
-    // Slicing a byte slice at an arbitrary index never splits a `char` (that is
-    // a `str` concern); `from_utf8_lossy` turns any partial trailing sequence
-    // into U+FFFD, so the result is always valid UTF-8.
-    let mut text = String::from_utf8_lossy(&bytes[..OUTPUT_LIMIT_BYTES]).into_owned();
+    // The retained byte prefix may end inside a code point; `from_utf8_lossy`
+    // turns that partial trailing sequence into U+FFFD.
+    let mut text = String::from_utf8_lossy(&captured.prefix).into_owned();
     text.push_str(&format!(
         "\n…⟨kuncode: {stream} truncated — showed first {OUTPUT_LIMIT_BYTES} of {total} bytes⟩",
-        total = bytes.len(),
+        total = captured.total_bytes,
     ));
     (text, true)
 }
@@ -334,10 +518,15 @@ fn is_dynamic_shell_command(command: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Duration};
 
-    use super::{Bash, simple_command_chain};
+    use tokio::io::AsyncReadExt;
+
+    use super::{
+        Bash, CapturedStream, OUTPUT_LIMIT_BYTES, capture_stream, output_text, simple_command_chain,
+    };
     use crate::{
+        test_support::TestDir,
         tool::{Tool, ToolContext, execute_for_test},
         workspace::Workspace,
     };
@@ -425,6 +614,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_capture_retains_only_the_bounded_prefix() {
+        let total_bytes = (OUTPUT_LIMIT_BYTES as u64) * 50;
+        let input = tokio::io::repeat(b'x').take(total_bytes);
+
+        let captured = capture_stream(input)
+            .await
+            .expect("in-memory stream should be readable");
+
+        assert_eq!(captured.prefix.len(), OUTPUT_LIMIT_BYTES);
+        assert_eq!(captured.total_bytes, total_bytes);
+        assert!(captured.prefix.iter().all(|byte| *byte == b'x'));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drains_large_stdout_and_stderr_concurrently() {
+        let bash = bash().await;
+        let out = bash
+            .run_command(
+                "(head -c 2000000 /dev/zero | tr '\\000' o) & \
+                 (head -c 2000000 /dev/zero | tr '\\000' e >&2) & wait"
+                    .to_string(),
+                super::COMMAND_TIMEOUT,
+            )
+            .await;
+
+        assert!(out.ok);
+        assert!(out.truncated);
+        let data = out.data.expect("data present");
+        assert!(data.stdout.starts_with(&"o".repeat(OUTPUT_LIMIT_BYTES)));
+        assert!(data.stdout.contains("of 2000000 bytes"));
+        assert!(data.stderr.starts_with(&"e".repeat(OUTPUT_LIMIT_BYTES)));
+        assert!(data.stderr.contains("of 2000000 bytes"));
+    }
+
+    #[test]
+    fn output_decoding_remains_lossy_without_rewriting_controls() {
+        let captured = CapturedStream {
+            prefix: vec![b'a', 0xff, 0x1b],
+            total_bytes: 3,
+        };
+
+        assert_eq!(output_text("stdout", &captured), ("a�\u{1b}".into(), false));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_terminates_descendants() {
+        let tmp = TestDir::new();
+        let bash = Bash::new(tmp.workspace().await);
+        let out = bash
+            .run_command(
+                "(printf ready > started; \
+                 while [ ! -e release ]; do sleep 0.01; done; \
+                 printf survived > descendant-survived) & wait"
+                    .to_string(),
+                Duration::from_secs(1),
+            )
+            .await;
+
+        assert!(!out.ok);
+        assert_eq!(out.error.expect("error payload").kind.as_str(), "timeout");
+        assert!(tmp.path().join("started").exists());
+        release_and_assert_descendant_stopped(&tmp).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_terminates_descendants() {
+        let tmp = TestDir::new();
+        let bash = Arc::new(Bash::new(tmp.workspace().await));
+        let task = tokio::spawn({
+            let bash = Arc::clone(&bash);
+            async move {
+                bash.run_command(
+                    "(printf ready > started; \
+                     while [ ! -e release ]; do sleep 0.01; done; \
+                     printf survived > descendant-survived) & wait"
+                        .to_string(),
+                    Duration::from_secs(30),
+                )
+                .await
+            }
+        });
+
+        wait_for_path(&tmp.path().join("started")).await;
+        task.abort();
+        assert!(
+            task.await
+                .expect_err("aborted execution should be cancelled")
+                .is_cancelled()
+        );
+        release_and_assert_descendant_stopped(&tmp).await;
+    }
+
+    #[tokio::test]
     async fn runs_commands_from_workspace_root() {
         let workspace = Workspace::new(std::env::current_dir().expect("current directory exists"))
             .await
@@ -477,5 +762,27 @@ mod tests {
         ] {
             assert_eq!(simple_command_chain(command), None, "{command}");
         }
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_path(path: &std::path::Path) {
+        for _ in 0..200 {
+            if path.exists() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("{} should have been created", path.display());
+    }
+
+    #[cfg(unix)]
+    async fn release_and_assert_descendant_stopped(tmp: &TestDir) {
+        std::fs::write(tmp.path().join("release"), b"go").expect("release gate should be created");
+        let survivor = tmp.path().join("descendant-survived");
+        for _ in 0..100 {
+            assert!(!survivor.exists(), "descendant survived process-group kill");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!survivor.exists(), "descendant survived process-group kill");
     }
 }

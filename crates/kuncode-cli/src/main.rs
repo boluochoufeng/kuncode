@@ -49,7 +49,6 @@ pub(crate) struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    dotenvy::dotenv().ok();
     // Keep the non-blocking writer alive until every async task has stopped so
     // shutdown flushes the final turn/error records before the process exits.
     let _logging_guard = logging::init(std::env::current_dir().ok().as_deref());

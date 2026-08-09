@@ -1894,7 +1894,6 @@ dependencies = [
  "async-trait",
  "clap",
  "crossterm",
- "dotenvy",
  "futures-util",
  "kuncode-agent",
  "kuncode-core",

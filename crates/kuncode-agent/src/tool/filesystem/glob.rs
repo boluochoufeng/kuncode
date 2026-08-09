@@ -623,7 +623,8 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    // Darwin rejects arbitrary non-UTF-8 path bytes before the tool can observe them.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn names_that_are_not_utf8_are_counted_as_unconsidered() {
         use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
