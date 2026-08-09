@@ -249,10 +249,14 @@ impl TypedTool for ReadFile {
             // model can see *which* line lost its tail and that re-reading will
             // not bring it back. The marker is metadata, not file content.
             //
-            // TODO(read_file): horizontal truncation is lossy and unpaginable.
-            // Revisit whether a better scheme — e.g. Roo-style continuation
-            // sub-lines (`41.1`, `41.2`) that fold the tail back onto the
-            // vertical pagination axis — is worth the line-numbering complexity.
+            // Lossy-and-unpaginable is deliberate, and industry-wide: mainstream
+            // agent CLIs all drop overlong tails the same way and point the model
+            // at grep. The one lossless precedent (DeepAgents' continuation
+            // sub-lines `41.1`, `41.2`) recovers tails — near-always minified
+            // output — at the price of line numbers that don't exist in the
+            // file. Not worth it. The cap is bytes, not chars, on purpose: it
+            // bounds token cost uniformly across scripts and stays on the same
+            // axis as `READ_LIMIT_BYTES`.
             if line_truncated {
                 truncated_lines.push(start_line + collected.len());
                 line.push_str(&line_truncated_marker(raw_bytes - line.len()));
