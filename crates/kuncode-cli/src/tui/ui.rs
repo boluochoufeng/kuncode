@@ -138,14 +138,17 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
     }
 
     let state = match app.status {
-        Status::Idle => Line::from(vec![Span::styled("●", theme.success()), Span::raw(" 就绪")]),
+        Status::Idle => Line::from(vec![
+            Span::styled("●", theme.success()),
+            Span::raw(" Ready"),
+        ]),
         Status::Running => Line::from(vec![
             Span::styled(app.activity_glyph(), theme.accent()),
-            Span::raw(" 处理中"),
+            Span::raw(" Working"),
         ]),
         Status::Compacting => Line::from(vec![
             Span::styled(app.activity_glyph(), theme.warning()),
-            Span::raw(" 整理上下文"),
+            Span::raw(" Compacting"),
         ]),
     };
     let brand_width = 12u16.min(area.width);
@@ -177,7 +180,7 @@ fn draw_plan(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
         .into_iter()
         .map(|task| plan_item_line(task, inner_width, theme))
         .collect();
-    let title = format!(" 计划 {completed}/{} ", app.plan.len());
+    let title = format!(" Plan {completed}/{} ", app.plan.len());
     let panel = Paragraph::new(Text::from(rows)).block(
         Block::new()
             .borders(Borders::TOP)
@@ -236,9 +239,9 @@ fn input_height(app: &App, width: u16) -> u16 {
 
 fn draw_input(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
     let title = match app.status {
-        Status::Idle => " 提问 ",
-        Status::Running => " 处理中 ",
-        Status::Compacting => " 整理上下文 ",
+        Status::Idle => " Prompt ",
+        Status::Running => " Working ",
+        Status::Compacting => " Compacting ",
     };
     let block = Block::bordered()
         .title(Line::from(title).style(if app.status == Status::Idle {
@@ -297,9 +300,9 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
 
     let content = if app.input.is_empty() {
         let placeholder = match app.status {
-            Status::Idle => "描述你想完成的任务",
-            Status::Running => "等待当前任务完成",
-            Status::Compacting => "正在整理会话上下文",
+            Status::Idle => "Describe what you want to get done",
+            Status::Running => "Waiting for the current turn to finish",
+            Status::Compacting => "Compacting session context",
         };
         Text::from(Line::from(placeholder).style(theme.muted()))
     } else {
@@ -367,7 +370,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
         let [left, right] =
             Layout::horizontal([Constraint::Length(left_width), Constraint::Min(0)]).areas(area);
         frame.render_widget(
-            Paragraph::new(Line::from("↑ 较早内容").style(theme.warning())),
+            Paragraph::new(Line::from("↑ earlier output").style(theme.warning())),
             left,
         );
         frame.render_widget(
@@ -385,11 +388,11 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
 fn approval_lines(approval: &ApprovalRequest, width: u16, theme: Theme) -> Vec<Line<'static>> {
     let detail_rows = if width >= 46 { 2 } else { 1 };
     let summary = truncate_display(
-        &format!("操作  {}", approval.summary),
+        &format!("Action  {}", approval.summary),
         width.saturating_mul(detail_rows),
     );
     let scope = truncate_display(
-        &format!("范围  {}", approval.persistence_label()),
+        &format!("Scope  {}", approval.persistence_label()),
         width.saturating_mul(detail_rows),
     );
     let mut lines = wrap_lines(
@@ -400,15 +403,15 @@ fn approval_lines(approval: &ApprovalRequest, width: u16, theme: Theme) -> Vec<L
         width,
     );
 
-    let mut actions = vec![("y", "允许一次")];
+    let mut actions = vec![("y", "allow once")];
     if approval.allow_session.is_some() {
-        actions.push(("a", "本次会话允许"));
+        actions.push(("a", "allow for session"));
     }
-    actions.push(("n", "拒绝一次"));
+    actions.push(("n", "deny once"));
     if approval.deny_session.is_some() {
-        actions.push(("d", "本次会话拒绝"));
+        actions.push(("d", "deny for session"));
     }
-    actions.push(("Esc", "取消任务"));
+    actions.push(("Esc", "cancel turn"));
     lines.extend(action_lines(&actions, width, theme));
     lines
 }
@@ -451,7 +454,7 @@ fn char_widths(text: &str) -> u16 {
 fn draw_approval(frame: &mut Frame, lines: Vec<Line<'static>>, area: Rect, theme: Theme) {
     let panel = Paragraph::new(Text::from(lines)).block(
         Block::bordered()
-            .title(Line::from(" 需要授权 ").style(theme.warning()))
+            .title(Line::from(" Approval required ").style(theme.warning()))
             .border_style(theme.warning()),
     );
     frame.render_widget(panel, area);
@@ -532,7 +535,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(60, 20)).expect("test terminal");
         terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
         let rendered = format!("{}", terminal.backend());
-        assert!(rendered.contains("计划 1/2"), "plan progress is shown");
+        assert!(rendered.contains("Plan 1/2"), "plan progress is shown");
         // The in_progress row shows the present-tense active_form, not content.
         assert!(
             rendered.contains("Doing second step"),
@@ -566,7 +569,7 @@ mod tests {
 
         // All tasks done → the panel collapses, so its title is gone.
         assert!(
-            !rendered.contains("计划 2/2"),
+            !rendered.contains("Plan 2/2"),
             "an all-completed plan hides the panel"
         );
     }
@@ -592,7 +595,7 @@ mod tests {
         terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
         let rendered = format!("{}", terminal.backend());
 
-        assert!(rendered.contains("计划 8/10"));
+        assert!(rendered.contains("Plan 8/10"));
         assert!(rendered.contains("Executing task 9"));
 
         let mut terminal = Terminal::new(TestBackend::new(32, 10)).expect("small terminal");
@@ -646,7 +649,7 @@ mod tests {
                 .draw(|frame| draw(frame, &mut app))
                 .expect("responsive draw");
             let rendered = format!("{}", terminal.backend());
-            assert!(rendered.contains("需要授权"));
+            assert!(rendered.contains("Approval required"));
             assert!(rendered.contains("[y]"));
             assert!(rendered.contains("[n]"));
         }
@@ -793,7 +796,7 @@ mod tests {
 
         // Then
         let rendered = format!("{}", terminal.backend());
-        assert!(rendered.contains("整理上下文"));
+        assert!(rendered.contains("Compacting"));
         assert!(!rendered.contains("98765"));
 
         // When
@@ -814,7 +817,7 @@ mod tests {
 
         // Then
         let rendered = format!("{}", terminal.backend());
-        assert!(rendered.contains("上下文已整理"));
+        assert!(rendered.contains("Context compacted"));
         assert!(!rendered.contains("98765"));
         assert!(!rendered.contains("12345"));
     }

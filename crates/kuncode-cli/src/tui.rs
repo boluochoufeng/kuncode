@@ -354,7 +354,7 @@ async fn run_one_turn<M: CompletionModel>(
             }
             app.push_assistant(text);
         }
-        Err(AgentError::Cancelled) => app.push_error("已取消".to_string()),
+        Err(AgentError::Cancelled) => app.push_error("cancelled".to_string()),
         Err(err) => app.push_error(err.to_string()),
     }
 

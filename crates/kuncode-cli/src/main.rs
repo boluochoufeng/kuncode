@@ -114,7 +114,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // failing inside terminal setup.
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         eprintln!(
-            "kuncode: 交互模式需要终端。用 `kuncode \"<任务>\"` 传入一次性任务,或在终端中直接运行。"
+            "kuncode: interactive mode needs a terminal. Pass a one-shot task with `kuncode \"<task>\"`, or run kuncode directly in a terminal."
         );
         tracing::info!(
             target: "kuncode::runtime",

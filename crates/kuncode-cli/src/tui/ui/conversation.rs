@@ -155,7 +155,7 @@ fn conversation_lines(app: &App, theme: Theme) -> Vec<Line<'static>> {
             Item::User(text) => {
                 lines.push(Line::from(vec![
                     Span::styled("❯", theme.accent_strong()),
-                    Span::styled(" 你", Style::new().add_modifier(Modifier::BOLD)),
+                    Span::styled(" You", Style::new().add_modifier(Modifier::BOLD)),
                 ]));
                 for raw in text.split('\n') {
                     lines.push(Line::from(format!("  {raw}")));
@@ -176,7 +176,7 @@ fn conversation_lines(app: &App, theme: Theme) -> Vec<Line<'static>> {
                 append_tool(&mut lines, app, name, summary, state, theme);
             }
             Item::Error(text) => lines.push(Line::from(format!("× {text}")).style(theme.danger())),
-            Item::Compaction => lines.push(Line::from("◇ 上下文已整理").style(theme.muted())),
+            Item::Compaction => lines.push(Line::from("◇ Context compacted").style(theme.muted())),
             Item::Warning(text) => {
                 lines.push(Line::from(format!("! {text}")).style(theme.warning()))
             }
@@ -205,7 +205,7 @@ fn append_tool(
     let (glyph, glyph_style, suffix) = match state {
         ToolState::Running => (app.activity_glyph(), theme.accent(), None),
         ToolState::Ok { truncated: false } => ("✓", theme.success(), None),
-        ToolState::Ok { truncated: true } => ("✓", theme.warning(), Some("输出已截断")),
+        ToolState::Ok { truncated: true } => ("✓", theme.warning(), Some("output truncated")),
         ToolState::Failed(_) => ("×", theme.danger(), None),
         ToolState::Denied(_) => ("!", theme.warning(), None),
     };
@@ -253,12 +253,12 @@ fn append_stream_preview(lines: &mut Vec<Line<'static>>, app: &App, theme: Theme
     }
     if !reasoning.is_empty() {
         if answer.is_empty() {
-            lines.push(Line::from("  思考中").style(theme.muted()));
+            lines.push(Line::from("  Thinking").style(theme.muted()));
             for raw in reasoning_preview(reasoning).split('\n') {
                 lines.push(Line::from(format!("  {raw}")).style(theme.muted()));
             }
         } else {
-            lines.push(Line::from("  思考完成").style(theme.muted()));
+            lines.push(Line::from("  Finished thinking").style(theme.muted()));
         }
     }
     if !answer.is_empty() {
@@ -352,7 +352,7 @@ mod tests {
             "in-progress answer should render live"
         );
         assert!(
-            rendered.contains("思考完成"),
+            rendered.contains("Finished thinking"),
             "completed reasoning should collapse once the answer starts"
         );
         assert!(!rendered.contains("weighing options"));
@@ -378,12 +378,17 @@ mod tests {
         let mut app = App::new("m", PermissionMode::Default);
         app.set_colors_enabled(true);
         app.push_user("你好世界".to_string());
-        let (w, h) = (20u16, 8u16);
+        // Tall enough for the role marker row itself to stay in view: the
+        // conversation pane trails a spacer line and follows the tail.
+        let (w, h) = (20u16, 10u16);
         let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("terminal");
         terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
 
         let rendered = format!("{}", terminal.backend());
-        assert!(rendered.contains("你"), "the user role should be labeled");
+        assert!(
+            rendered.contains("You"),
+            "the user role should be labeled:\n{rendered}"
+        );
         let buf = terminal.backend().buffer();
         for y in 0..h {
             for x in 0..w {

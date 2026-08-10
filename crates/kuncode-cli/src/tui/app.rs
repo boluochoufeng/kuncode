@@ -797,7 +797,7 @@ mod tests {
 
         // When
         app.apply_event(compaction_started());
-        app.push_error("已取消".to_string());
+        app.push_error("cancelled".to_string());
 
         // Then
         assert_eq!(app.status, Status::Running);

@@ -39,7 +39,7 @@ impl AgentObserver for CliObserver {
             // here, unlike the TUI. An empty plan prints nothing, so no lone header.
             ViewEffect::Plan(todos) => {
                 if !todos.is_empty() {
-                    println!("⏺ 任务计划");
+                    println!("⏺ Task plan");
                     for todo in &todos {
                         let (glyph, text) = todo_glyph_and_text(todo);
                         println!("  ⎿ {glyph} {text}");
