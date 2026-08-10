@@ -518,7 +518,7 @@ mod tests {
 
         assert_eq!(
             snapshot,
-            r#"[{"name":"bash","description":"Run a shell command in the workspace. Use it for commands that do something — building, testing, version control, package managers — rather than to inspect the workspace: read_file, ls, glob, and grep answer those questions without an approval prompt and without spilling unbounded output into the conversation.","parameters":{"properties":{"cmd":{"description":"The shell command to run, e.g. `cargo test --workspace`.","type":"string"}},"required":["cmd"],"type":"object"}}]"#
+            r#"[{"name":"bash","description":"Run a shell command in the workspace. Use it for commands that do something — building, testing, version control, package managers — rather than to inspect the workspace: read_file, ls, glob, and grep answer those questions without an approval prompt and without spilling unbounded output into the conversation.","parameters":{"properties":{"cmd":{"description":"The shell command to run, e.g. `cargo test --workspace`.","type":"string"},"timeout_secs":{"description":"Timeout in seconds. Defaults to 120; values above 600 are capped to\n600. When the timeout trips, the whole process group is killed and the\noutput received up to that point is returned.","format":"uint64","maximum":600,"minimum":1,"type":["integer","null"]}},"required":["cmd"],"type":"object"}}]"#
         );
     }
 
