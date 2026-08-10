@@ -70,7 +70,10 @@ where
     // Read the frontend-facing bits before `into_runner` consumes the runtime.
     let model_name = runtime.model_name().to_string();
     let mode = runtime.mode();
-    let mut session = runtime.session().await;
+    let mut session = runtime
+        .session()
+        .await
+        .map_err(|error| io::Error::other(error.to_string()))?;
     let runner = runtime
         .into_runner(
             Arc::new(TuiApprover::new(approval_tx)),
@@ -78,6 +81,7 @@ where
         )
         .map_err(io::Error::other)?;
     let mut app = App::new(model_name, mode);
+    seed_transcript(&mut app, &session);
 
     let mut terminal = ratatui::init();
     let features = TerminalFeatures::enable();
@@ -95,9 +99,80 @@ where
     if let Err(error) = &restore_result {
         log_tui_io("restore_terminal", error, true);
     }
+    // The alternate screen is gone with everything it displayed; this print is
+    // what survives in the user's scrollback.
+    print_exit_report(&app, &session);
     match (result, restore_result) {
         (Err(error), _) | (Ok(()), Err(error)) => Err(error),
         (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+/// Prints the session's token usage and the command that resumes it, Codex-style.
+///
+/// Silent when the run neither consumed tokens nor has any history to resume,
+/// so `kuncode` + immediate quit stays clean.
+fn print_exit_report(app: &App, session: &AgentSession) {
+    let usage = app.session_usage;
+    let consumed = usage.total_tokens > 0 || usage.input_tokens > 0 || usage.output_tokens > 0;
+    if consumed {
+        let cached = if usage.cached_input_tokens > 0 {
+            format!(" (cached {})", usage.cached_input_tokens)
+        } else {
+            String::new()
+        };
+        println!(
+            "Token usage: input {}{cached} · output {} · total {}",
+            usage.input_tokens, usage.output_tokens, usage.total_tokens,
+        );
+    }
+    if let Some(id) = session.session_id()
+        && !session.messages().is_empty()
+    {
+        println!(
+            "To resume this session, run kuncode --resume={}",
+            id.as_str()
+        );
+    }
+}
+
+/// Replays a resumed session's dialog into the transcript so the user sees
+/// what they are continuing.
+///
+/// Only user and assistant text is replayed: tool exchanges were already
+/// rendered live when they happened, and the compacted-context envelope is
+/// collapsed to a marker line instead of its JSON payload. This is purely a
+/// display decision — the envelope's shape grants it no authority.
+fn seed_transcript(app: &mut App, session: &AgentSession) {
+    use kuncode_core::completion::{AssistantContent, Message, UserContent};
+
+    if session.messages().is_empty() {
+        return;
+    }
+    for message in session.messages() {
+        match message {
+            Message::User { content } => {
+                if kuncode_agent::compaction::summary::is_compacted_context_message(message) {
+                    app.push_assistant(
+                        "(earlier conversation compacted into a summary)".to_string(),
+                    );
+                    continue;
+                }
+                for block in content.iter() {
+                    if let UserContent::Text(text) = block {
+                        app.push_user(text.text_ref().to_string());
+                    }
+                }
+            }
+            Message::Assistant { content, .. } => {
+                for block in content.iter() {
+                    if let AssistantContent::Text(text) = block {
+                        app.push_assistant(text.text_ref().to_string());
+                    }
+                }
+            }
+            Message::System { .. } => {}
+        }
     }
 }
 
@@ -262,6 +337,7 @@ async fn run_one_turn<M: CompletionModel>(
 
     match outcome.expect("loop exits only once outcome is set") {
         Ok(turn) => {
+            app.add_usage(turn.usage);
             let text = turn.final_text(session);
             // Keep typing out whatever the typewriter hasn't shown yet, so a fast
             // stream finishes at the reading pace instead of snapping to the full

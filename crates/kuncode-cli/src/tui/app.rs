@@ -8,6 +8,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use kuncode_agent::observer::EventKind;
 use kuncode_agent::permission::{ApprovalResolution, PermissionMode};
 use kuncode_agent::todo::TodoItem;
+use kuncode_core::completion::Usage;
 
 use super::bridge::ApprovalRequest;
 use crate::view::{ToolOutcome, ViewEffect, view};
@@ -98,6 +99,10 @@ pub struct App {
     /// scroll-up clears it; scrolling back to the bottom restores it.
     pub follow: bool,
     pub should_quit: bool,
+    /// Provider usage accumulated across this process run, for the exit report.
+    /// Fed from each completed turn's aggregate plus compaction summary calls;
+    /// usage of turns that unwind before returning is not recoverable here.
+    pub session_usage: Usage,
     colors_enabled: bool,
     animation_frame: usize,
 }
@@ -120,9 +125,15 @@ impl App {
             scroll: 0,
             follow: true,
             should_quit: false,
+            session_usage: Usage::default(),
             colors_enabled: std::env::var_os("NO_COLOR").is_none(),
             animation_frame: 0,
         }
+    }
+
+    /// Adds one turn's aggregated provider usage to the session total.
+    pub fn add_usage(&mut self, usage: Usage) {
+        self.session_usage += usage;
     }
 
     /// Whether semantic terminal colors are enabled for this process.
@@ -296,13 +307,22 @@ impl App {
                 self.status = Status::Compacting;
                 return;
             }
-            EventKind::CompactionCompleted { .. } => {
+            EventKind::CompactionCompleted { summary_usage, .. } => {
                 self.status = Status::Running;
+                // Summary calls bill the provider like any other request, so
+                // the exit report must include them.
+                if let Some(usage) = summary_usage {
+                    self.session_usage += *usage;
+                }
                 self.conversation.push(Item::Compaction);
                 return;
             }
-            EventKind::CompactionFailed { .. } => {
+            EventKind::CompactionFailed { summary_usage, .. } => {
                 self.status = Status::Running;
+                // A rejected summary still consumed tokens.
+                if let Some(usage) = summary_usage {
+                    self.session_usage += *usage;
+                }
                 return;
             }
             EventKind::TextDelta { text } => {
@@ -781,6 +801,51 @@ mod tests {
 
         // Then
         assert_eq!(app.status, Status::Running);
+    }
+
+    #[test]
+    fn session_usage_accumulates_turns_and_summary_calls() {
+        let mut app = app();
+        app.add_usage(Usage {
+            input_tokens: 100,
+            output_tokens: 20,
+            total_tokens: 120,
+            ..Usage::default()
+        });
+
+        // Both compaction outcomes bill their summary call; a rejected summary
+        // still consumed tokens.
+        let summary = Usage {
+            input_tokens: 30,
+            output_tokens: 5,
+            total_tokens: 35,
+            ..Usage::default()
+        };
+        app.apply_event(EventKind::CompactionCompleted {
+            before_tokens: 42_000,
+            after_tokens: 18_000,
+            target_reached: true,
+            passes: vec!["semantic_summary".to_string()],
+            source_seq_start: 1,
+            source_seq_end: 10,
+            checkpoint_seq: 11,
+            artifact_count: 0,
+            summary_usage: Some(summary),
+            summary_latency_ms: Some(50),
+            latency_ms: 80,
+        });
+        app.apply_event(EventKind::CompactionFailed {
+            stage: "validation".to_string(),
+            error: "no_safe_boundary".to_string(),
+            recoverable: true,
+            before_tokens: 42_000,
+            summary_usage: Some(summary),
+            latency_ms: 10,
+        });
+
+        assert_eq!(app.session_usage.input_tokens, 160);
+        assert_eq!(app.session_usage.output_tokens, 30);
+        assert_eq!(app.session_usage.total_tokens, 190);
     }
 
     fn compaction_started() -> EventKind {

@@ -2,6 +2,7 @@ mod approver;
 mod config;
 mod logging;
 mod observer;
+mod resume;
 mod runtime;
 mod settings;
 mod tui;
@@ -42,6 +43,14 @@ pub(crate) struct Cli {
     /// Trust this workspace's permission relaxations for the current process.
     #[arg(long)]
     pub(crate) trust_project: bool,
+    /// Resume the most recently updated session of this project.
+    #[arg(long = "continue", conflicts_with = "resume")]
+    pub(crate) continue_latest: bool,
+    /// Resume a session: `--resume=<ID>` takes an id (or unique prefix),
+    /// bare `--resume` picks interactively from this project's sessions.
+    /// `=` is required so a trailing prompt is never mistaken for an id.
+    #[arg(long = "resume", value_name = "SESSION_ID", num_args = 0..=1, require_equals = true)]
+    pub(crate) resume: Option<Option<String>>,
     /// Prompt to run. Omit to start an interactive session.
     #[arg(trailing_var_arg = true)]
     prompt: Vec<String>,
@@ -79,14 +88,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // All assembly (workspace, settings, permissions, prompt, model, tools)
     // lives in `CliRuntime`; `main` only parses, dispatches, and owns the
     // one-shot turn's terminal line.
-    let runtime = CliRuntime::assemble(&cli).await?;
+    let mut runtime = CliRuntime::assemble(&cli).await?;
+    resume::apply_resume_flags(&mut runtime, &cli).await?;
 
     let initial_prompt = cli.prompt.join(" ");
 
     // A prompt on argv (or a non-TTY pipe) runs one-shot on the plain
     // line-by-line renderer; only the bare interactive session enters the TUI.
     if !initial_prompt.trim().is_empty() {
-        let mut session = runtime.session().await;
+        let mut session = runtime.session().await?;
         let runner =
             runtime.into_runner(Arc::new(TerminalApprover), Arc::new(observer::CliObserver))?;
 

@@ -13,6 +13,7 @@ kuncode-agent = { path = "../kuncode-agent" }
 async-trait = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-util = { workspace = true }
+chrono = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -20,7 +20,8 @@ use kuncode_agent::runner::{
 };
 use kuncode_agent::session::AgentSession;
 use kuncode_agent::session_store::{
-    NewSession, SessionStore, session_store_path, turso::TursoSessionStore,
+    NewSession, SessionId, SessionStore, SessionSummary, session_store_path,
+    turso::TursoSessionStore,
 };
 use kuncode_agent::system_prompt::{
     EnvironmentSection, IdentitySection, SystemPrompt, ToolsSection,
@@ -66,6 +67,7 @@ pub struct CliRuntime<M> {
     project_root: std::path::PathBuf,
     session_store: Option<Arc<dyn SessionStore>>,
     persistence_error: Option<String>,
+    resume_target: Option<SessionId>,
 }
 
 impl CliRuntime<RetryModel<AnyChatCompletionModel>> {
@@ -185,6 +187,7 @@ impl CliRuntime<RetryModel<AnyChatCompletionModel>> {
             project_root,
             session_store,
             persistence_error,
+            resume_target: None,
         })
     }
 }
@@ -230,12 +233,59 @@ impl<M: CompletionModel> CliRuntime<M> {
         self.mode
     }
 
-    /// Creates a session and attempts to establish its durable identity.
+    /// Lists this project's stored sessions, most recently updated first.
     ///
-    /// Store-open and session-creation failures do not prevent session
-    /// construction. They are recorded on the returned session so observers can
-    /// report the degradation and persistence-dependent compaction fails closed.
-    pub async fn session(&self) -> AgentSession {
+    /// # Errors
+    /// Fails when the session store is unavailable or the listing query fails;
+    /// resume flows need the real reason instead of an empty list.
+    pub async fn list_sessions(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<SessionSummary>, Box<dyn std::error::Error>> {
+        let store = self.available_store()?;
+        Ok(store.list_sessions(&self.project_root, limit).await?)
+    }
+
+    /// Requests that [`session`](Self::session) resume this stored session
+    /// instead of creating a new one.
+    pub fn set_resume_target(&mut self, id: SessionId) {
+        self.resume_target = Some(id);
+    }
+
+    fn available_store(&self) -> Result<&Arc<dyn SessionStore>, Box<dyn std::error::Error>> {
+        match (&self.session_store, &self.persistence_error) {
+            (Some(store), _) => Ok(store),
+            (None, Some(reason)) => Err(format!("session store unavailable: {reason}").into()),
+            (None, None) => Err("session store unavailable".into()),
+        }
+    }
+
+    /// Creates a session — or rebuilds the requested resume target — and
+    /// attempts to establish its durable identity.
+    ///
+    /// For a new session, store-open and session-creation failures do not
+    /// prevent construction: they are recorded on the returned session so
+    /// observers can report the degradation and persistence-dependent
+    /// compaction fails closed. Resuming is different — the user asked for a
+    /// specific history, so any failure to rebuild it is an error rather than
+    /// a silently empty session.
+    ///
+    /// # Errors
+    /// Fails only when a resume target is set and the store or the rebuild
+    /// rejects it.
+    pub async fn session(&self) -> Result<AgentSession, Box<dyn std::error::Error>> {
+        if let Some(id) = &self.resume_target {
+            let store = self.available_store()?;
+            let session =
+                AgentSession::resume_durable_session(store.as_ref(), id.clone(), self.mode).await?;
+            tracing::info!(
+                target: "kuncode::persistence",
+                session_id = id.as_str(),
+                messages = session.messages().len(),
+                "session resumed",
+            );
+            return Ok(session);
+        }
         let mut session = AgentSession::with_mode(self.mode);
         match (&self.session_store, &self.persistence_error) {
             (Some(store), _) => match session
@@ -261,7 +311,7 @@ impl<M: CompletionModel> CliRuntime<M> {
             (None, Some(error)) => session.mark_persistence_failed(error.clone()),
             (None, None) => {}
         }
-        session
+        Ok(session)
     }
 
     /// Consumes the runtime into a configured [`AgentRunner`], wiring the
