@@ -16,6 +16,7 @@ use crate::tool::{ReadLedger, ToolResultRetention};
 mod compaction;
 mod lineage;
 mod persistence;
+mod resume;
 
 pub(crate) use compaction::SummarySourceBinding;
 pub use compaction::SummarySourceError;
@@ -24,6 +25,7 @@ pub(crate) use persistence::DurableSessionContext;
 #[cfg(test)]
 use persistence::SessionMutationError;
 pub use persistence::{SessionAppendError, SessionAttachError, SessionStartError};
+pub use resume::SessionResumeError;
 
 /// Active conversation context owned by the caller between agent turns.
 ///
@@ -103,9 +105,9 @@ impl AgentSession {
 
     /// Starts a session from an existing active context in the default mode.
     ///
-    /// The messages remain non-durable in the first release, and every role is
-    /// assigned untrusted lineage. Resume must later reconstruct both messages
-    /// and lineage through a dedicated store path; [`Self::start_durable_session`]
+    /// The messages are non-durable and every role is assigned untrusted
+    /// lineage. Rebuilding a stored session with proven lineage is
+    /// [`Self::resume_durable_session`]; [`Self::start_durable_session`]
     /// intentionally rejects this non-empty state.
     pub fn from_messages(messages: Vec<Message>) -> Self {
         Self {

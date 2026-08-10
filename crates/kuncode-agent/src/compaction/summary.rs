@@ -6,9 +6,8 @@ mod summarizer;
 mod types;
 mod validation;
 
-pub(crate) use projection::{
-    COMPACTED_CONTEXT_SYSTEM_INSTRUCTION, is_compacted_context_message, project_summary_message,
-};
+pub use projection::is_compacted_context_message;
+pub(crate) use projection::{COMPACTED_CONTEXT_SYSTEM_INSTRUCTION, project_summary_message};
 pub use prompt::{SummaryRequest, build_summary_prompt};
 pub use summarizer::{ContextSummarizer, GeneratedSummary, LlmContextSummarizer, SummarizerError};
 pub use types::{

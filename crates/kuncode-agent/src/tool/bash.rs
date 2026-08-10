@@ -220,11 +220,9 @@ impl TypedTool for Bash {
 /// clamp rather than a rejection — the schema advertises the maximum, so an
 /// oversized request costs a shorter wait, not a wasted round-trip.
 fn effective_timeout(timeout_secs: Option<NonZeroU64>) -> Duration {
-    Duration::from_secs(
-        timeout_secs.map_or(DEFAULT_TIMEOUT_SECS, |secs| {
-            secs.get().min(MAX_TIMEOUT_SECS)
-        }),
-    )
+    Duration::from_secs(timeout_secs.map_or(DEFAULT_TIMEOUT_SECS, |secs| {
+        secs.get().min(MAX_TIMEOUT_SECS)
+    }))
 }
 
 /// Kills the whole process group created via `process_group(0)`. Killing only

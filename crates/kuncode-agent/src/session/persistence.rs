@@ -54,8 +54,9 @@ impl AgentSession {
 
     /// Attaches a newly created durable session at the empty journal frontier.
     ///
-    /// Existing journals must be reconstructed through a future resume path;
-    /// attaching their id here would skip facts that are not in memory.
+    /// Existing journals must be reconstructed through
+    /// [`Self::resume_durable_session`]; attaching their id here would skip
+    /// facts that are not in memory.
     ///
     /// # Errors
     /// Returns [`SessionAttachError`] without changing the session when it is
