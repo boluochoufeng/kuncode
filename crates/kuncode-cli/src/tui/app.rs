@@ -103,6 +103,11 @@ pub struct App {
     /// scroll-up clears it; scrolling back to the bottom restores it.
     pub follow: bool,
     pub should_quit: bool,
+    /// Highlighted row of the slash-command completion menu. The menu itself
+    /// (whether it shows, which rows) derives from [`input`](Self::input) each
+    /// frame, so this index may go stale as typing narrows the matches —
+    /// readers clamp it to the current list instead of resetting on every edit.
+    pub menu_selection: usize,
     /// Provider usage accumulated across this process run, for the exit report.
     /// Fed from each completed turn's aggregate plus compaction summary calls;
     /// usage of turns that unwind before returning is not recoverable here.
@@ -129,6 +134,7 @@ impl App {
             scroll: 0,
             follow: true,
             should_quit: false,
+            menu_selection: 0,
             session_usage: Usage::default(),
             colors_enabled: std::env::var_os("NO_COLOR").is_none(),
             animation_frame: 0,

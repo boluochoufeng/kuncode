@@ -72,9 +72,9 @@ cargo run -p kuncode-cli
 ```
 
 TUI 中按 `Enter` 提交，`Ctrl+J` 插入换行，`PageUp` / `PageDown` 浏览历史，
-运行中按 `Ctrl+C` 取消。输入 `/help` 列出可用命令，`/quit`（或输入 `exit`）
-退出。终端设置了 `NO_COLOR` 时界面自动使用无颜色样式；移除该环境变量即可启用
-ANSI 语义色。
+运行中按 `Ctrl+C` 取消。输入 `/` 弹出命令列表，`↑` / `↓` 选择、`Tab` 补全、
+`Enter` 执行；`/help` 列出可用命令，`/quit`（或输入 `exit`）退出。终端设置了
+`NO_COLOR` 时界面自动使用无颜色样式；移除该环境变量即可启用 ANSI 语义色。
 
 构建 release 二进制：
 

@@ -16,10 +16,11 @@ enum Command {
     Quit,
 }
 
-/// One registry row: what `/help` prints and what the name resolves to.
-struct CommandSpec {
-    name: &'static str,
-    description: &'static str,
+/// One registry row: what `/help` and the completion menu print, and what the
+/// name resolves to.
+pub(super) struct CommandSpec {
+    pub(super) name: &'static str,
+    pub(super) description: &'static str,
     command: Command,
 }
 
@@ -84,6 +85,27 @@ pub(super) fn dispatch(app: &mut App, input: &str) -> Dispatch {
         )),
     }
     Dispatch::Handled
+}
+
+/// The registry rows whose names extend the command name being typed, for the
+/// completion menu. `None` when the buffer is not in the name position — not
+/// `/`-led, or whitespace after the name means arguments (or a prompt line)
+/// have begun and the menu must close. `Some` but empty (no name matches the
+/// prefix) also renders no menu; the distinction lets Enter fall through to
+/// ordinary unknown-command dispatch.
+pub(super) fn completions(input: &str) -> Option<Vec<&'static CommandSpec>> {
+    // trim_start only: a trailing space is the user finishing the name, which
+    // must close the menu rather than keep completing it.
+    let prefix = input.trim_start().strip_prefix('/')?;
+    if prefix.contains(char::is_whitespace) {
+        return None;
+    }
+    Some(
+        COMMANDS
+            .iter()
+            .filter(|spec| spec.name.starts_with(prefix))
+            .collect(),
+    )
 }
 
 /// `None` when `input` is not a command attempt (first non-whitespace char is
@@ -161,6 +183,43 @@ mod tests {
         let spaced = parse("/ foo").expect("a command attempt");
         assert_eq!(spaced.name, "");
         assert_eq!(spaced.args, "foo");
+    }
+
+    fn completion_names(input: &str) -> Option<Vec<&'static str>> {
+        completions(input).map(|menu| menu.iter().map(|spec| spec.name).collect())
+    }
+
+    #[test]
+    fn a_lone_slash_offers_every_command_in_table_order() {
+        assert_eq!(completion_names("/"), Some(vec!["help", "quit"]));
+    }
+
+    #[test]
+    fn a_name_prefix_narrows_the_menu() {
+        assert_eq!(completion_names("/h"), Some(vec!["help"]));
+        assert_eq!(completion_names("/q"), Some(vec!["quit"]));
+        assert_eq!(completion_names("  /h"), Some(vec!["help"]));
+    }
+
+    #[test]
+    fn an_unmatched_prefix_is_an_empty_menu_not_a_prompt() {
+        assert_eq!(completion_names("/x"), Some(vec![]));
+    }
+
+    #[test]
+    fn ordinary_text_has_no_menu() {
+        assert_eq!(completion_names(""), None);
+        assert_eq!(completion_names("hello"), None);
+        assert_eq!(completion_names("say /help"), None);
+    }
+
+    #[test]
+    fn whitespace_after_the_name_closes_the_menu() {
+        // A finished name (trailing space) or begun arguments leave the name
+        // position; so does a newline from multi-line input.
+        assert_eq!(completion_names("/help "), None);
+        assert_eq!(completion_names("/model deepseek"), None);
+        assert_eq!(completion_names("/he\nllo"), None);
     }
 
     #[test]

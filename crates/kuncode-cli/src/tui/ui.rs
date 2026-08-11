@@ -7,7 +7,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Margin, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Clear, Paragraph},
 };
 
 use kuncode_agent::permission::PermissionMode;
@@ -18,10 +18,12 @@ use self::conversation::{
 };
 use super::app::{App, Status, mode_label};
 use super::bridge::ApprovalRequest;
+use super::command;
 
 const HEADER_HEIGHT: u16 = 2;
 const FOOTER_HEIGHT: u16 = 1;
 const INPUT_MAX_ROWS: u16 = 6;
+const MENU_MAX_ROWS: usize = 8;
 const PLAN_MAX_ROWS: usize = 5;
 const MIN_CONVERSATION_ROWS: u16 = 2;
 
@@ -106,8 +108,61 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         draw_approval(frame, lines, bottom, theme);
     } else {
         draw_input(frame, app, bottom, theme);
+        draw_command_menu(frame, app, bottom, theme);
     }
     draw_footer(frame, app, footer, theme);
+}
+
+/// Floats the slash-command completion menu directly above the composer while
+/// a command name is being typed. Painted after (over) the conversation, like
+/// a dropdown; the highlighted row is what Enter will run, so the marker must
+/// survive `NO_COLOR` (a `❯` glyph, not color alone).
+fn draw_command_menu(frame: &mut Frame, app: &App, anchor: Rect, theme: Theme) {
+    let Some(menu) = command::completions(&app.input) else {
+        return;
+    };
+    if menu.is_empty() {
+        return;
+    }
+    let rows = menu.len().min(MENU_MAX_ROWS) as u16;
+    let height = rows.saturating_add(2).min(anchor.y); // borders; clipped on tiny frames
+    if height < 3 {
+        return;
+    }
+    let area = Rect::new(anchor.x, anchor.y - height, anchor.width, height);
+    let selected = app.menu_selection.min(menu.len() - 1);
+    let name_width = menu.iter().map(|spec| spec.name.len()).max().unwrap_or(0);
+    let lines: Vec<Line> = menu
+        .iter()
+        .take(rows as usize)
+        .enumerate()
+        .map(|(index, spec)| {
+            let name = format!("/{:<name_width$}", spec.name);
+            if index == selected {
+                Line::from(vec![
+                    Span::styled("❯ ", theme.accent_strong()),
+                    Span::styled(name, theme.accent_strong()),
+                    Span::styled(format!("  {}", spec.description), theme.muted()),
+                ])
+            } else {
+                Line::from(vec![
+                    Span::raw("  "),
+                    Span::raw(name),
+                    Span::styled(format!("  {}", spec.description), theme.muted()),
+                ])
+            }
+        })
+        .collect();
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).block(
+            Block::new()
+                .borders(Borders::ALL)
+                .title(Line::from(" Commands ").style(theme.accent_strong()))
+                .border_style(theme.divider()),
+        ),
+        area,
+    );
 }
 
 fn pane_heights(app: &App, frame_height: u16, requested_bottom: u16) -> (u16, u16) {
@@ -482,6 +537,38 @@ mod tests {
             deny_session: None,
             respond,
         }
+    }
+
+    #[test]
+    fn command_menu_pops_up_while_typing_a_command_name() {
+        let mut app = App::new("m", PermissionMode::Default);
+        app.set_input("/".to_string());
+        let mut terminal = Terminal::new(TestBackend::new(60, 16)).expect("test terminal");
+
+        terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
+
+        let rendered = format!("{}", terminal.backend());
+        assert!(rendered.contains("Commands"), "menu panel:\n{rendered}");
+        assert!(
+            rendered.contains("❯ /help"),
+            "first row starts highlighted:\n{rendered}"
+        );
+        assert!(rendered.contains("/quit"));
+
+        // Narrowing the prefix filters rows; the highlight follows the clamp.
+        app.set_input("/q".to_string());
+        terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
+        let rendered = format!("{}", terminal.backend());
+        assert!(rendered.contains("❯ /quit"));
+        assert!(
+            !rendered.contains("/help"),
+            "help filtered out:\n{rendered}"
+        );
+
+        // Leaving the command-name position hides the menu entirely.
+        app.set_input("hello".to_string());
+        terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
+        assert!(!format!("{}", terminal.backend()).contains("Commands"));
     }
 
     #[test]

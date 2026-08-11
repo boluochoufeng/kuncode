@@ -392,6 +392,9 @@ fn log_tui_io(stage: &str, error: &io::Error, fatal: bool) -> io::Error {
 /// Handles a key in the idle state. Returns `Some(input)` when Enter submits a
 /// non-empty buffer; otherwise edits the buffer (or sets `should_quit`).
 fn handle_idle_key(app: &mut App, key: KeyEvent) -> Option<String> {
+    if let Some(submitted) = handle_menu_key(app, key) {
+        return submitted;
+    }
     match (key.modifiers, key.code) {
         (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
             app.should_quit = true;
@@ -492,6 +495,43 @@ fn handle_idle_key(app: &mut App, key: KeyEvent) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// Intercepts a key while the slash-command completion menu is open (the
+/// composer holds a command name in progress with at least one match). The
+/// menu owns Up/Down (selection), Tab (complete into the composer), and Enter
+/// (run the highlighted command — what the user sees selected, not the raw
+/// prefix); every other key falls through to ordinary editing, which
+/// re-derives the menu from the buffer on the next frame.
+///
+/// `None` = not consumed; `Some(inner)` = consumed, with `inner` as
+/// [`handle_idle_key`]'s return value (always `None` today: menu actions never
+/// submit a model prompt).
+fn handle_menu_key(app: &mut App, key: KeyEvent) -> Option<Option<String>> {
+    if !key.modifiers.is_empty() {
+        return None;
+    }
+    let menu = command::completions(&app.input)?;
+    let last = menu.len().checked_sub(1)?; // empty menu: nothing to navigate or run
+    let selected = app.menu_selection.min(last);
+    match key.code {
+        KeyCode::Up => app.menu_selection = selected.saturating_sub(1),
+        KeyCode::Down => app.menu_selection = (selected + 1).min(last),
+        KeyCode::Tab => {
+            // Trailing space: the finished name closes the menu and starts the
+            // (future) argument position.
+            app.set_input(format!("/{} ", menu[selected].name));
+            app.menu_selection = 0;
+        }
+        KeyCode::Enter => {
+            app.follow_tail();
+            app.take_input();
+            app.menu_selection = 0;
+            command::dispatch(app, &format!("/{}", menu[selected].name));
+        }
+        _ => return None,
+    }
+    Some(None)
 }
 
 /// Handles a key while a turn runs: answer the approval modal if one is open,
@@ -595,6 +635,65 @@ mod tests {
                 |item| matches!(item, app::Item::Notice(text) if text.contains("unknown command"))
             ),
             "an unknown command should push a notice instead of running a turn"
+        );
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::empty())
+    }
+
+    #[test]
+    fn menu_enter_runs_the_highlighted_command_not_the_raw_prefix() {
+        let mut app = App::new("m", PermissionMode::Default);
+        typing(&mut app, "/q"); // menu: [quit], highlighted
+        assert!(handle_idle_key(&mut app, enter()).is_none());
+        assert!(app.should_quit, "the highlighted /quit should run");
+        assert!(
+            app.conversation
+                .iter()
+                .any(|item| matches!(item, app::Item::Notice(text) if text == "/quit")),
+            "the echo shows the completed command, not the prefix"
+        );
+    }
+
+    #[test]
+    fn menu_navigation_selects_and_clamps() {
+        let mut app = App::new("m", PermissionMode::Default);
+        typing(&mut app, "/"); // menu: [help, quit]
+        assert!(handle_idle_key(&mut app, key(KeyCode::Down)).is_none());
+        // A second Down must clamp at the last row instead of running past it.
+        assert!(handle_idle_key(&mut app, key(KeyCode::Down)).is_none());
+        assert!(handle_idle_key(&mut app, enter()).is_none());
+        assert!(app.should_quit, "Down should have selected /quit");
+    }
+
+    #[test]
+    fn menu_tab_completes_the_name_without_running_it() {
+        let mut app = App::new("m", PermissionMode::Default);
+        typing(&mut app, "/q");
+        assert!(handle_idle_key(&mut app, key(KeyCode::Tab)).is_none());
+        assert_eq!(app.input, "/quit ");
+        assert_eq!(app.cursor, app.input.len());
+        assert!(!app.should_quit, "Tab completes; only Enter runs");
+        assert!(
+            app.conversation.is_empty(),
+            "completion is not an execution"
+        );
+    }
+
+    #[test]
+    fn menu_does_not_capture_keys_without_matches() {
+        let mut app = App::new("m", PermissionMode::Default);
+        typing(&mut app, "/frobnicate");
+        // No matches: Up/Down stay cursor motion, Enter submits the attempt.
+        assert!(handle_idle_key(&mut app, key(KeyCode::Up)).is_none());
+        assert_eq!(app.input, "/frobnicate", "the buffer must survive Up");
+        assert!(handle_idle_key(&mut app, enter()).is_none());
+        assert!(
+            app.conversation.iter().any(
+                |item| matches!(item, app::Item::Notice(text) if text.contains("unknown command"))
+            ),
+            "Enter still reaches unknown-command dispatch"
         );
     }
 

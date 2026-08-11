@@ -89,6 +89,12 @@ impl App {
         std::mem::take(&mut self.input)
     }
 
+    /// Replaces the whole buffer (e.g. command-menu completion), cursor at the end.
+    pub fn set_input(&mut self, text: String) {
+        self.cursor = text.len();
+        self.input = text;
+    }
+
     fn prev_boundary(&self) -> Option<usize> {
         self.input[..self.cursor]
             .chars()
