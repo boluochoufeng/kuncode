@@ -35,7 +35,9 @@ use kuncode_core::providers::{
 };
 
 use crate::config::{PermissionFlags, resolve_permissions};
-use crate::settings::{ProjectSettings, ProjectTrust, ProviderKind, load_project_settings};
+use crate::settings::{
+    ProjectSettings, ProjectTrust, ProviderKind, SettingsError, load_project_settings,
+};
 use crate::{Cli, logging::LoggingObserver};
 
 /// Identity and behavioral instructions rendered as the first system-prompt
@@ -68,6 +70,13 @@ pub struct CliRuntime<M> {
     session_store: Option<Arc<dyn SessionStore>>,
     persistence_error: Option<String>,
     resume_target: Option<SessionId>,
+    /// Provider client retained for mid-session model switches; cloning shares
+    /// the underlying connection pool.
+    client: AnyChatClient,
+    /// Workspace trust as granted at startup, reused verbatim by switches.
+    trust: ProjectTrust,
+    /// Provider the retained client talks to; a switch must not cross it.
+    provider: ProviderKind,
 }
 
 impl CliRuntime<RetryModel<AnyChatCompletionModel>> {
@@ -103,6 +112,8 @@ impl CliRuntime<RetryModel<AnyChatCompletionModel>> {
         };
         let project = load_project_settings(workspace.root(), project_trust, cli.model.as_deref())?;
         let model_name = project.model_name.clone();
+        // Captured before `resolve_permissions` consumes the settings below.
+        let provider = project.provider;
         let config = agent_config(&project)?;
         let client = provider_client(&project)?;
         let flags = PermissionFlags {
@@ -171,9 +182,9 @@ impl CliRuntime<RetryModel<AnyChatCompletionModel>> {
         // Normal turns inherit the default retry budget. Semantic summaries use
         // a separate one-retry wrapper so their fallback latency is bounded
         // independently of ordinary model calls.
-        let provider = AnyChatCompletionModel::make(&client, model_name.clone());
-        let model = RetryModel::with_policy(provider.clone(), RetryPolicy::default());
-        let summary_model = RetryModel::with_policy(provider, summary_retry_policy());
+        let provider_model = AnyChatCompletionModel::make(&client, model_name.clone());
+        let model = RetryModel::with_policy(provider_model.clone(), RetryPolicy::default());
+        let summary_model = RetryModel::with_policy(provider_model, summary_retry_policy());
         let registry = ToolRegistry::with_default_workspace_tools(workspace)?;
 
         Ok(Self {
@@ -189,9 +200,133 @@ impl CliRuntime<RetryModel<AnyChatCompletionModel>> {
             session_store,
             persistence_error,
             resume_target: None,
+            client,
+            trust: project_trust,
+            provider,
+        })
+    }
+
+    /// Snapshot for mid-session `/model` switches; call before
+    /// [`into_runner`](Self::into_runner) consumes the runtime.
+    pub(crate) fn model_switcher(&self) -> ModelSwitcher {
+        ModelSwitcher {
+            client: self.client.clone(),
+            project_root: self.project_root.clone(),
+            trust: self.trust,
+            provider: self.provider,
+            base_config: self.config.clone(),
+        }
+    }
+}
+
+/// Everything a mid-session `/model` switch needs after
+/// [`into_runner`](CliRuntime::into_runner) consumed the runtime. All parts
+/// are model-independent: the provider client (and its connection pool) is
+/// reused; only the model, its output budget, and the compaction binding are
+/// rebuilt per switch.
+pub(crate) struct ModelSwitcher {
+    client: AnyChatClient,
+    project_root: std::path::PathBuf,
+    trust: ProjectTrust,
+    provider: ProviderKind,
+    base_config: AgentConfig,
+}
+
+/// The validated products of one switch, applied atomically by the caller.
+pub(crate) struct ModelSwitch {
+    pub(crate) model: RetryModel<AnyChatCompletionModel>,
+    pub(crate) summary_model: RetryModel<AnyChatCompletionModel>,
+    pub(crate) config: AgentConfig,
+    pub(crate) model_name: String,
+}
+
+impl ModelSwitcher {
+    /// Resolves and validates a switch to `name`, constructing the new model
+    /// pair and configuration without touching any live state.
+    ///
+    /// Only the *model facts* of the reloaded settings are used — name,
+    /// output budget, compaction binding. Permissions and mode are
+    /// deliberately not re-resolved: session-scoped approval grants live in
+    /// the runner and must survive a switch.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the settings reload rejects the name (blank, budget or
+    /// compaction constraints), the rebound compaction config is invalid, or
+    /// the settings file now selects a different provider than the retained
+    /// client was built for.
+    pub(crate) fn switch(&self, name: &str) -> Result<ModelSwitch, ModelSwitchError> {
+        let project = load_project_settings(&self.project_root, self.trust, Some(name))?;
+        if project.provider != self.provider {
+            return Err(ModelSwitchError::ProviderChanged {
+                active: self.provider,
+                requested: project.provider,
+            });
+        }
+        let compaction = project
+            .compaction
+            .map(|settings| settings.into_runtime(&project.model_name))
+            .transpose()?;
+        let mut config = self.base_config.clone();
+        config.max_tokens = Some(project.max_tokens);
+        config.compaction = compaction;
+        let provider_model = AnyChatCompletionModel::make(&self.client, project.model_name.clone());
+        let model = RetryModel::with_policy(provider_model.clone(), RetryPolicy::default());
+        let summary_model = RetryModel::with_policy(provider_model, summary_retry_policy());
+        Ok(ModelSwitch {
+            model,
+            summary_model,
+            config,
+            model_name: project.model_name,
         })
     }
 }
+
+/// Why a `/model` switch was rejected; the live runner stays untouched.
+#[derive(Debug)]
+pub(crate) enum ModelSwitchError {
+    /// The settings reload rejected the requested model.
+    Settings(SettingsError),
+    /// The rebound compaction runtime is invalid for the new model.
+    Compaction(AgentCompactionConfigError),
+    /// The settings file now selects a different provider than the retained
+    /// client; switching providers needs a restart.
+    ProviderChanged {
+        /// Provider the running client was built for.
+        active: ProviderKind,
+        /// Provider the settings file selects now.
+        requested: ProviderKind,
+    },
+}
+
+impl From<SettingsError> for ModelSwitchError {
+    fn from(error: SettingsError) -> Self {
+        Self::Settings(error)
+    }
+}
+
+impl From<AgentCompactionConfigError> for ModelSwitchError {
+    fn from(error: AgentCompactionConfigError) -> Self {
+        Self::Compaction(error)
+    }
+}
+
+impl std::fmt::Display for ModelSwitchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Settings(error) => error.fmt(f),
+            Self::Compaction(error) => error.fmt(f),
+            Self::ProviderChanged { active, requested } => write!(
+                f,
+                "provider changed on disk ({} -> {}); restart kuncode to apply",
+                active.as_str(),
+                requested.as_str()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ModelSwitchError {}
 
 fn provider_client(project: &ProjectSettings) -> Result<AnyChatClient, Box<dyn std::error::Error>> {
     match project.provider {
@@ -405,5 +540,109 @@ mod tests {
         let policy = summary_retry_policy();
 
         assert_eq!(policy.max_retries, 1);
+    }
+
+    /// A switcher over a temp project dir with the given settings JSON. The
+    /// returned dir must outlive the [`ModelSwitcher::switch`] call — it reads
+    /// the file at call time.
+    fn switcher_over(tag: &str, json: &str) -> (ModelSwitcher, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("kuncode-switch-{}-{tag}", std::process::id()));
+        fs::create_dir_all(dir.join(".kuncode")).expect("temp dir");
+        fs::write(dir.join(".kuncode/settings.json"), json).expect("write settings");
+        let client = AnyChatClient::DeepSeek(
+            kuncode_core::providers::deepseek::DeepSeekClient::new("test-key").expect("client"),
+        );
+        let switcher = ModelSwitcher {
+            client,
+            project_root: dir.clone(),
+            trust: ProjectTrust::Untrusted,
+            provider: ProviderKind::DeepSeek,
+            base_config: AgentConfig {
+                max_iterations: 7,
+                ..AgentConfig::default()
+            },
+        };
+        (switcher, dir)
+    }
+
+    #[test]
+    fn switch_rebinds_budget_and_compaction_to_the_new_model() {
+        let (switcher, dir) = switcher_over(
+            "rebind",
+            r#"{
+                "model": { "maxTokens": 8192 },
+                "compaction": { "mode": "enabled", "contextLimit": 131072, "reservedOutput": 8192 }
+            }"#,
+        );
+
+        let switch = switcher
+            .switch("deepseek-v4-pro")
+            .expect("a known model switches");
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(switch.model_name, "deepseek-v4-pro");
+        assert_eq!(switch.config.max_tokens, Some(8_192));
+        assert_eq!(
+            switch
+                .config
+                .compaction
+                .expect("compaction stays active")
+                .model_id(),
+            "deepseek-v4-pro",
+        );
+        // Only the model facts move; the rest of the config is the base's.
+        assert_eq!(switch.config.max_iterations, 7);
+    }
+
+    /// `expect_err` without requiring `Debug` on the switch payload (the
+    /// model handles hold credentials and deliberately stay un-`Debug`).
+    fn switch_error(switcher: &ModelSwitcher, name: &str) -> ModelSwitchError {
+        match switcher.switch(name) {
+            Err(error) => error,
+            Ok(_) => panic!("switch to `{name}` should have been rejected"),
+        }
+    }
+
+    #[test]
+    fn switch_rejects_a_provider_change_on_disk() {
+        let (mut switcher, dir) = switcher_over("provider-drift", "{}");
+        switcher.provider = ProviderKind::OpenAi;
+
+        let error = switch_error(&switcher, "deepseek-v4-pro");
+        let _ = fs::remove_dir_all(&dir);
+
+        assert!(matches!(error, ModelSwitchError::ProviderChanged { .. }));
+        assert!(error.to_string().contains("restart"));
+    }
+
+    #[test]
+    fn switch_rejects_a_blank_model_name() {
+        let (switcher, dir) = switcher_over("blank", "{}");
+
+        let error = switch_error(&switcher, " ");
+        let _ = fs::remove_dir_all(&dir);
+
+        assert!(matches!(
+            error,
+            ModelSwitchError::Settings(SettingsError::Model(_))
+        ));
+    }
+
+    #[test]
+    fn switch_to_an_unprofiled_model_with_active_compaction_requires_context_limit() {
+        // Valid at startup: the flash profile supplies contextLimit. The
+        // unprofiled target has no default, so the switch must be rejected.
+        let (switcher, dir) = switcher_over(
+            "no-context-limit",
+            r#"{ "compaction": { "mode": "enabled" } }"#,
+        );
+
+        let error = switch_error(&switcher, "some-custom-model");
+        let _ = fs::remove_dir_all(&dir);
+
+        assert!(matches!(
+            error,
+            ModelSwitchError::Settings(SettingsError::CompactionContextLimit)
+        ));
     }
 }

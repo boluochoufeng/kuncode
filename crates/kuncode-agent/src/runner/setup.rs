@@ -162,6 +162,27 @@ where
         self
     }
 
+    /// Replaces the model used for ordinary turn completions (e.g. a
+    /// mid-session `/model` switch).
+    ///
+    /// The summary model is untouched; pair with
+    /// [`with_summary_model`](Self::with_summary_model) when both must move.
+    pub fn with_model(mut self, model: M) -> Self {
+        self.model = model;
+        self
+    }
+
+    /// Replaces the loop configuration wholesale.
+    ///
+    /// Nothing in the runner is derived from the config at build time, so no
+    /// other state needs recomputing. Invariant: when `config.compaction` is
+    /// present, its model id is checkpoint provenance and must name the active
+    /// summary model — a mismatch silently mislabels checkpoints.
+    pub fn with_agent_config(mut self, config: AgentConfig) -> Self {
+        self.config = config;
+        self
+    }
+
     /// Replaces the model used only for semantic context summaries.
     ///
     /// Summary calls still use the active turn's cancellation and durable commit

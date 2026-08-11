@@ -1,8 +1,9 @@
 use super::support::{
-    AgentRunner, AgentSession, ApproveAll, Arc, AssistantContent, CollectingObserver,
-    CompletionError, CompletionRequest, CompletionResponse, CompletionStream, EventKind, FakeModel,
-    FinishReason, Message, NonEmptyVec, StreamEvent, ToolRegistry, ToolResultContent, Usage,
-    UserContent, Value, event_label, register_bash, response,
+    AgentConfig, AgentRunner, AgentSession, ApproveAll, Arc, AssistantContent, CollectingObserver,
+    CompactionMode, CompletionError, CompletionRequest, CompletionResponse, CompletionStream,
+    EventKind, FakeModel, FinishReason, Message, NonEmptyVec, StreamEvent, ToolRegistry,
+    ToolResultContent, Usage, UserContent, Value, configured_runner, event_label, register_bash,
+    response,
 };
 
 /// A model that streams reasoning + text deltas before the final answer, for
@@ -126,4 +127,44 @@ async fn runs_tool_call_then_final_answer() {
         }
         other => panic!("expected tool result user message, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn with_model_swaps_the_model_used_for_turns() {
+    let original = FakeModel::new([]);
+    let replacement = FakeModel::new([response(AssistantContent::text("done"))]);
+    let runner =
+        AgentRunner::new(original.clone(), ToolRegistry::new()).with_model(replacement.clone());
+    let mut session = AgentSession::new();
+
+    runner
+        .run_turn(&mut session, "hi")
+        .await
+        .expect("agent run should complete");
+
+    assert!(
+        original.requests().is_empty(),
+        "the replaced model must not be called"
+    );
+    assert_eq!(replacement.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn with_agent_config_swaps_max_tokens_and_compaction() {
+    let model = FakeModel::new([response(AssistantContent::text("done"))]);
+    let runner =
+        configured_runner(model.clone(), CompactionMode::Enabled).with_agent_config(AgentConfig {
+            max_tokens: Some(1234),
+            ..AgentConfig::default()
+        });
+    let mut session = AgentSession::new();
+
+    runner
+        .run_turn(&mut session, "hi")
+        .await
+        .expect("agent run should complete");
+
+    assert_eq!(model.requests()[0].max_tokens, Some(1234));
+    // Wholesale replacement: the configured runner's compaction is gone.
+    assert!(runner.config.compaction.is_none());
 }

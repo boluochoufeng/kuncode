@@ -13,6 +13,7 @@ use super::app::App;
 #[derive(Clone, Copy)]
 enum Command {
     Help,
+    Model,
     Quit,
 }
 
@@ -31,6 +32,11 @@ const COMMANDS: &[CommandSpec] = &[
         command: Command::Help,
     },
     CommandSpec {
+        name: "model",
+        description: "switch the completion model (usage: /model <name>)",
+        command: Command::Model,
+    },
+    CommandSpec {
         name: "quit",
         description: "quit kuncode (typing `exit` also works)",
         command: Command::Quit,
@@ -40,11 +46,7 @@ const COMMANDS: &[CommandSpec] = &[
 /// A parsed command attempt: `/name` plus whatever followed it.
 struct Invocation<'a> {
     name: &'a str,
-    /// Everything after the name, leading whitespace stripped. Unused by
-    /// `/help` and `/quit`; the grammar carries it now so an argument-taking
-    /// command (`/model <name>`) is a table entry + match arm, not a parser
-    /// change.
-    #[allow(dead_code)] // read only by tests until the first argument-taking command lands
+    /// Everything after the name, leading whitespace stripped.
     args: &'a str,
 }
 
@@ -54,6 +56,8 @@ pub(super) enum Dispatch {
     Handled,
     /// Not a command; the caller submits it to the model unchanged.
     Prompt,
+    /// `/model <name>`: the switch needs the event loop's runner + switcher.
+    SwitchModel(String),
 }
 
 /// Routes one submitted line. Command attempts execute against `app` (echo +
@@ -75,6 +79,24 @@ pub(super) fn dispatch(app: &mut App, input: &str) -> Dispatch {
             command: Command::Help,
             ..
         }) => app.push_notice(help_text()),
+        Some(CommandSpec {
+            command: Command::Model,
+            ..
+        }) => {
+            let name = invocation.args.trim();
+            if name.is_empty() {
+                // The menu's Enter always dispatches the bare name, so this
+                // is also what selecting /model from the popup shows.
+                app.push_notice(format!(
+                    "current model: {} — usage: /model <name>",
+                    app.model_name
+                ));
+            } else if name.contains(char::is_whitespace) {
+                app.push_notice("usage: /model <name> — one model name, no spaces".to_string());
+            } else {
+                return Dispatch::SwitchModel(name.to_string());
+            }
+        }
         Some(CommandSpec {
             command: Command::Quit,
             ..
@@ -191,7 +213,7 @@ mod tests {
 
     #[test]
     fn a_lone_slash_offers_every_command_in_table_order() {
-        assert_eq!(completion_names("/"), Some(vec!["help", "quit"]));
+        assert_eq!(completion_names("/"), Some(vec!["help", "model", "quit"]));
     }
 
     #[test]
@@ -248,6 +270,44 @@ mod tests {
                 spec.name
             );
         }
+    }
+
+    #[test]
+    fn model_without_args_shows_current_model_and_usage() {
+        let mut app = app();
+
+        assert!(matches!(dispatch(&mut app, "/model"), Dispatch::Handled));
+
+        assert!(!app.should_quit);
+        let notices = notice_texts(&app);
+        assert_eq!(notices[0], "/model");
+        assert!(notices[1].contains("current model: m"));
+        assert!(notices[1].contains("usage: /model <name>"));
+    }
+
+    #[test]
+    fn model_with_a_name_returns_the_switch_payload() {
+        let mut app = app();
+
+        assert!(matches!(
+            dispatch(&mut app, "/model deepseek-v4-pro"),
+            Dispatch::SwitchModel(name) if name == "deepseek-v4-pro"
+        ));
+
+        // Only the echo notice: the switch itself happens in the event loop.
+        assert_eq!(notice_texts(&app), vec!["/model deepseek-v4-pro"]);
+    }
+
+    #[test]
+    fn model_with_extra_words_is_a_usage_notice() {
+        let mut app = app();
+
+        assert!(matches!(
+            dispatch(&mut app, "/model a b"),
+            Dispatch::Handled
+        ));
+
+        assert!(notice_texts(&app)[1].contains("usage"));
     }
 
     #[test]

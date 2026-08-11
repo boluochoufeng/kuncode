@@ -107,6 +107,11 @@ impl AgentCompactionConfig {
             summary_max_tokens,
         })
     }
+
+    /// The model recorded as summary-checkpoint provenance.
+    pub fn model_id(&self) -> &str {
+        &self.model_id
+    }
 }
 
 /// Invalid automatic-compaction runtime metadata.

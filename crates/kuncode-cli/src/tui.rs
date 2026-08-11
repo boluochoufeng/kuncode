@@ -25,13 +25,19 @@ use kuncode_agent::error::AgentError;
 use kuncode_agent::observer::AgentEvent;
 use kuncode_agent::runner::AgentRunner;
 use kuncode_agent::session::AgentSession;
-use kuncode_core::completion::CompletionModel;
+use kuncode_core::completion::{CompletionModel, RetryModel};
+use kuncode_core::providers::any_chat::AnyChatCompletionModel;
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 use tokio_util::sync::CancellationToken;
 
 use self::app::{App, Status};
 use self::bridge::{ApprovalRequest, TuiApprover, TuiObserver};
-use crate::runtime::CliRuntime;
+use crate::runtime::{CliRuntime, ModelSwitcher};
+
+/// The one model type the TUI runs. Concrete (unlike [`CliRuntime`]) because a
+/// `/model` switch rebuilds the turn and summary models with two different
+/// retry policies, which a generic `M::make` cannot express.
+type CliModel = RetryModel<AnyChatCompletionModel>;
 
 /// Rows scrolled per PageUp/PageDown.
 const SCROLL_STEP: u16 = 10;
@@ -61,16 +67,14 @@ const MAX_DRAIN: Duration = Duration::from_millis(3000);
 /// guarantees [`ratatui::restore`] on every exit path. Mouse capture and
 /// bracketed paste ride a [`TerminalFeatures`] guard so a panic can't leave
 /// them enabled in the user's shell.
-pub async fn run<M>(runtime: CliRuntime<M>) -> io::Result<()>
-where
-    M: CompletionModel,
-{
+pub async fn run(runtime: CliRuntime<CliModel>) -> io::Result<()> {
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let (approval_tx, mut approval_rx) = mpsc::unbounded_channel();
 
     // Read the frontend-facing bits before `into_runner` consumes the runtime.
     let model_name = runtime.model_name().to_string();
     let mode = runtime.mode();
+    let switcher = runtime.model_switcher();
     let mut session = runtime
         .session()
         .await
@@ -88,7 +92,8 @@ where
     let features = TerminalFeatures::enable();
     let result = event_loop(
         &mut terminal,
-        &runner,
+        runner,
+        &switcher,
         &mut session,
         &mut app,
         &mut event_rx,
@@ -212,10 +217,17 @@ impl Drop for TerminalFeatures {
 }
 
 /// Idle loop: render, read a key, and either edit the input box or — on submit —
-/// hand off to [`run_one_turn`] for the duration of the turn.
-async fn event_loop<M: CompletionModel>(
+/// hand off to [`run_one_turn`] for the duration of the turn, or apply a model
+/// switch between turns.
+///
+/// Owns the runner (nothing else references it) so a `/model` switch can
+/// replace its model pair and config in place, keeping the approval broker's
+/// session-scoped grants.
+#[allow(clippy::too_many_arguments)]
+async fn event_loop(
     terminal: &mut ratatui::DefaultTerminal,
-    runner: &AgentRunner<M>,
+    mut runner: AgentRunner<CliModel>,
+    switcher: &ModelSwitcher,
     session: &mut AgentSession,
     app: &mut App,
     event_rx: &mut UnboundedReceiver<AgentEvent>,
@@ -228,21 +240,43 @@ async fn event_loop<M: CompletionModel>(
 
         match events.next().await {
             Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
-                if let Some(input) = handle_idle_key(app, key) {
-                    app.push_user(input.clone());
-                    app.status = Status::Running;
-                    run_one_turn(
-                        terminal,
-                        runner,
-                        session,
-                        app,
-                        input,
-                        &mut events,
-                        event_rx,
-                        approval_rx,
-                    )
-                    .await?;
-                    app.status = Status::Idle;
+                match handle_idle_key(app, key) {
+                    Some(Submission::Prompt(input)) => {
+                        app.push_user(input.clone());
+                        app.status = Status::Running;
+                        run_one_turn(
+                            terminal,
+                            &runner,
+                            session,
+                            app,
+                            input,
+                            &mut events,
+                            event_rx,
+                            approval_rx,
+                        )
+                        .await?;
+                        app.status = Status::Idle;
+                    }
+                    // Between turns by construction: the idle loop only reaches
+                    // here while no turn is running. All-or-nothing — a rejected
+                    // switch leaves the runner untouched.
+                    Some(Submission::SwitchModel(name)) => match switcher.switch(&name) {
+                        Ok(switch) => {
+                            runner = runner
+                                .with_model(switch.model)
+                                .with_summary_model(switch.summary_model)
+                                .with_agent_config(switch.config);
+                            app.model_name = switch.model_name.clone();
+                            app.push_notice(format!("model switched to {}", switch.model_name));
+                            tracing::info!(
+                                target: "kuncode::runtime",
+                                model = %switch.model_name,
+                                "model switched",
+                            );
+                        }
+                        Err(error) => app.push_error(error.to_string()),
+                    },
+                    None => {}
                 }
             }
             Some(Ok(Event::Mouse(mouse))) => handle_scroll(app, mouse),
@@ -389,9 +423,18 @@ fn log_tui_io(stage: &str, error: &io::Error, fatal: bool) -> io::Error {
     io::Error::new(error.kind(), error.to_string())
 }
 
-/// Handles a key in the idle state. Returns `Some(input)` when Enter submits a
-/// non-empty buffer; otherwise edits the buffer (or sets `should_quit`).
-fn handle_idle_key(app: &mut App, key: KeyEvent) -> Option<String> {
+/// What an idle-state submission asks the event loop to do.
+#[derive(Debug, Eq, PartialEq)]
+enum Submission {
+    /// Run a model turn with this prompt.
+    Prompt(String),
+    /// Switch the completion model to this name, between turns.
+    SwitchModel(String),
+}
+
+/// Handles a key in the idle state. Returns `Some` when Enter submits work for
+/// the event loop; otherwise edits the buffer (or sets `should_quit`).
+fn handle_idle_key(app: &mut App, key: KeyEvent) -> Option<Submission> {
     if let Some(submitted) = handle_menu_key(app, key) {
         return submitted;
     }
@@ -469,7 +512,8 @@ fn handle_idle_key(app: &mut App, key: KeyEvent) -> Option<String> {
                 let submitted = app.take_input();
                 match command::dispatch(app, &submitted) {
                     command::Dispatch::Handled => None,
-                    command::Dispatch::Prompt => Some(submitted),
+                    command::Dispatch::Prompt => Some(Submission::Prompt(submitted)),
+                    command::Dispatch::SwitchModel(name) => Some(Submission::SwitchModel(name)),
                 }
             }
         }
@@ -505,9 +549,12 @@ fn handle_idle_key(app: &mut App, key: KeyEvent) -> Option<String> {
 /// re-derives the menu from the buffer on the next frame.
 ///
 /// `None` = not consumed; `Some(inner)` = consumed, with `inner` as
-/// [`handle_idle_key`]'s return value (always `None` today: menu actions never
-/// submit a model prompt).
-fn handle_menu_key(app: &mut App, key: KeyEvent) -> Option<Option<String>> {
+/// [`handle_idle_key`]'s return value — `None` for navigation/completion,
+/// `Some(Submission)` when running the highlighted command yields work for the
+/// event loop (menu Enter always dispatches a bare command name, so today only
+/// `/model`'s empty-args notice path is reachable, which yields `None`; the
+/// forwarding keeps the compiler honest if that ever changes).
+fn handle_menu_key(app: &mut App, key: KeyEvent) -> Option<Option<Submission>> {
     if !key.modifiers.is_empty() {
         return None;
     }
@@ -527,7 +574,15 @@ fn handle_menu_key(app: &mut App, key: KeyEvent) -> Option<Option<String>> {
             app.follow_tail();
             app.take_input();
             app.menu_selection = 0;
-            command::dispatch(app, &format!("/{}", menu[selected].name));
+            return Some(
+                match command::dispatch(app, &format!("/{}", menu[selected].name)) {
+                    command::Dispatch::Handled => None,
+                    // Unreachable today (a bare name is never a prompt), kept
+                    // for the compiler to police as commands grow payloads.
+                    command::Dispatch::Prompt => None,
+                    command::Dispatch::SwitchModel(name) => Some(Submission::SwitchModel(name)),
+                },
+            );
         }
         _ => return None,
     }
@@ -592,10 +647,38 @@ mod tests {
         let mut app = App::new("m", PermissionMode::Default);
         typing(&mut app, "exit now");
         assert_eq!(
-            handle_idle_key(&mut app, enter()).as_deref(),
-            Some("exit now")
+            handle_idle_key(&mut app, enter()),
+            Some(Submission::Prompt("exit now".to_string()))
         );
         assert!(!app.should_quit, "a prompt containing exit must not quit");
+    }
+
+    #[test]
+    fn slash_model_with_a_name_submits_a_switch() {
+        let mut app = App::new("m", PermissionMode::Default);
+        // The space after the name closes the completion menu, so this takes
+        // the plain Enter path.
+        typing(&mut app, "/model deepseek-v4-pro");
+        assert_eq!(
+            handle_idle_key(&mut app, enter()),
+            Some(Submission::SwitchModel("deepseek-v4-pro".to_string()))
+        );
+        assert!(app.input.is_empty(), "the submission clears the composer");
+    }
+
+    #[test]
+    fn slash_model_without_args_notices_the_current_model() {
+        let mut app = App::new("m", PermissionMode::Default);
+        // Bare `/model` matches the completion menu, so Enter runs the
+        // highlighted command with no arguments.
+        typing(&mut app, "/model");
+        assert!(handle_idle_key(&mut app, enter()).is_none());
+        assert!(
+            app.conversation.iter().any(
+                |item| matches!(item, app::Item::Notice(text) if text.contains("current model: m"))
+            ),
+            "bare /model should report the active model"
+        );
     }
 
     #[test]

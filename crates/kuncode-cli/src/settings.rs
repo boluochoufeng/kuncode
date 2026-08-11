@@ -97,7 +97,7 @@ pub(crate) enum ProviderKind {
 }
 
 impl ProviderKind {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::DeepSeek => "deepseek",
             Self::OpenAi => "openai",
