@@ -180,6 +180,14 @@ fn conversation_lines(app: &App, theme: Theme) -> Vec<Line<'static>> {
             Item::Warning(text) => {
                 lines.push(Line::from(format!("! {text}")).style(theme.warning()))
             }
+            Item::Notice(text) => {
+                // Notices are multi-line (`/help`), so split like user/assistant
+                // bodies; a literal `\n` inside a `Line` would not break the row.
+                for (index, raw) in text.split('\n').enumerate() {
+                    let prefix = if index == 0 { "· " } else { "  " };
+                    lines.push(Line::from(format!("{prefix}{raw}")).style(theme.muted()));
+                }
+            }
         }
         lines.push(Line::from(""));
     }
@@ -356,6 +364,27 @@ mod tests {
             "completed reasoning should collapse once the answer starts"
         );
         assert!(!rendered.contains("weighing options"));
+    }
+
+    #[test]
+    fn notice_renders_each_line_with_a_marker() {
+        let mut app = App::new("m", PermissionMode::Default);
+        app.push_notice("/help".to_string());
+        app.push_notice("first line of output\nsecond line of output".to_string());
+        let mut terminal = Terminal::new(TestBackend::new(60, 16)).expect("test terminal");
+
+        terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
+
+        let rendered = format!("{}", terminal.backend());
+        assert!(
+            rendered.contains("· /help"),
+            "the first notice line carries the marker:\n{rendered}"
+        );
+        assert!(rendered.contains("· first line of output"));
+        assert!(
+            rendered.contains("  second line of output"),
+            "continuation lines indent under the marker:\n{rendered}"
+        );
     }
 
     #[test]

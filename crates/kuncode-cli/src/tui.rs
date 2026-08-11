@@ -8,6 +8,7 @@
 
 mod app;
 mod bridge;
+mod command;
 mod ui;
 
 use std::io;
@@ -455,12 +456,18 @@ fn handle_idle_key(app: &mut App, key: KeyEvent) -> Option<String> {
                 None
             } else if trimmed == "exit" {
                 // `exit` is a REPL command, not a prompt: quit instead of sending
-                // it to the agent.
+                // it to the agent. Kept as an alias of `/quit`.
                 app.should_quit = true;
                 None
             } else {
                 app.follow_tail();
-                Some(app.take_input())
+                // Take the buffer before dispatch: a command submission clears
+                // the composer exactly like a prompt submission does.
+                let submitted = app.take_input();
+                match command::dispatch(app, &submitted) {
+                    command::Dispatch::Handled => None,
+                    command::Dispatch::Prompt => Some(submitted),
+                }
             }
         }
         (_, KeyCode::Enter) => {
@@ -549,6 +556,46 @@ mod tests {
             Some("exit now")
         );
         assert!(!app.should_quit, "a prompt containing exit must not quit");
+    }
+
+    #[test]
+    fn typing_slash_quit_then_enter_quits_without_submitting() {
+        let mut app = App::new("m", PermissionMode::Default);
+        typing(&mut app, "/quit");
+        assert!(handle_idle_key(&mut app, enter()).is_none());
+        assert!(app.should_quit, "/quit should quit the TUI");
+    }
+
+    #[test]
+    fn typing_slash_help_then_enter_shows_help_without_submitting() {
+        let mut app = App::new("m", PermissionMode::Default);
+        typing(&mut app, "/help");
+        assert!(handle_idle_key(&mut app, enter()).is_none());
+        assert!(!app.should_quit);
+        assert!(
+            app.input.is_empty(),
+            "a command submission clears the composer like a prompt"
+        );
+        assert!(
+            app.conversation
+                .iter()
+                .any(|item| matches!(item, app::Item::Notice(_))),
+            "help output should land in the transcript"
+        );
+    }
+
+    #[test]
+    fn unknown_slash_command_notices_instead_of_submitting() {
+        let mut app = App::new("m", PermissionMode::Default);
+        typing(&mut app, "/frobnicate");
+        assert!(handle_idle_key(&mut app, enter()).is_none());
+        assert!(!app.should_quit);
+        assert!(
+            app.conversation.iter().any(
+                |item| matches!(item, app::Item::Notice(text) if text.contains("unknown command"))
+            ),
+            "an unknown command should push a notice instead of running a turn"
+        );
     }
 
     #[test]

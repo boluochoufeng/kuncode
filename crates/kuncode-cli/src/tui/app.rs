@@ -51,6 +51,10 @@ pub enum Item {
     /// A non-fatal harness notice (e.g. session persistence degraded);
     /// rendered apart from [`Error`](Self::Error) — the turn kept going.
     Warning(String),
+    /// Frontend-originated informational text (slash-command echo and output).
+    /// Never enters the agent transcript; rendered muted so it cannot be
+    /// mistaken for user or assistant dialog.
+    Notice(String),
 }
 
 /// Mutable state driving the terminal UI.
@@ -229,6 +233,10 @@ impl App {
         if !text.trim().is_empty() {
             self.conversation.push(Item::Assistant(text));
         }
+    }
+
+    pub fn push_notice(&mut self, text: String) {
+        self.conversation.push(Item::Notice(text));
     }
 
     pub fn push_error(&mut self, text: String) {
