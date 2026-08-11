@@ -218,11 +218,12 @@ impl Default for ProjectSettings {
 
 /// Loads `.kuncode/settings.json` under `root`.
 ///
-/// A missing file returns defaults. `KUNCODE_MODEL` overrides the file's model
-/// name for any provider; `DEEPSEEK_MODEL` remains a backward-compatible
-/// fallback that applies only when the DeepSeek provider is selected. Every
-/// section forms a closed schema, so misspelled fields fail instead of silently
-/// selecting defaults.
+/// A missing file returns defaults. `cli_model` (the `--model` flag) names the
+/// model for any provider and wins over the environment; `KUNCODE_MODEL`
+/// overrides the file's model name for any provider; `DEEPSEEK_MODEL` remains
+/// a backward-compatible fallback that applies only when the DeepSeek provider
+/// is selected. Every section forms a closed schema, so misspelled fields fail
+/// instead of silently selecting defaults.
 ///
 /// # Errors
 ///
@@ -233,12 +234,14 @@ impl Default for ProjectSettings {
 pub(crate) fn load_project_settings(
     root: &Path,
     trust: ProjectTrust,
+    cli_model: Option<&str>,
 ) -> Result<ProjectSettings, SettingsError> {
     let universal = std::env::var("KUNCODE_MODEL").ok();
     let deepseek = std::env::var("DEEPSEEK_MODEL").ok();
     load_project_settings_from(
         root,
         ModelOverrides {
+            cli: cli_model,
             universal: universal.as_deref(),
             deepseek: deepseek.as_deref(),
         },
@@ -246,14 +249,16 @@ pub(crate) fn load_project_settings(
     )
 }
 
-/// Environment model-name overrides, applied by provider: `universal`
-/// (`KUNCODE_MODEL`) wins for every provider, while `deepseek`
-/// (`DEEPSEEK_MODEL`, the pre-multi-provider compatibility variable) applies
-/// only when the file selects the DeepSeek provider. A stale `DEEPSEEK_MODEL`
-/// export in a shell rc must neither steer another provider's requests nor
-/// bypass that provider's explicit-model-name requirement.
+/// Model-name overrides applied ahead of the file's own `model.name`: `cli`
+/// (the `--model` flag) wins for every provider, then `universal`
+/// (`KUNCODE_MODEL`) for every provider, while `deepseek` (`DEEPSEEK_MODEL`,
+/// the pre-multi-provider compatibility variable) applies only when the file
+/// selects the DeepSeek provider. A stale `DEEPSEEK_MODEL` export in a shell
+/// rc must neither steer another provider's requests nor bypass that
+/// provider's explicit-model-name requirement.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ModelOverrides<'a> {
+    pub(crate) cli: Option<&'a str>,
     pub(crate) universal: Option<&'a str>,
     pub(crate) deepseek: Option<&'a str>,
 }
@@ -261,7 +266,7 @@ pub(crate) struct ModelOverrides<'a> {
 impl<'a> ModelOverrides<'a> {
     /// The override that actually applies once the file's provider is known.
     fn for_provider(self, provider: ProviderKind) -> Option<&'a str> {
-        self.universal.or(match provider {
+        self.cli.or(self.universal).or(match provider {
             ProviderKind::DeepSeek => self.deepseek,
             ProviderKind::OpenAi => None,
         })
@@ -320,41 +325,12 @@ fn resolve_settings(
             "DEEPSEEK_MODEL is set but the project selects a different provider; ignoring it",
         );
     }
-    let model_override = overrides.for_provider(file.model.provider);
-    let model_name = match (model_override, &file.model.name, file.model.provider) {
-        (Some(name), _, _) => name.to_string(),
-        (None, Some(name), _) => name.clone(),
-        (None, None, ProviderKind::DeepSeek) => DEEPSEEK_V4_FLASH_MODEL_ID.to_string(),
-        // No cross-provider default exists: falling back to the DeepSeek model
-        // id would send it to the other provider and fail at the first request.
-        (None, None, ProviderKind::OpenAi) => {
-            return Err(SettingsError::Model(format!(
-                "provider \"{}\" requires an explicit model name",
-                ProviderKind::OpenAi.as_str()
-            )));
-        }
-    };
-    if model_name.trim().is_empty() {
-        return Err(SettingsError::Model(
-            "model name must not be blank".to_string(),
-        ));
-    }
-    let profile = if file.model.provider == ProviderKind::DeepSeek {
-        model_profile(&model_name)
-    } else {
-        None
-    };
-    let max_tokens = file.model.max_tokens.unwrap_or_else(|| {
-        profile.map_or(
-            // No capability profile to consult (an unknown DeepSeek id or a
-            // non-DeepSeek provider): default conservatively — every current
-            // OpenAI model accepts 16k output, while the agent default of 32k
-            // exceeds several of them and 400s the first request.
-            CONSERVATIVE_DEFAULT_MAX_TOKENS,
-            DeepSeekModelProfile::default_max_tokens,
-        )
-    });
-    validate_model_max_tokens(max_tokens, profile)?;
+    let model = resolve_model(
+        file.model.provider,
+        overrides.for_provider(file.model.provider),
+        file.model.name.as_deref(),
+        file.model.max_tokens,
+    )?;
     validate_agent(&file.agent)?;
     validate_log_level(&file.logging.level)?;
     let canonical_root =
@@ -374,25 +350,113 @@ fn resolve_settings(
         Some(name) => Some(PermissionMode::parse(&name).ok_or(SettingsError::Mode(name))?),
         None => None,
     };
-    // Name where a defaulted budget came from: when the mismatch error below
-    // fires, "16384" must be traceable to something the user can act on.
-    let max_tokens_note = if file.model.max_tokens.is_none() && profile.is_none() {
-        " (the built-in default for a model without a capability profile; set model.maxTokens to override)"
-    } else {
-        ""
-    };
-    let compaction = parse_compaction(file.compaction, profile, max_tokens, max_tokens_note)?;
+    let compaction = parse_compaction(
+        file.compaction,
+        model.profile,
+        model.max_tokens,
+        model.max_tokens_note(),
+    )?;
 
     Ok(ProjectSettings {
         policy: Some(policy),
         default_mode,
         trust,
         provider: file.model.provider,
-        model_name,
-        max_tokens,
+        model_name: model.name,
+        max_tokens: model.max_tokens,
         max_iterations: file.agent.max_iterations,
         todo_reminder_interval: file.agent.todo_reminder_interval,
         compaction,
+    })
+}
+
+/// One model choice validated against known provider capabilities.
+///
+/// Every surface that selects a model — the settings file, the environment
+/// overrides, the `--model` flag, and an eventual `/model` command — funnels
+/// through [`resolve_model`] into this type.
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedModel {
+    /// Effective model identifier.
+    pub(crate) name: String,
+    /// Effective provider output budget for an ordinary turn.
+    pub(crate) max_tokens: u64,
+    /// Capability profile, when the provider has one for this model.
+    profile: Option<DeepSeekModelProfile>,
+    /// Whether `max_tokens` is the conservative built-in default (no explicit
+    /// budget and no capability profile to consult).
+    conservative_default: bool,
+}
+
+impl ResolvedModel {
+    /// Names where a defaulted budget came from: when a compaction mismatch
+    /// error cites it, "16384" must be traceable to something the user can
+    /// act on.
+    fn max_tokens_note(&self) -> &'static str {
+        if self.conservative_default {
+            " (the built-in default for a model without a capability profile; set model.maxTokens to override)"
+        } else {
+            ""
+        }
+    }
+}
+
+/// Resolves a model request into a validated model choice.
+///
+/// `requested` is the highest-precedence explicit request (a CLI flag or
+/// environment override today, a `/model` argument later); `file_name` and
+/// `file_max_tokens` come from the settings file.
+///
+/// # Errors
+///
+/// Returns [`SettingsError::Model`] when no name is available for a provider
+/// without a built-in default, the name is blank, or the output budget
+/// violates the provider range or the model's capability profile.
+pub(crate) fn resolve_model(
+    provider: ProviderKind,
+    requested: Option<&str>,
+    file_name: Option<&str>,
+    file_max_tokens: Option<u64>,
+) -> Result<ResolvedModel, SettingsError> {
+    let name = match (requested, file_name, provider) {
+        (Some(name), _, _) => name.to_string(),
+        (None, Some(name), _) => name.to_string(),
+        (None, None, ProviderKind::DeepSeek) => DEEPSEEK_V4_FLASH_MODEL_ID.to_string(),
+        // No cross-provider default exists: falling back to the DeepSeek model
+        // id would send it to the other provider and fail at the first request.
+        (None, None, ProviderKind::OpenAi) => {
+            return Err(SettingsError::Model(format!(
+                "provider \"{}\" requires an explicit model name",
+                ProviderKind::OpenAi.as_str()
+            )));
+        }
+    };
+    if name.trim().is_empty() {
+        return Err(SettingsError::Model(
+            "model name must not be blank".to_string(),
+        ));
+    }
+    let profile = if provider == ProviderKind::DeepSeek {
+        model_profile(&name)
+    } else {
+        None
+    };
+    let max_tokens = file_max_tokens.unwrap_or_else(|| {
+        profile.map_or(
+            // No capability profile to consult (an unknown DeepSeek id or a
+            // non-DeepSeek provider): default conservatively — every current
+            // OpenAI model accepts 16k output, while the agent default of 32k
+            // exceeds several of them and 400s the first request.
+            CONSERVATIVE_DEFAULT_MAX_TOKENS,
+            DeepSeekModelProfile::default_max_tokens,
+        )
+    });
+    validate_model_max_tokens(max_tokens, profile)?;
+    Ok(ResolvedModel {
+        name,
+        max_tokens,
+        profile,
+        conservative_default: file_max_tokens.is_none() && profile.is_none(),
     })
 }
 
@@ -686,6 +750,7 @@ mod tests {
         )
         .expect("write settings");
         let overrides = ModelOverrides {
+            cli: None,
             universal: None,
             deepseek: Some("deepseek-v4-flash"),
         };
@@ -705,6 +770,7 @@ mod tests {
 
         // KUNCODE_MODEL stays a universal override.
         let universal = ModelOverrides {
+            cli: None,
             universal: Some("gpt-override"),
             deepseek: Some("deepseek-v4-flash"),
         };
@@ -712,6 +778,65 @@ mod tests {
             .expect("universal override names the model");
         assert_eq!(loaded.model_name, "gpt-override");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cli_model_override_wins_over_environment_and_file() {
+        let dir = unique_dir("cli-model-override");
+        fs::write(
+            dir.join(".kuncode/settings.json"),
+            r#"{ "model": { "name": "file-model" } }"#,
+        )
+        .expect("write settings");
+
+        let overrides = ModelOverrides {
+            cli: Some("cli-model"),
+            universal: Some("env-model"),
+            deepseek: Some("deepseek-env-model"),
+        };
+        let loaded = load_project_settings_from(&dir, overrides, ProjectTrust::Trusted)
+            .expect("the flag names the model");
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(loaded.model_name, "cli-model");
+    }
+
+    #[test]
+    fn cli_model_override_satisfies_the_openai_name_requirement() {
+        let dir = unique_dir("cli-model-openai");
+        fs::write(
+            dir.join(".kuncode/settings.json"),
+            r#"{ "model": { "provider": "openai" } }"#,
+        )
+        .expect("write settings");
+
+        let overrides = ModelOverrides {
+            cli: Some("gpt-cli"),
+            universal: None,
+            deepseek: None,
+        };
+        let loaded = load_project_settings_from(&dir, overrides, ProjectTrust::Trusted)
+            .expect("the flag names the model explicitly");
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(loaded.model_name, "gpt-cli");
+    }
+
+    #[test]
+    fn blank_cli_model_override_is_an_error() {
+        let dir = unique_dir("cli-model-blank");
+        fs::create_dir_all(dir.join(".kuncode")).expect("temp dir");
+
+        let overrides = ModelOverrides {
+            cli: Some(" "),
+            universal: None,
+            deepseek: None,
+        };
+        let error = load_project_settings_from(&dir, overrides, ProjectTrust::Trusted)
+            .expect_err("a blank model name must fail");
+        let _ = fs::remove_dir_all(&dir);
+
+        assert!(matches!(error, SettingsError::Model(_)));
     }
 
     #[test]
@@ -1027,6 +1152,7 @@ mod tests {
         let loaded = load_project_settings_from(
             &dir,
             ModelOverrides {
+                cli: None,
                 universal: Some("deepseek-v4-pro"),
                 deepseek: None,
             },

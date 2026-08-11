@@ -75,8 +75,9 @@ impl CliRuntime<RetryModel<AnyChatCompletionModel>> {
     ///
     /// Resolves permissions from built-in ∪ project file ∪ CLI flags (mode
     /// precedence CLI > project > Default), assembles the system prompt from its
-    /// identity/environment/tools sections, and wires the configured model +
-    /// the default workspace tool registry.
+    /// identity/environment/tools sections, and wires the configured model
+    /// (name precedence `--model` > environment > settings file) + the default
+    /// workspace tool registry.
     ///
     /// # Errors
     ///
@@ -100,7 +101,7 @@ impl CliRuntime<RetryModel<AnyChatCompletionModel>> {
         } else {
             ProjectTrust::Untrusted
         };
-        let project = load_project_settings(workspace.root(), project_trust)?;
+        let project = load_project_settings(workspace.root(), project_trust, cli.model.as_deref())?;
         let model_name = project.model_name.clone();
         let config = agent_config(&project)?;
         let client = provider_client(&project)?;

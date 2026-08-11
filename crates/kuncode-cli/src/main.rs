@@ -28,6 +28,10 @@ use crate::{approver::TerminalApprover, runtime::CliRuntime};
 #[derive(Parser, Debug)]
 #[command(name = "kuncode", about = "A coding agent in your shell")]
 pub(crate) struct Cli {
+    /// Model name for this run (any provider); wins over KUNCODE_MODEL,
+    /// DEEPSEEK_MODEL, and the settings file.
+    #[arg(long = "model", value_name = "NAME")]
+    pub(crate) model: Option<String>,
     /// Allow rule, e.g. `Bash(cargo *)` or `Read(./src/**)` (repeatable).
     #[arg(long = "allow", value_name = "RULE")]
     pub(crate) allow: Vec<String>,

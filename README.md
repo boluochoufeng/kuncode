@@ -114,7 +114,8 @@ cargo build --release -p kuncode-cli
 
 补充说明：
 
-- `KUNCODE_MODEL` 可以覆盖配置文件中的模型名称；`DEEPSEEK_MODEL` 作为兼容别名保留。
+- `--model <NAME>` 可以为单次运行指定模型名称，适用于任意 provider，优先级最高；
+  `KUNCODE_MODEL` 可以覆盖配置文件中的模型名称；`DEEPSEEK_MODEL` 作为兼容别名保留。
 - `model.provider` 支持 `deepseek` 和 `openai`；两者分别使用固定官方 endpoint，
   并读取 `DEEPSEEK_API_KEY` 或 `OPENAI_API_KEY`。
 - 内置模型配置包括 `deepseek-v4-flash` 和 `deepseek-v4-pro`；未指定 `model.name`
