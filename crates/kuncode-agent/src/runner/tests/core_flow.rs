@@ -39,6 +39,7 @@ impl kuncode_core::completion::CompletionModel for DeltaModel {
                 content: NonEmptyVec::new(AssistantContent::text("Hello")),
                 usage: Usage::default(),
                 finish_reason: FinishReason::Stop,
+                model: None,
             }),
         ];
         Ok(Box::pin(futures_util::stream::iter(events)))

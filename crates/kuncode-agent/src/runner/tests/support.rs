@@ -319,6 +319,7 @@ pub(super) fn completed_stream<T>(response: CompletionResponse<T>) -> Completion
             content: choice,
             usage,
             finish_reason: FinishReason::Stop,
+            model: None,
         })
     }))
 }
