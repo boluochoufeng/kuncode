@@ -22,7 +22,8 @@ mod model;
 pub(crate) mod protocol;
 
 pub use model::{
-    DEEPSEEK_V4_FLASH_MODEL_ID, DEEPSEEK_V4_PRO_MODEL_ID, DeepSeekModelProfile, model_profile,
+    DEEPSEEK_V4_FLASH_MODEL_ID, DEEPSEEK_V4_PRO_MODEL_ID, DeepSeekModelProfile, known_model_ids,
+    model_profile,
 };
 
 const DEEPSEEK_API_BASE_URL: &str = "https://api.deepseek.com";

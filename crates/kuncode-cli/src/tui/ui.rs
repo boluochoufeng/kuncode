@@ -109,6 +109,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     } else {
         draw_input(frame, app, bottom, theme);
         draw_command_menu(frame, app, bottom, theme);
+        draw_model_picker(frame, app, bottom, theme);
     }
     draw_footer(frame, app, footer, theme);
 }
@@ -159,6 +160,56 @@ fn draw_command_menu(frame: &mut Frame, app: &App, anchor: Rect, theme: Theme) {
             Block::new()
                 .borders(Borders::ALL)
                 .title(Line::from(" Commands ").style(theme.accent_strong()))
+                .border_style(theme.divider()),
+        ),
+        area,
+    );
+}
+
+/// Floats the `/model` selection dialog above the composer, in the command
+/// menu's spot (the two never show together: the picker only opens after the
+/// composer was cleared, which closes the menu). Same `NO_COLOR`-surviving
+/// `❯` marker; the active model is annotated so re-picking it reads as a
+/// deliberate no-op.
+fn draw_model_picker(frame: &mut Frame, app: &App, anchor: Rect, theme: Theme) {
+    let Some(picker) = &app.model_picker else {
+        return;
+    };
+    let rows = picker.options.len().min(MENU_MAX_ROWS) as u16;
+    let height = rows.saturating_add(2).min(anchor.y); // borders; clipped on tiny frames
+    if height < 3 {
+        return;
+    }
+    let area = Rect::new(anchor.x, anchor.y - height, anchor.width, height);
+    let lines: Vec<Line> = picker
+        .options
+        .iter()
+        .take(rows as usize)
+        .enumerate()
+        .map(|(index, name)| {
+            let mut spans = if index == picker.selected {
+                vec![
+                    Span::styled("❯ ", theme.accent_strong()),
+                    Span::styled(name.clone(), theme.accent_strong()),
+                ]
+            } else {
+                vec![Span::raw("  "), Span::raw(name.clone())]
+            };
+            if *name == app.model_name {
+                spans.push(Span::styled("  (current)", theme.muted()));
+            }
+            Line::from(spans)
+        })
+        .collect();
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).block(
+            Block::new()
+                .borders(Borders::ALL)
+                .title(
+                    Line::from(" Model — Enter to switch, Esc to cancel ")
+                        .style(theme.accent_strong()),
+                )
                 .border_style(theme.divider()),
         ),
         area,
@@ -569,6 +620,36 @@ mod tests {
         app.set_input("hello".to_string());
         terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
         assert!(!format!("{}", terminal.backend()).contains("Commands"));
+    }
+
+    #[test]
+    fn model_picker_renders_options_with_the_current_model_annotated() {
+        let mut app = App::new("deepseek-v4-flash", PermissionMode::Default);
+        app.available_models = vec![
+            "deepseek-v4-pro".to_string(),
+            "deepseek-v4-flash".to_string(),
+        ];
+        app.open_model_picker();
+        let mut terminal = Terminal::new(TestBackend::new(60, 16)).expect("test terminal");
+
+        terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
+
+        let rendered = format!("{}", terminal.backend());
+        assert!(rendered.contains("Model"), "picker panel:\n{rendered}");
+        assert!(
+            rendered.contains("❯ deepseek-v4-flash"),
+            "the active model starts highlighted:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("(current)"),
+            "the active model is annotated:\n{rendered}"
+        );
+        assert!(rendered.contains("deepseek-v4-pro"));
+
+        // Closing the picker removes the panel.
+        app.model_picker = None;
+        terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
+        assert!(!format!("{}", terminal.backend()).contains("(current)"));
     }
 
     #[test]

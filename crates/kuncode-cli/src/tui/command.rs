@@ -33,7 +33,7 @@ const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "model",
-        description: "switch the completion model (usage: /model <name>)",
+        description: "switch the completion model (bare opens a picker; /model <name> is direct)",
         command: Command::Model,
     },
     CommandSpec {
@@ -86,11 +86,8 @@ pub(super) fn dispatch(app: &mut App, input: &str) -> Dispatch {
             let name = invocation.args.trim();
             if name.is_empty() {
                 // The menu's Enter always dispatches the bare name, so this
-                // is also what selecting /model from the popup shows.
-                app.push_notice(format!(
-                    "current model: {} — usage: /model <name>",
-                    app.model_name
-                ));
+                // is also what selecting /model from the popup does.
+                app.open_model_picker();
             } else if name.contains(char::is_whitespace) {
                 app.push_notice("usage: /model <name> — one model name, no spaces".to_string());
             } else {
@@ -273,16 +270,18 @@ mod tests {
     }
 
     #[test]
-    fn model_without_args_shows_current_model_and_usage() {
+    fn model_without_args_opens_the_picker() {
         let mut app = app();
+        app.available_models = vec!["m".to_string(), "other".to_string()];
 
         assert!(matches!(dispatch(&mut app, "/model"), Dispatch::Handled));
 
         assert!(!app.should_quit);
-        let notices = notice_texts(&app);
-        assert_eq!(notices[0], "/model");
-        assert!(notices[1].contains("current model: m"));
-        assert!(notices[1].contains("usage: /model <name>"));
+        // Only the echo notice; the selection happens in the picker.
+        assert_eq!(notice_texts(&app), vec!["/model"]);
+        let picker = app.model_picker.as_ref().expect("picker should be open");
+        assert_eq!(picker.options, vec!["m", "other"]);
+        assert_eq!(picker.selected, 0, "the active model starts highlighted");
     }
 
     #[test]

@@ -241,6 +241,18 @@ pub(crate) struct ModelSwitch {
 }
 
 impl ModelSwitcher {
+    /// Model names worth offering in a selection list: the active provider's
+    /// built-in profiles. Empty for providers without built-ins (the picker
+    /// still lists the currently active model).
+    pub(crate) fn known_models(&self) -> Vec<String> {
+        match self.provider {
+            ProviderKind::DeepSeek => kuncode_core::providers::deepseek::known_model_ids()
+                .map(str::to_string)
+                .collect(),
+            ProviderKind::OpenAi => Vec::new(),
+        }
+    }
+
     /// Resolves and validates a switch to `name`, constructing the new model
     /// pair and configuration without touching any live state.
     ///
@@ -626,6 +638,27 @@ mod tests {
             error,
             ModelSwitchError::Settings(SettingsError::Model(_))
         ));
+    }
+
+    #[test]
+    fn known_models_lists_the_deepseek_builtins() {
+        let (switcher, dir) = switcher_over("known-models", "{}");
+
+        let models = switcher.known_models();
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(models, vec!["deepseek-v4-pro", "deepseek-v4-flash"]);
+    }
+
+    #[test]
+    fn known_models_is_empty_for_providers_without_builtins() {
+        let (mut switcher, dir) = switcher_over("known-models-openai", "{}");
+        switcher.provider = ProviderKind::OpenAi;
+
+        let models = switcher.known_models();
+        let _ = fs::remove_dir_all(&dir);
+
+        assert!(models.is_empty());
     }
 
     #[test]

@@ -86,6 +86,7 @@ pub async fn run(runtime: CliRuntime<CliModel>) -> io::Result<()> {
         )
         .map_err(io::Error::other)?;
     let mut app = App::new(model_name, mode);
+    app.available_models = switcher.known_models();
     seed_transcript(&mut app, &session);
 
     let mut terminal = ratatui::init();
@@ -435,6 +436,9 @@ enum Submission {
 /// Handles a key in the idle state. Returns `Some` when Enter submits work for
 /// the event loop; otherwise edits the buffer (or sets `should_quit`).
 fn handle_idle_key(app: &mut App, key: KeyEvent) -> Option<Submission> {
+    if app.model_picker.is_some() {
+        return handle_picker_key(app, key);
+    }
     if let Some(submitted) = handle_menu_key(app, key) {
         return submitted;
     }
@@ -541,6 +545,42 @@ fn handle_idle_key(app: &mut App, key: KeyEvent) -> Option<Submission> {
     }
 }
 
+/// Handles a key while the model picker dialog is open. The dialog is modal:
+/// Up/Down move the highlight, Enter picks the highlighted model (re-picking
+/// the active model just closes — no pointless switch), Esc cancels, Ctrl+C
+/// still quits, and every other key is swallowed instead of reaching the
+/// composer.
+fn handle_picker_key(app: &mut App, key: KeyEvent) -> Option<Submission> {
+    if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
+        app.should_quit = true;
+        return None;
+    }
+    if !key.modifiers.is_empty() {
+        return None;
+    }
+    let picker = app.model_picker.as_mut()?; // caller guards is_some
+    match key.code {
+        KeyCode::Up => picker.selected = picker.selected.saturating_sub(1),
+        KeyCode::Down => {
+            picker.selected = (picker.selected + 1).min(picker.options.len().saturating_sub(1));
+        }
+        KeyCode::Enter => {
+            let picker = app.model_picker.take()?;
+            let chosen = picker
+                .options
+                .into_iter()
+                .nth(picker.selected)
+                .expect("selected stays in bounds for the picker's lifetime");
+            if chosen != app.model_name {
+                return Some(Submission::SwitchModel(chosen));
+            }
+        }
+        KeyCode::Esc => app.model_picker = None,
+        _ => {}
+    }
+    None
+}
+
 /// Intercepts a key while the slash-command completion menu is open (the
 /// composer holds a command name in progress with at least one match). The
 /// menu owns Up/Down (selection), Tab (complete into the composer), and Enter
@@ -551,9 +591,9 @@ fn handle_idle_key(app: &mut App, key: KeyEvent) -> Option<Submission> {
 /// `None` = not consumed; `Some(inner)` = consumed, with `inner` as
 /// [`handle_idle_key`]'s return value — `None` for navigation/completion,
 /// `Some(Submission)` when running the highlighted command yields work for the
-/// event loop (menu Enter always dispatches a bare command name, so today only
-/// `/model`'s empty-args notice path is reachable, which yields `None`; the
-/// forwarding keeps the compiler honest if that ever changes).
+/// event loop (menu Enter always dispatches a bare command name, so today it
+/// always yields `None` — bare `/model` opens the picker dialog rather than
+/// switching; the forwarding keeps the compiler honest if that ever changes).
 fn handle_menu_key(app: &mut App, key: KeyEvent) -> Option<Option<Submission>> {
     if !key.modifiers.is_empty() {
         return None;
@@ -667,18 +707,18 @@ mod tests {
     }
 
     #[test]
-    fn slash_model_without_args_notices_the_current_model() {
+    fn slash_model_without_args_opens_the_picker() {
         let mut app = App::new("m", PermissionMode::Default);
+        app.available_models = vec!["m".to_string(), "other".to_string()];
         // Bare `/model` matches the completion menu, so Enter runs the
         // highlighted command with no arguments.
         typing(&mut app, "/model");
         assert!(handle_idle_key(&mut app, enter()).is_none());
         assert!(
-            app.conversation.iter().any(
-                |item| matches!(item, app::Item::Notice(text) if text.contains("current model: m"))
-            ),
-            "bare /model should report the active model"
+            app.model_picker.is_some(),
+            "bare /model should open the model picker"
         );
+        assert!(app.input.is_empty(), "the submission clears the composer");
     }
 
     #[test]
@@ -762,6 +802,70 @@ mod tests {
             app.conversation.is_empty(),
             "completion is not an execution"
         );
+    }
+
+    /// An app with the picker open over ["m", "other"], "m" active + selected.
+    fn picker_app() -> App {
+        let mut app = App::new("m", PermissionMode::Default);
+        app.available_models = vec!["m".to_string(), "other".to_string()];
+        app.open_model_picker();
+        app
+    }
+
+    #[test]
+    fn picker_enter_on_another_model_submits_a_switch() {
+        let mut app = picker_app();
+        assert!(handle_idle_key(&mut app, key(KeyCode::Down)).is_none());
+        assert_eq!(
+            handle_idle_key(&mut app, enter()),
+            Some(Submission::SwitchModel("other".to_string()))
+        );
+        assert!(app.model_picker.is_none(), "picking closes the dialog");
+    }
+
+    #[test]
+    fn picker_enter_on_the_current_model_closes_without_switching() {
+        let mut app = picker_app();
+        assert!(handle_idle_key(&mut app, enter()).is_none());
+        assert!(app.model_picker.is_none());
+    }
+
+    #[test]
+    fn picker_navigation_clamps_at_both_ends() {
+        let mut app = picker_app();
+        assert!(handle_idle_key(&mut app, key(KeyCode::Up)).is_none());
+        assert_eq!(app.model_picker.as_ref().unwrap().selected, 0);
+        for _ in 0..3 {
+            assert!(handle_idle_key(&mut app, key(KeyCode::Down)).is_none());
+        }
+        assert_eq!(app.model_picker.as_ref().unwrap().selected, 1);
+    }
+
+    #[test]
+    fn picker_esc_cancels_without_switching() {
+        let mut app = picker_app();
+        assert!(handle_idle_key(&mut app, key(KeyCode::Esc)).is_none());
+        assert!(app.model_picker.is_none());
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn picker_swallows_ordinary_typing() {
+        let mut app = picker_app();
+        assert!(handle_idle_key(&mut app, key(KeyCode::Char('x'))).is_none());
+        assert!(
+            app.input.is_empty(),
+            "the dialog is modal; typing must not reach the composer"
+        );
+        assert!(app.model_picker.is_some());
+    }
+
+    #[test]
+    fn picker_ctrl_c_still_quits() {
+        let mut app = picker_app();
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(handle_idle_key(&mut app, ctrl_c).is_none());
+        assert!(app.should_quit);
     }
 
     #[test]

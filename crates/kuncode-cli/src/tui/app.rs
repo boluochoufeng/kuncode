@@ -57,6 +57,15 @@ pub enum Item {
     Notice(String),
 }
 
+/// The `/model` selection dialog: a snapshot of the candidate list taken when
+/// the picker opened. Unlike the completion menu (recomputed from the input
+/// each frame), the options are fixed for the dialog's lifetime, so `selected`
+/// stays in bounds by construction.
+pub struct ModelPicker {
+    pub options: Vec<String>,
+    pub selected: usize,
+}
+
 /// Mutable state driving the terminal UI.
 pub struct App {
     pub model_name: String,
@@ -108,6 +117,12 @@ pub struct App {
     /// frame, so this index may go stale as typing narrows the matches —
     /// readers clamp it to the current list instead of resetting on every edit.
     pub menu_selection: usize,
+    /// Candidate models for the `/model` picker, seeded at startup from the
+    /// active provider's built-ins. The active model is added at open time.
+    pub available_models: Vec<String>,
+    /// Open model-selection dialog; while present it captures Up/Down, Enter,
+    /// and Esc at idle instead of the composer.
+    pub model_picker: Option<ModelPicker>,
     /// Provider usage accumulated across this process run, for the exit report.
     /// Fed from each completed turn's aggregate plus compaction summary calls;
     /// usage of turns that unwind before returning is not recoverable here.
@@ -135,6 +150,8 @@ impl App {
             follow: true,
             should_quit: false,
             menu_selection: 0,
+            available_models: Vec::new(),
+            model_picker: None,
             session_usage: Usage::default(),
             colors_enabled: std::env::var_os("NO_COLOR").is_none(),
             animation_frame: 0,
@@ -243,6 +260,21 @@ impl App {
 
     pub fn push_notice(&mut self, text: String) {
         self.conversation.push(Item::Notice(text));
+    }
+
+    /// Opens the model picker over the candidate list, highlighting the
+    /// active model. The active model is always listed — first when it is not
+    /// among the candidates — so the picker is never empty.
+    pub fn open_model_picker(&mut self) {
+        let mut options = self.available_models.clone();
+        if !options.contains(&self.model_name) {
+            options.insert(0, self.model_name.clone());
+        }
+        let selected = options
+            .iter()
+            .position(|name| *name == self.model_name)
+            .unwrap_or(0);
+        self.model_picker = Some(ModelPicker { options, selected });
     }
 
     pub fn push_error(&mut self, text: String) {
@@ -461,6 +493,45 @@ mod tests {
             tool: "bash".to_string(),
             summary: "run ls".to_string(),
         }
+    }
+
+    #[test]
+    fn open_model_picker_highlights_the_active_model() {
+        let mut app = app();
+        app.available_models = vec!["other".to_string(), "model".to_string()];
+
+        app.open_model_picker();
+
+        let picker = app.model_picker.as_ref().expect("picker should be open");
+        assert_eq!(picker.options, vec!["other", "model"]);
+        assert_eq!(picker.selected, 1, "the active model starts highlighted");
+    }
+
+    #[test]
+    fn open_model_picker_lists_an_unknown_active_model_first() {
+        // e.g. started with `--model custom-name`: the active model is not in
+        // the provider's built-in table but must still show as current.
+        let mut app = app();
+        app.available_models = vec!["other".to_string()];
+
+        app.open_model_picker();
+
+        let picker = app.model_picker.as_ref().expect("picker should be open");
+        assert_eq!(picker.options, vec!["model", "other"]);
+        assert_eq!(picker.selected, 0);
+    }
+
+    #[test]
+    fn open_model_picker_with_no_candidates_still_offers_the_active_model() {
+        // e.g. the OpenAI provider has no built-in table; the picker degrades
+        // to a one-row list instead of an empty dialog.
+        let mut app = app();
+
+        app.open_model_picker();
+
+        let picker = app.model_picker.as_ref().expect("picker should be open");
+        assert_eq!(picker.options, vec!["model"]);
+        assert_eq!(picker.selected, 0);
     }
 
     #[test]
