@@ -110,6 +110,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         draw_input(frame, app, bottom, theme);
         draw_command_menu(frame, app, bottom, theme);
         draw_model_picker(frame, app, bottom, theme);
+        draw_session_picker(frame, app, bottom, theme);
     }
     draw_footer(frame, app, footer, theme);
 }
@@ -208,6 +209,62 @@ fn draw_model_picker(frame: &mut Frame, app: &App, anchor: Rect, theme: Theme) {
                 .borders(Borders::ALL)
                 .title(
                     Line::from(" Model — Enter to switch, Esc to cancel ")
+                        .style(theme.accent_strong()),
+                )
+                .border_style(theme.divider()),
+        ),
+        area,
+    );
+}
+
+/// Floats the `/resume` session picker above the composer, in the same spot
+/// as the other dialogs (they never show together). Unlike the model picker's
+/// handful of options, a session listing can far exceed the panel, so the
+/// drawn rows window around the highlight to keep it always visible; the
+/// session this process is running is annotated so re-picking it reads as a
+/// deliberate no-op.
+fn draw_session_picker(frame: &mut Frame, app: &App, anchor: Rect, theme: Theme) {
+    let Some(picker) = &app.session_picker else {
+        return;
+    };
+    let rows = picker.sessions.len().min(MENU_MAX_ROWS);
+    let height = (rows as u16).saturating_add(2).min(anchor.y); // borders; clipped on tiny frames
+    if height < 3 {
+        return;
+    }
+    let area = Rect::new(anchor.x, anchor.y - height, anchor.width, height);
+    // Stateless window derived from the selection alone: top-anchored while
+    // the highlight fits, then the highlight rides the bottom row.
+    let start = picker.selected.saturating_sub(rows.saturating_sub(1));
+    let lines: Vec<Line> = picker
+        .sessions
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(rows)
+        .map(|(index, session)| {
+            let label = crate::resume::session_label(session);
+            let mut spans = if index == picker.selected {
+                vec![
+                    Span::styled("❯ ", theme.accent_strong()),
+                    Span::styled(label, theme.accent_strong()),
+                ]
+            } else {
+                vec![Span::raw("  "), Span::raw(label)]
+            };
+            if picker.current == Some(index) {
+                spans.push(Span::styled("  (current)", theme.muted()));
+            }
+            Line::from(spans)
+        })
+        .collect();
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).block(
+            Block::new()
+                .borders(Borders::ALL)
+                .title(
+                    Line::from(" Resume session — Enter to load, Esc to cancel ")
                         .style(theme.accent_strong()),
                 )
                 .border_style(theme.divider()),
@@ -650,6 +707,58 @@ mod tests {
         app.model_picker = None;
         terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
         assert!(!format!("{}", terminal.backend()).contains("(current)"));
+    }
+
+    #[test]
+    fn session_picker_renders_and_windows_around_the_selection() {
+        use kuncode_agent::session_store::{SessionId, SessionSummary};
+
+        let mut app = App::new("m", PermissionMode::Default);
+        let sessions: Vec<SessionSummary> = (0..12u64)
+            .map(|index| SessionSummary {
+                id: SessionId::new(format!("session-{index:02}")),
+                title: None,
+                created_at: "2026-08-10T00:00:00.000Z".to_string(),
+                updated_at: "2026-08-10T00:00:00.000Z".to_string(),
+                message_count: index,
+                preview: Some(format!("task number {index:02}")),
+            })
+            .collect();
+        let active = SessionId::new("session-00");
+        app.open_session_picker(sessions, Some(&active));
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).expect("test terminal");
+
+        terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
+
+        let rendered = format!("{}", terminal.backend());
+        assert!(
+            rendered.contains("Resume session"),
+            "picker panel:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("❯ ") && rendered.contains("task number 00"),
+            "the active session starts highlighted:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("(current)"),
+            "the active session is annotated:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("task number 11"),
+            "rows beyond the window stay hidden:\n{rendered}"
+        );
+
+        // Moving the highlight past the window slides later rows into view.
+        app.session_picker.as_mut().expect("open").selected = 11;
+        terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
+        let rendered = format!("{}", terminal.backend());
+        assert!(rendered.contains("task number 11"));
+        assert!(!rendered.contains("task number 00"));
+
+        // Closing the picker removes the panel.
+        app.session_picker = None;
+        terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
+        assert!(!format!("{}", terminal.backend()).contains("Resume session"));
     }
 
     #[test]

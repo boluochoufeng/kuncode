@@ -14,6 +14,7 @@ use super::app::App;
 enum Command {
     Help,
     Model,
+    Resume,
     Quit,
 }
 
@@ -37,6 +38,11 @@ const COMMANDS: &[CommandSpec] = &[
         command: Command::Model,
     },
     CommandSpec {
+        name: "resume",
+        description: "switch to another stored session of this project",
+        command: Command::Resume,
+    },
+    CommandSpec {
         name: "quit",
         description: "quit kuncode (typing `exit` also works)",
         command: Command::Quit,
@@ -58,16 +64,18 @@ pub(super) enum Dispatch {
     Prompt,
     /// `/model <name>`: the switch needs the event loop's runner + switcher.
     SwitchModel(String),
+    /// Bare `/resume`: listing the stored sessions needs the event loop's
+    /// store handle (and is async), so the picker opens there.
+    PickSession,
 }
 
 /// Routes one submitted line. Command attempts execute against `app` (echo +
 /// output as [`Item::Notice`](super::app::Item::Notice)); anything else is
 /// the caller's prompt.
 ///
-/// Effects are App-only today. A command needing the event loop's resources
-/// (session/runner — e.g. a future `/model`) grows a payload variant on
-/// [`Dispatch`] that `handle_idle_key` forwards to its caller; the single
-/// call site keeps that migration compiler-guided.
+/// Commands needing the event loop's resources (session/runner/store) return
+/// a payload variant on [`Dispatch`] that `handle_idle_key` forwards to its
+/// caller; the single call site keeps that contract compiler-guided.
 pub(super) fn dispatch(app: &mut App, input: &str) -> Dispatch {
     let Some(invocation) = parse(input) else {
         return Dispatch::Prompt;
@@ -93,6 +101,17 @@ pub(super) fn dispatch(app: &mut App, input: &str) -> Dispatch {
             } else {
                 return Dispatch::SwitchModel(name.to_string());
             }
+        }
+        Some(CommandSpec {
+            command: Command::Resume,
+            ..
+        }) => {
+            if invocation.args.is_empty() {
+                return Dispatch::PickSession;
+            }
+            // Unlike `--resume=<ID>`, the in-TUI form is picker-only: ids are
+            // long and unmemorable mid-session, and the panel shows them all.
+            app.push_notice("usage: /resume — no arguments; pick from the list".to_string());
         }
         Some(CommandSpec {
             command: Command::Quit,
@@ -210,7 +229,10 @@ mod tests {
 
     #[test]
     fn a_lone_slash_offers_every_command_in_table_order() {
-        assert_eq!(completion_names("/"), Some(vec!["help", "model", "quit"]));
+        assert_eq!(
+            completion_names("/"),
+            Some(vec!["help", "model", "resume", "quit"])
+        );
     }
 
     #[test]
@@ -303,6 +325,31 @@ mod tests {
 
         assert!(matches!(
             dispatch(&mut app, "/model a b"),
+            Dispatch::Handled
+        ));
+
+        assert!(notice_texts(&app)[1].contains("usage"));
+    }
+
+    #[test]
+    fn resume_without_args_returns_the_pick_payload() {
+        let mut app = app();
+
+        assert!(matches!(
+            dispatch(&mut app, "/resume"),
+            Dispatch::PickSession
+        ));
+
+        // Only the echo notice: the listing + picker happen in the event loop.
+        assert_eq!(notice_texts(&app), vec!["/resume"]);
+    }
+
+    #[test]
+    fn resume_with_args_is_a_usage_notice() {
+        let mut app = app();
+
+        assert!(matches!(
+            dispatch(&mut app, "/resume some-id"),
             Dispatch::Handled
         ));
 

@@ -7,6 +7,7 @@ use std::time::Duration;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use kuncode_agent::observer::EventKind;
 use kuncode_agent::permission::{ApprovalResolution, PermissionMode};
+use kuncode_agent::session_store::{SessionId, SessionSummary};
 use kuncode_agent::todo::TodoItem;
 use kuncode_core::completion::Usage;
 
@@ -66,6 +67,19 @@ pub struct ModelPicker {
     pub selected: usize,
 }
 
+/// The `/resume` selection dialog: this project's stored sessions, newest
+/// first, snapshotted when the picker opened. Never empty —
+/// [`open_session_picker`](App::open_session_picker) refuses an empty list —
+/// so `selected` stays in bounds by construction.
+pub struct SessionPicker {
+    pub sessions: Vec<SessionSummary>,
+    pub selected: usize,
+    /// Index of the session this process is currently running, when listed.
+    /// Re-picking it closes the dialog instead of reloading: a rebuild would
+    /// drop non-persisted state such as session-scoped permission grants.
+    pub current: Option<usize>,
+}
+
 /// Mutable state driving the terminal UI.
 pub struct App {
     pub model_name: String,
@@ -123,6 +137,9 @@ pub struct App {
     /// Open model-selection dialog; while present it captures Up/Down, Enter,
     /// and Esc at idle instead of the composer.
     pub model_picker: Option<ModelPicker>,
+    /// Open `/resume` session dialog, modal exactly like
+    /// [`model_picker`](Self::model_picker); the two never show together.
+    pub session_picker: Option<SessionPicker>,
     /// Provider usage accumulated across this process run, for the exit report.
     /// Fed from each completed turn's aggregate plus compaction summary calls;
     /// usage of turns that unwind before returning is not recoverable here.
@@ -152,6 +169,7 @@ impl App {
             menu_selection: 0,
             available_models: Vec::new(),
             model_picker: None,
+            session_picker: None,
             session_usage: Usage::default(),
             colors_enabled: std::env::var_os("NO_COLOR").is_none(),
             animation_frame: 0,
@@ -275,6 +293,27 @@ impl App {
             .position(|name| *name == self.model_name)
             .unwrap_or(0);
         self.model_picker = Some(ModelPicker { options, selected });
+    }
+
+    /// Opens the session picker over this project's stored sessions, starting
+    /// on the active session when it is listed. An empty list never opens a
+    /// dialog — a notice explains instead — which keeps
+    /// [`SessionPicker::selected`] in bounds for the picker's lifetime.
+    pub fn open_session_picker(
+        &mut self,
+        sessions: Vec<SessionSummary>,
+        active: Option<&SessionId>,
+    ) {
+        if sessions.is_empty() {
+            self.push_notice("no resumable sessions in this project".to_string());
+            return;
+        }
+        let current = active.and_then(|id| sessions.iter().position(|session| session.id == *id));
+        self.session_picker = Some(SessionPicker {
+            sessions,
+            selected: current.unwrap_or(0),
+            current,
+        });
     }
 
     pub fn push_error(&mut self, text: String) {
@@ -532,6 +571,55 @@ mod tests {
         let picker = app.model_picker.as_ref().expect("picker should be open");
         assert_eq!(picker.options, vec!["model"]);
         assert_eq!(picker.selected, 0);
+    }
+
+    fn summary(id: &str) -> SessionSummary {
+        SessionSummary {
+            id: SessionId::new(id),
+            title: None,
+            created_at: "2026-08-10T00:00:00.000Z".to_string(),
+            updated_at: "2026-08-10T00:00:00.000Z".to_string(),
+            message_count: 0,
+            preview: None,
+        }
+    }
+
+    #[test]
+    fn open_session_picker_starts_on_the_active_session() {
+        let mut app = app();
+        let active = SessionId::new("s2");
+
+        app.open_session_picker(vec![summary("s1"), summary("s2")], Some(&active));
+
+        let picker = app.session_picker.as_ref().expect("picker should be open");
+        assert_eq!(picker.selected, 1);
+        assert_eq!(picker.current, Some(1));
+    }
+
+    #[test]
+    fn open_session_picker_without_the_active_session_starts_at_the_top() {
+        // e.g. persistence degraded (no durable id) or the active session fell
+        // off the listing: no row is "current", the newest starts highlighted.
+        let mut app = app();
+
+        app.open_session_picker(vec![summary("s1"), summary("s2")], None);
+
+        let picker = app.session_picker.as_ref().expect("picker should be open");
+        assert_eq!(picker.selected, 0);
+        assert_eq!(picker.current, None);
+    }
+
+    #[test]
+    fn open_session_picker_with_no_sessions_notices_instead_of_opening() {
+        let mut app = app();
+
+        app.open_session_picker(Vec::new(), None);
+
+        assert!(app.session_picker.is_none());
+        assert!(matches!(
+            app.conversation.as_slice(),
+            [Item::Notice(text)] if text.contains("no resumable sessions")
+        ));
     }
 
     #[test]

@@ -134,14 +134,20 @@ fn pick_session(
 }
 
 fn picker_row(index: usize, session: &SessionSummary) -> String {
+    format!("  {:>3}. {}", index + 1, session_label(session))
+}
+
+/// One-line session descriptor — local update time, message count, then
+/// title/preview — shared by the stdin picker rows and the TUI's `/resume`
+/// panel so both surfaces describe a session identically.
+pub(crate) fn session_label(session: &SessionSummary) -> String {
     let title = session
         .title
         .as_deref()
         .or(session.preview.as_deref())
         .unwrap_or("(empty session)");
     format!(
-        "  {:>3}. {}  {:>4} msgs  {}",
-        index + 1,
+        "{}  {:>4} msgs  {}",
         local_time(&session.updated_at),
         session.message_count,
         title,

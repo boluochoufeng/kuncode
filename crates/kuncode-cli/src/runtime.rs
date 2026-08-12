@@ -219,6 +219,61 @@ impl CliRuntime<RetryModel<AnyChatCompletionModel>> {
     }
 }
 
+/// Everything a mid-session `/resume` needs after
+/// [`into_runner`](CliRuntime::into_runner) consumed the runtime: the store
+/// handle for listing and rebuilding this project's sessions, plus the startup
+/// permission mode a rebuilt session begins from.
+pub(crate) struct SessionResumer {
+    store: Option<Arc<dyn SessionStore>>,
+    persistence_error: Option<String>,
+    project_root: std::path::PathBuf,
+    mode: PermissionMode,
+}
+
+impl SessionResumer {
+    /// Lists this project's stored sessions, most recently updated first.
+    ///
+    /// # Errors
+    /// Fails when the session store is unavailable or the listing query fails;
+    /// resume flows need the real reason instead of an empty list.
+    pub(crate) async fn list(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<SessionSummary>, Box<dyn std::error::Error>> {
+        let store = self.available_store()?;
+        Ok(store.list_sessions(&self.project_root, limit).await?)
+    }
+
+    /// Rebuilds the stored session `id` at the startup permission mode.
+    ///
+    /// # Errors
+    /// Fails when the store is unavailable or the rebuild rejects the id — the
+    /// user asked for a specific history, so failure must not be silent.
+    pub(crate) async fn resume(
+        &self,
+        id: SessionId,
+    ) -> Result<AgentSession, Box<dyn std::error::Error>> {
+        let store = self.available_store()?;
+        let session =
+            AgentSession::resume_durable_session(store.as_ref(), id.clone(), self.mode).await?;
+        tracing::info!(
+            target: "kuncode::persistence",
+            session_id = id.as_str(),
+            messages = session.messages().len(),
+            "session resumed",
+        );
+        Ok(session)
+    }
+
+    fn available_store(&self) -> Result<&Arc<dyn SessionStore>, Box<dyn std::error::Error>> {
+        match (&self.store, &self.persistence_error) {
+            (Some(store), _) => Ok(store),
+            (None, Some(reason)) => Err(format!("session store unavailable: {reason}").into()),
+            (None, None) => Err("session store unavailable".into()),
+        }
+    }
+}
+
 /// Everything a mid-session `/model` switch needs after
 /// [`into_runner`](CliRuntime::into_runner) consumed the runtime. All parts
 /// are model-independent: the provider client (and its connection pool) is
@@ -390,8 +445,7 @@ impl<M: CompletionModel> CliRuntime<M> {
         &self,
         limit: usize,
     ) -> Result<Vec<SessionSummary>, Box<dyn std::error::Error>> {
-        let store = self.available_store()?;
-        Ok(store.list_sessions(&self.project_root, limit).await?)
+        self.session_resumer().list(limit).await
     }
 
     /// Requests that [`session`](Self::session) resume this stored session
@@ -400,11 +454,15 @@ impl<M: CompletionModel> CliRuntime<M> {
         self.resume_target = Some(id);
     }
 
-    fn available_store(&self) -> Result<&Arc<dyn SessionStore>, Box<dyn std::error::Error>> {
-        match (&self.session_store, &self.persistence_error) {
-            (Some(store), _) => Ok(store),
-            (None, Some(reason)) => Err(format!("session store unavailable: {reason}").into()),
-            (None, None) => Err("session store unavailable".into()),
+    /// Snapshot for mid-session `/resume`; like
+    /// [`model_switcher`](CliRuntime::model_switcher), call before
+    /// [`into_runner`](Self::into_runner) consumes the runtime.
+    pub(crate) fn session_resumer(&self) -> SessionResumer {
+        SessionResumer {
+            store: self.session_store.clone(),
+            persistence_error: self.persistence_error.clone(),
+            project_root: self.project_root.clone(),
+            mode: self.mode,
         }
     }
 
@@ -423,16 +481,7 @@ impl<M: CompletionModel> CliRuntime<M> {
     /// rejects it.
     pub async fn session(&self) -> Result<AgentSession, Box<dyn std::error::Error>> {
         if let Some(id) = &self.resume_target {
-            let store = self.available_store()?;
-            let session =
-                AgentSession::resume_durable_session(store.as_ref(), id.clone(), self.mode).await?;
-            tracing::info!(
-                target: "kuncode::persistence",
-                session_id = id.as_str(),
-                messages = session.messages().len(),
-                "session resumed",
-            );
-            return Ok(session);
+            return self.session_resumer().resume(id.clone()).await;
         }
         let mut session = AgentSession::with_mode(self.mode);
         match (&self.session_store, &self.persistence_error) {

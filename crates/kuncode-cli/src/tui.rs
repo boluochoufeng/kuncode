@@ -25,6 +25,7 @@ use kuncode_agent::error::AgentError;
 use kuncode_agent::observer::AgentEvent;
 use kuncode_agent::runner::AgentRunner;
 use kuncode_agent::session::AgentSession;
+use kuncode_agent::session_store::SessionId;
 use kuncode_core::completion::{CompletionModel, RetryModel};
 use kuncode_core::providers::any_chat::AnyChatCompletionModel;
 use tokio::sync::mpsc::{self, UnboundedReceiver};
@@ -32,7 +33,7 @@ use tokio_util::sync::CancellationToken;
 
 use self::app::{App, Status};
 use self::bridge::{ApprovalRequest, TuiApprover, TuiObserver};
-use crate::runtime::{CliRuntime, ModelSwitcher};
+use crate::runtime::{CliRuntime, ModelSwitcher, SessionResumer};
 
 /// The one model type the TUI runs. Concrete (unlike [`CliRuntime`]) because a
 /// `/model` switch rebuilds the turn and summary models with two different
@@ -59,6 +60,11 @@ const REVEAL_CPS: u32 = 80;
 /// delay the commit by more than this.
 const MAX_DRAIN: Duration = Duration::from_millis(3000);
 
+/// Upper bound on sessions offered by the `/resume` picker. Smaller than the
+/// startup picker's limit: the panel is walked row-by-row with arrow keys, so
+/// a longer listing is unnavigable anyway.
+const SESSION_LISTING_LIMIT: usize = 50;
+
 /// Runs the interactive TUI until the user quits.
 ///
 /// Wraps the assembled runner pieces with the TUI's own observer + approver,
@@ -75,6 +81,7 @@ pub async fn run(runtime: CliRuntime<CliModel>) -> io::Result<()> {
     let model_name = runtime.model_name().to_string();
     let mode = runtime.mode();
     let switcher = runtime.model_switcher();
+    let resumer = runtime.session_resumer();
     let mut session = runtime
         .session()
         .await
@@ -95,6 +102,7 @@ pub async fn run(runtime: CliRuntime<CliModel>) -> io::Result<()> {
         &mut terminal,
         runner,
         &switcher,
+        &resumer,
         &mut session,
         &mut app,
         &mut event_rx,
@@ -229,6 +237,7 @@ async fn event_loop(
     terminal: &mut ratatui::DefaultTerminal,
     mut runner: AgentRunner<CliModel>,
     switcher: &ModelSwitcher,
+    resumer: &SessionResumer,
     session: &mut AgentSession,
     app: &mut App,
     event_rx: &mut UnboundedReceiver<AgentEvent>,
@@ -277,6 +286,32 @@ async fn event_loop(
                         }
                         Err(error) => app.push_error(error.to_string()),
                     },
+                    // Between turns like a model switch. The listing await
+                    // blocks the loop, but the store is a local database —
+                    // the stall is well under a frame.
+                    Some(Submission::PickSession) => {
+                        match resumer.list(SESSION_LISTING_LIMIT).await {
+                            Ok(sessions) => app.open_session_picker(sessions, session.session_id()),
+                            Err(error) => app.push_error(error.to_string()),
+                        }
+                    }
+                    Some(Submission::ResumeSession(id)) => {
+                        match resumer.resume(id.clone()).await {
+                            Ok(resumed) => {
+                                *session = resumed;
+                                // The transcript now belongs to the resumed
+                                // session: rebuild it from that history, like
+                                // a fresh `--resume` start. Process-scoped
+                                // usage keeps accumulating for the exit report.
+                                app.conversation.clear();
+                                app.plan.clear();
+                                app.follow_tail();
+                                seed_transcript(app, session);
+                                app.push_notice(format!("resumed session {}", id.as_str()));
+                            }
+                            Err(error) => app.push_error(error.to_string()),
+                        }
+                    }
                     None => {}
                 }
             }
@@ -431,6 +466,10 @@ enum Submission {
     Prompt(String),
     /// Switch the completion model to this name, between turns.
     SwitchModel(String),
+    /// List stored sessions and open the `/resume` picker.
+    PickSession,
+    /// Replace the live session with this stored one, between turns.
+    ResumeSession(SessionId),
 }
 
 /// Handles a key in the idle state. Returns `Some` when Enter submits work for
@@ -438,6 +477,9 @@ enum Submission {
 fn handle_idle_key(app: &mut App, key: KeyEvent) -> Option<Submission> {
     if app.model_picker.is_some() {
         return handle_picker_key(app, key);
+    }
+    if app.session_picker.is_some() {
+        return handle_session_picker_key(app, key);
     }
     if let Some(submitted) = handle_menu_key(app, key) {
         return submitted;
@@ -518,6 +560,7 @@ fn handle_idle_key(app: &mut App, key: KeyEvent) -> Option<Submission> {
                     command::Dispatch::Handled => None,
                     command::Dispatch::Prompt => Some(Submission::Prompt(submitted)),
                     command::Dispatch::SwitchModel(name) => Some(Submission::SwitchModel(name)),
+                    command::Dispatch::PickSession => Some(Submission::PickSession),
                 }
             }
         }
@@ -581,6 +624,43 @@ fn handle_picker_key(app: &mut App, key: KeyEvent) -> Option<Submission> {
     None
 }
 
+/// Handles a key while the `/resume` session picker is open. Modal exactly
+/// like [`handle_picker_key`]: Up/Down move the highlight, Enter resumes the
+/// highlighted session (re-picking the current one just closes — a reload
+/// would drop session-scoped grants for nothing), Esc cancels, Ctrl+C still
+/// quits, and every other key is swallowed instead of reaching the composer.
+fn handle_session_picker_key(app: &mut App, key: KeyEvent) -> Option<Submission> {
+    if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
+        app.should_quit = true;
+        return None;
+    }
+    if !key.modifiers.is_empty() {
+        return None;
+    }
+    let picker = app.session_picker.as_mut()?; // caller guards is_some
+    match key.code {
+        KeyCode::Up => picker.selected = picker.selected.saturating_sub(1),
+        KeyCode::Down => {
+            picker.selected = (picker.selected + 1).min(picker.sessions.len().saturating_sub(1));
+        }
+        KeyCode::Enter => {
+            let picker = app.session_picker.take()?;
+            if picker.current == Some(picker.selected) {
+                return None;
+            }
+            let chosen = picker
+                .sessions
+                .into_iter()
+                .nth(picker.selected)
+                .expect("selected stays in bounds for the picker's lifetime");
+            return Some(Submission::ResumeSession(chosen.id));
+        }
+        KeyCode::Esc => app.session_picker = None,
+        _ => {}
+    }
+    None
+}
+
 /// Intercepts a key while the slash-command completion menu is open (the
 /// composer holds a command name in progress with at least one match). The
 /// menu owns Up/Down (selection), Tab (complete into the composer), and Enter
@@ -591,9 +671,9 @@ fn handle_picker_key(app: &mut App, key: KeyEvent) -> Option<Submission> {
 /// `None` = not consumed; `Some(inner)` = consumed, with `inner` as
 /// [`handle_idle_key`]'s return value — `None` for navigation/completion,
 /// `Some(Submission)` when running the highlighted command yields work for the
-/// event loop (menu Enter always dispatches a bare command name, so today it
-/// always yields `None` — bare `/model` opens the picker dialog rather than
-/// switching; the forwarding keeps the compiler honest if that ever changes).
+/// event loop (menu Enter always dispatches a bare command name: bare `/model`
+/// opens its picker dialog directly, while bare `/resume` yields
+/// [`Submission::PickSession`] because listing sessions needs the event loop).
 fn handle_menu_key(app: &mut App, key: KeyEvent) -> Option<Option<Submission>> {
     if !key.modifiers.is_empty() {
         return None;
@@ -621,6 +701,7 @@ fn handle_menu_key(app: &mut App, key: KeyEvent) -> Option<Option<Submission>> {
                     // for the compiler to police as commands grow payloads.
                     command::Dispatch::Prompt => None,
                     command::Dispatch::SwitchModel(name) => Some(Submission::SwitchModel(name)),
+                    command::Dispatch::PickSession => Some(Submission::PickSession),
                 },
             );
         }
@@ -782,10 +863,12 @@ mod tests {
     #[test]
     fn menu_navigation_selects_and_clamps() {
         let mut app = App::new("m", PermissionMode::Default);
-        typing(&mut app, "/"); // menu: [help, quit]
-        assert!(handle_idle_key(&mut app, key(KeyCode::Down)).is_none());
-        // A second Down must clamp at the last row instead of running past it.
-        assert!(handle_idle_key(&mut app, key(KeyCode::Down)).is_none());
+        typing(&mut app, "/"); // menu: [help, model, resume, quit]
+        // One Down per row past the first, plus an extra that must clamp at
+        // the last row instead of running past it.
+        for _ in 0..4 {
+            assert!(handle_idle_key(&mut app, key(KeyCode::Down)).is_none());
+        }
         assert!(handle_idle_key(&mut app, enter()).is_none());
         assert!(app.should_quit, "Down should have selected /quit");
     }
@@ -863,6 +946,80 @@ mod tests {
     #[test]
     fn picker_ctrl_c_still_quits() {
         let mut app = picker_app();
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(handle_idle_key(&mut app, ctrl_c).is_none());
+        assert!(app.should_quit);
+    }
+
+    fn stored_session(id: &str) -> kuncode_agent::session_store::SessionSummary {
+        kuncode_agent::session_store::SessionSummary {
+            id: SessionId::new(id),
+            title: None,
+            created_at: "2026-08-10T00:00:00.000Z".to_string(),
+            updated_at: "2026-08-10T00:00:00.000Z".to_string(),
+            message_count: 0,
+            preview: None,
+        }
+    }
+
+    /// An app with the session picker open over ["a", "b"], "a" current + selected.
+    fn session_picker_app() -> App {
+        let mut app = App::new("m", PermissionMode::Default);
+        let active = SessionId::new("a");
+        app.open_session_picker(
+            vec![stored_session("a"), stored_session("b")],
+            Some(&active),
+        );
+        app
+    }
+
+    #[test]
+    fn typing_slash_resume_then_enter_asks_for_the_listing() {
+        let mut app = App::new("m", PermissionMode::Default);
+        // Bare `/resume` matches the completion menu, so Enter runs the
+        // highlighted command; the listing itself happens in the event loop.
+        typing(&mut app, "/resume");
+        assert_eq!(
+            handle_idle_key(&mut app, enter()),
+            Some(Submission::PickSession)
+        );
+        assert!(app.input.is_empty(), "the submission clears the composer");
+    }
+
+    #[test]
+    fn session_picker_enter_on_another_session_submits_a_resume() {
+        let mut app = session_picker_app();
+        assert!(handle_idle_key(&mut app, key(KeyCode::Down)).is_none());
+        assert_eq!(
+            handle_idle_key(&mut app, enter()),
+            Some(Submission::ResumeSession(SessionId::new("b")))
+        );
+        assert!(app.session_picker.is_none(), "picking closes the dialog");
+    }
+
+    #[test]
+    fn session_picker_enter_on_the_current_session_closes_without_resuming() {
+        let mut app = session_picker_app();
+        assert!(handle_idle_key(&mut app, enter()).is_none());
+        assert!(app.session_picker.is_none());
+    }
+
+    #[test]
+    fn session_picker_esc_cancels_and_typing_is_swallowed() {
+        let mut app = session_picker_app();
+        assert!(handle_idle_key(&mut app, key(KeyCode::Char('x'))).is_none());
+        assert!(
+            app.input.is_empty(),
+            "the dialog is modal; typing must not reach the composer"
+        );
+        assert!(handle_idle_key(&mut app, key(KeyCode::Esc)).is_none());
+        assert!(app.session_picker.is_none());
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn session_picker_ctrl_c_still_quits() {
+        let mut app = session_picker_app();
         let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(handle_idle_key(&mut app, ctrl_c).is_none());
         assert!(app.should_quit);
