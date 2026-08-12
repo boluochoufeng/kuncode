@@ -6,6 +6,7 @@ mod cancellation;
 mod compaction_fail_closed;
 mod compaction_redaction;
 mod core_flow;
+mod deferred_session;
 mod events;
 mod hooks_prompt;
 mod hooks_tool_stop;

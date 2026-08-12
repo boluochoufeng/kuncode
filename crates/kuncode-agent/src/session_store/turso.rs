@@ -176,16 +176,27 @@ impl SessionStore for TursoSessionStore {
     ) -> Result<Vec<SessionSummary>, SessionStoreError> {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let connection = self.connection.lock().await;
+        // Message-less sessions are excluded in the query, not post-filtered:
+        // dropping rows after LIMIT would under-fill the page even when more
+        // resumable sessions exist.
         let mut rows = connection
             .query(
                 r#"
                 SELECT id, title, created_at, updated_at
                 FROM sessions
                 WHERE project_root = ?1
+                  AND EXISTS (
+                    SELECT 1 FROM journal_entries
+                    WHERE session_id = sessions.id AND kind = ?2
+                  )
                 ORDER BY updated_at DESC, id DESC
-                LIMIT ?2
+                LIMIT ?3
                 "#,
-                (project_root.to_string_lossy().as_ref(), limit),
+                (
+                    project_root.to_string_lossy().as_ref(),
+                    JournalKind::Message.as_str(),
+                    limit,
+                ),
             )
             .await?;
         let mut headers = Vec::new();

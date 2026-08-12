@@ -52,6 +52,30 @@ impl AgentSession {
         Ok(())
     }
 
+    /// Schedules a durable identity without creating it yet.
+    ///
+    /// The runner materializes the descriptor via
+    /// [`Self::start_durable_session`] immediately before the first journaled
+    /// message, so a session that never exchanges one is never persisted —
+    /// empty rows would otherwise accumulate in resume listings from every
+    /// run that quit without a prompt.
+    ///
+    /// # Errors
+    /// Returns [`SessionAttachError`] when the session already has an identity
+    /// (scheduled or installed), is not pristine, or lost persistence
+    /// authority.
+    pub fn defer_durable_session(&mut self, session: NewSession) -> Result<(), SessionAttachError> {
+        self.ensure_attachable()?;
+        self.deferred_durable = Some(session);
+        Ok(())
+    }
+
+    /// Hands out the scheduled durable identity once (take-and-clear), so the
+    /// runner creates it exactly one time.
+    pub(crate) fn take_deferred_durable_session(&mut self) -> Option<NewSession> {
+        self.deferred_durable.take()
+    }
+
     /// Attaches a newly created durable session at the empty journal frontier.
     ///
     /// Existing journals must be reconstructed through
@@ -73,7 +97,13 @@ impl AgentSession {
         if self.non_durable {
             return Err(SessionAttachError::PersistenceFailed);
         }
-        if self.session_id.is_some() || self.last_durable_seq.is_some() {
+        // A scheduled identity counts as attached: materialization takes the
+        // descriptor before creating it, so any deferral still present here
+        // would race the identity being installed.
+        if self.session_id.is_some()
+            || self.last_durable_seq.is_some()
+            || self.deferred_durable.is_some()
+        {
             return Err(SessionAttachError::AlreadyAttached);
         }
         if !self.messages.is_empty() || self.todo_generation() != 0 {
@@ -245,7 +275,7 @@ pub enum SessionStartError {
 /// Rejects attempts to manufacture durable authority from existing state.
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 pub enum SessionAttachError {
-    /// A durable identity has already been installed.
+    /// A durable identity has already been scheduled or installed.
     #[error("session already has a durable identity")]
     AlreadyAttached,
     /// Existing messages or runtime state lack lineage for the new identity.

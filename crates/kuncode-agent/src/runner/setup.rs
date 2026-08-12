@@ -18,7 +18,7 @@ use crate::{
     },
     registry::ToolRegistry,
     session::AgentSession,
-    session_store::{NewJournalEntry, SessionStore},
+    session_store::{NewJournalEntry, SessionId, SessionStore},
     system_prompt::SystemPrompt,
     tool::ToolResultRetention,
 };
@@ -258,11 +258,39 @@ where
         session.push_tool_result_with_journal_seq(message, journal_seq, retention);
     }
 
+    /// Creates a deferred durable session right before its first journaled
+    /// message, so sessions that never exchange one are never persisted.
+    ///
+    /// Creation failure poisons persistence exactly like an append failure:
+    /// the caller scheduled durability, so its silent absence must not pass
+    /// for health.
+    async fn materialize_deferred_session(&self, session: &mut AgentSession) {
+        let Some(new_session) = session.take_deferred_durable_session() else {
+            return;
+        };
+        let Some(store) = &self.session_store else {
+            session.mark_persistence_failed("deferred session store is unavailable");
+            return;
+        };
+        match session
+            .start_durable_session(store.as_ref(), new_session)
+            .await
+        {
+            Ok(()) => tracing::info!(
+                target: "kuncode::persistence",
+                session_id = session.session_id().map_or("-", SessionId::as_str),
+                "durable session started",
+            ),
+            Err(error) => session.mark_persistence_failed(error.to_string()),
+        }
+    }
+
     async fn persist_message(
         &self,
         session: &mut AgentSession,
         message: &Message,
     ) -> Option<crate::session_store::Seq> {
+        self.materialize_deferred_session(session).await;
         let session_id = session.session_id().cloned();
         let mut journal_seq = None;
         if let Some(session_id) = session_id

@@ -40,7 +40,10 @@ pub trait SessionStore: Send + Sync {
     /// Lists this project's sessions, most recently updated first.
     ///
     /// The project is identified by the exact root path given to
-    /// [`NewSession::new`]. `limit` bounds the returned rows.
+    /// [`NewSession::new`]. `limit` bounds the returned rows. Sessions with no
+    /// journaled messages are omitted: they are not resumable histories, only
+    /// rows a run left behind before journaling anything (session creation is
+    /// normally deferred until the first message, so such rows are rare).
     ///
     /// # Errors
     /// Returns the underlying storage error when the listing query fails.

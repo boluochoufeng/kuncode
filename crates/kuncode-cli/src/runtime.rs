@@ -467,44 +467,28 @@ impl<M: CompletionModel> CliRuntime<M> {
     }
 
     /// Creates a session — or rebuilds the requested resume target — and
-    /// attempts to establish its durable identity.
+    /// schedules its durable identity.
     ///
-    /// For a new session, store-open and session-creation failures do not
-    /// prevent construction: they are recorded on the returned session so
-    /// observers can report the degradation and persistence-dependent
-    /// compaction fails closed. Resuming is different — the user asked for a
-    /// specific history, so any failure to rebuild it is an error rather than
-    /// a silently empty session.
+    /// For a new session, durable creation is deferred: the runner creates the
+    /// store row right before the first journaled message, so a session that
+    /// never exchanges one is never persisted. A store-open failure is
+    /// recorded on the returned session so observers can report the
+    /// degradation and persistence-dependent compaction fails closed.
+    /// Resuming is different — the user asked for a specific history, so any
+    /// failure to rebuild it is an error rather than a silently empty session.
     ///
     /// # Errors
     /// Fails only when a resume target is set and the store or the rebuild
-    /// rejects it.
+    /// rejects it (deferring on a freshly built session cannot fail).
     pub async fn session(&self) -> Result<AgentSession, Box<dyn std::error::Error>> {
         if let Some(id) = &self.resume_target {
             return self.session_resumer().resume(id.clone()).await;
         }
         let mut session = AgentSession::with_mode(self.mode);
         match (&self.session_store, &self.persistence_error) {
-            (Some(store), _) => match session
-                .start_durable_session(store.as_ref(), NewSession::new(self.project_root.clone()))
-                .await
-            {
-                Ok(()) => tracing::info!(
-                    target: "kuncode::persistence",
-                    session_id = session
-                        .session_id()
-                        .map_or("-", kuncode_agent::session_store::SessionId::as_str),
-                    "durable session started",
-                ),
-                Err(error) => {
-                    tracing::warn!(
-                        target: "kuncode::persistence",
-                        diagnostic_chars = error.to_string().chars().count(),
-                        "durable session creation failed",
-                    );
-                    session.mark_persistence_failed(error.to_string());
-                }
-            },
+            (Some(_), _) => {
+                session.defer_durable_session(NewSession::new(self.project_root.clone()))?;
+            }
             (None, Some(error)) => session.mark_persistence_failed(error.clone()),
             (None, None) => {}
         }
