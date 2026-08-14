@@ -31,7 +31,7 @@ use kuncode_core::providers::any_chat::AnyChatCompletionModel;
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 use tokio_util::sync::CancellationToken;
 
-use self::app::{App, Status};
+use self::app::{App, Status, mode_label, next_mode};
 use self::bridge::{ApprovalRequest, TuiApprover, TuiObserver};
 use crate::runtime::{CliRuntime, ModelSwitcher, SessionResumer};
 
@@ -295,10 +295,29 @@ async fn event_loop(
                             Err(error) => app.push_error(error.to_string()),
                         }
                     }
+                    // Between turns, so the mode a turn was authorized under
+                    // cannot change underneath it. The session overlay is the
+                    // authority; `app.mode` only mirrors it for the footer.
+                    Some(Submission::CycleMode) => {
+                        let mode = next_mode(app.mode);
+                        session.permissions_mut().set_mode(mode);
+                        app.mode = mode;
+                        app.push_notice(format!("permission mode: {}", mode_label(mode)));
+                        tracing::info!(
+                            target: "kuncode::authorization",
+                            permission_mode = ?mode,
+                            "permission mode switched",
+                        );
+                    }
                     Some(Submission::ResumeSession(id)) => {
                         match resumer.resume(id.clone()).await {
                             Ok(resumed) => {
                                 *session = resumed;
+                                // The resumed session is built with the mode
+                                // this process *started* in, so re-apply the
+                                // live one: a mid-session Shift+Tab choice
+                                // survives `/resume` the way `/model` does.
+                                session.permissions_mut().set_mode(app.mode);
                                 // The transcript now belongs to the resumed
                                 // session: rebuild it from that history, like
                                 // a fresh `--resume` start. Process-scoped
@@ -470,6 +489,8 @@ enum Submission {
     PickSession,
     /// Replace the live session with this stored one, between turns.
     ResumeSession(SessionId),
+    /// Advance the permission mode one step, between turns.
+    CycleMode,
 }
 
 /// Handles a key in the idle state. Returns `Some` when Enter submits work for
@@ -502,6 +523,9 @@ fn handle_idle_key(app: &mut App, key: KeyEvent) -> Option<Submission> {
             app.insert_newline();
             None
         }
+        // Shift+Tab, which terminals report as BackTab (with or without the
+        // modifier bit, depending on the terminal).
+        (_, KeyCode::BackTab) => Some(Submission::CycleMode),
         (_, KeyCode::PageUp) => {
             app.scroll_up(SCROLL_STEP);
             None
@@ -753,6 +777,54 @@ mod tests {
 
     fn enter() -> KeyEvent {
         KeyEvent::new(KeyCode::Enter, KeyModifiers::empty())
+    }
+
+    #[test]
+    fn shift_tab_asks_the_event_loop_to_cycle_the_mode() {
+        let mut app = App::new("m", PermissionMode::Default);
+        typing(&mut app, "half a prompt");
+        let key = KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT);
+
+        assert_eq!(handle_idle_key(&mut app, key), Some(Submission::CycleMode));
+        assert_eq!(
+            app.input, "half a prompt",
+            "cycling the mode must not disturb the composer"
+        );
+    }
+
+    #[test]
+    fn shift_tab_is_recognized_without_the_modifier_bit() {
+        // Terminals disagree on whether BackTab carries SHIFT.
+        let mut app = App::new("m", PermissionMode::Default);
+        let key = KeyEvent::new(KeyCode::BackTab, KeyModifiers::empty());
+
+        assert_eq!(handle_idle_key(&mut app, key), Some(Submission::CycleMode));
+    }
+
+    #[test]
+    fn the_mode_ring_skips_the_unattended_modes() {
+        let mut mode = PermissionMode::Default;
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            mode = next_mode(mode);
+            seen.push(mode);
+        }
+        assert_eq!(
+            seen,
+            vec![
+                PermissionMode::AcceptEdits,
+                PermissionMode::Plan,
+                PermissionMode::Default,
+                PermissionMode::AcceptEdits,
+            ],
+        );
+        // Starting outside the ring lands on the strictest entry, never on
+        // another unattended mode.
+        assert_eq!(
+            next_mode(PermissionMode::BypassPermissions),
+            PermissionMode::Default,
+        );
+        assert_eq!(next_mode(PermissionMode::DontAsk), PermissionMode::Default);
     }
 
     #[test]

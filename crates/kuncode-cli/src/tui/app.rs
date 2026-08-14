@@ -515,6 +515,23 @@ pub fn mode_label(mode: PermissionMode) -> &'static str {
     }
 }
 
+/// The next mode in the Shift+Tab ring.
+///
+/// The ring is deliberately the three *safe* modes — `default` →
+/// `accept-edits` → `plan` — even though [`PermissionMode`] has five.
+/// `bypass` and `dont-ask` change what happens when nobody is watching, so
+/// they stay a startup decision (`--mode`) that cannot be reached by one
+/// mistyped keystroke. A session started in one of them enters the ring at
+/// `default` on the first press, which is stricter than where it was.
+pub fn next_mode(mode: PermissionMode) -> PermissionMode {
+    match mode {
+        PermissionMode::Default => PermissionMode::AcceptEdits,
+        PermissionMode::AcceptEdits => PermissionMode::Plan,
+        PermissionMode::Plan => PermissionMode::Default,
+        PermissionMode::BypassPermissions | PermissionMode::DontAsk => PermissionMode::Default,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

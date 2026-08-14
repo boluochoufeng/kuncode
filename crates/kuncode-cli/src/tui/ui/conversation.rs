@@ -119,15 +119,18 @@ pub(super) fn char_width(ch: char) -> u16 {
     Line::raw(ch.to_string()).width() as u16
 }
 
+/// Display cells `text` occupies, saturating rather than wrapping on absurd input.
+pub(super) fn display_width(text: &str) -> u16 {
+    text.chars()
+        .fold(0u16, |used, ch| used.saturating_add(char_width(ch)))
+}
+
 /// Truncates text to `width` display cells and marks omitted content.
 pub(super) fn truncate_display(text: &str, width: u16) -> String {
     if width == 0 {
         return String::new();
     }
-    let total = text
-        .chars()
-        .fold(0u16, |used, ch| used.saturating_add(char_width(ch)));
-    if total <= width {
+    if display_width(text) <= width {
         return text.to_string();
     }
 

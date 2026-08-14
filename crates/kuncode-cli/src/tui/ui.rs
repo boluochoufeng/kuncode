@@ -12,9 +12,10 @@ use ratatui::{
 
 use kuncode_agent::permission::PermissionMode;
 use kuncode_agent::todo::TodoStatus;
+use kuncode_core::completion::Usage;
 
 use self::conversation::{
-    char_width, draw_conversation, plan_item_line, truncate_display, wrap_lines,
+    char_width, display_width, draw_conversation, plan_item_line, truncate_display, wrap_lines,
 };
 use super::app::{App, Status, mode_label};
 use super::bridge::ApprovalRequest;
@@ -26,6 +27,11 @@ const INPUT_MAX_ROWS: u16 = 6;
 const MENU_MAX_ROWS: usize = 8;
 const PLAN_MAX_ROWS: usize = 5;
 const MIN_CONVERSATION_ROWS: u16 = 2;
+/// Footer hint shown while the transcript is scrolled off its tail.
+const SCROLL_HINT: &str = "↑ earlier output";
+/// Columns the metadata needs before the hint is allowed to share the row;
+/// below this the hint is dropped and the metadata keeps the full width.
+const MIN_METADATA_WIDTH: u16 = 10;
 
 #[derive(Clone, Copy)]
 pub(super) struct Theme {
@@ -520,32 +526,95 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let metadata = format!("{} · {}", app.model_name, mode_label(app.mode));
-    let metadata = truncate_display(&metadata, area.width.saturating_sub(1));
     let mode_style = if app.mode == PermissionMode::BypassPermissions {
         theme.warning()
     } else {
         theme.muted()
     };
 
-    if !app.follow && area.width >= 24 {
-        let left_width = 14u16.min(area.width);
+    // The scroll hint takes the left end, so the metadata is fitted to whatever
+    // is actually left for it rather than to the whole row. The hint's slot is
+    // measured from the hint itself: a fixed width silently clipped it to
+    // "↑ earlier outp".
+    let hint_width = display_width(SCROLL_HINT);
+    let metadata_area = if !app.follow && area.width >= hint_width + MIN_METADATA_WIDTH {
         let [left, right] =
-            Layout::horizontal([Constraint::Length(left_width), Constraint::Min(0)]).areas(area);
+            Layout::horizontal([Constraint::Length(hint_width + 1), Constraint::Min(0)])
+                .areas(area);
         frame.render_widget(
-            Paragraph::new(Line::from("↑ earlier output").style(theme.warning())),
+            Paragraph::new(Line::from(SCROLL_HINT).style(theme.warning())),
             left,
         );
-        frame.render_widget(
-            Paragraph::new(Line::from(metadata).style(mode_style)).alignment(Alignment::Right),
-            right,
-        );
+        right
     } else {
-        frame.render_widget(
-            Paragraph::new(Line::from(metadata).style(mode_style)).alignment(Alignment::Right),
-            area,
-        );
+        area
+    };
+    let metadata = footer_metadata(app, metadata_area.width.saturating_sub(1));
+    frame.render_widget(
+        Paragraph::new(Line::from(metadata).style(mode_style)).alignment(Alignment::Right),
+        metadata_area,
+    );
+}
+
+/// Right-hand status text, fitted to `width` by dropping whole segments instead
+/// of truncating mid-label — a clipped `cach…` reads as a broken number.
+///
+/// Segments run least to most important, and dropping starts from the left, so
+/// a narrow terminal keeps the model and mode the run is actually using and a
+/// wide one also shows what the context is costing.
+fn footer_metadata(app: &App, width: u16) -> String {
+    let mut segments = usage_segments(&app.session_usage);
+    segments.push(app.model_name.clone());
+    segments.push(mode_label(app.mode).to_string());
+
+    while segments.len() > 1 && display_width(&segments.join(" · ")) > width {
+        segments.remove(0);
     }
+    // One segment may still overflow (a long model name on a narrow frame);
+    // only then is a truncation the lesser evil.
+    truncate_display(&segments.join(" · "), width)
+}
+
+/// Token counters worth showing, or nothing at all before the first response.
+///
+/// The cache share is the point of the whole prefix-stability design, so it is
+/// listed last: it is the segment that survives longest as the frame narrows.
+fn usage_segments(usage: &Usage) -> Vec<String> {
+    if usage.input_tokens == 0 && usage.output_tokens == 0 {
+        return Vec::new();
+    }
+    let mut segments = vec![
+        format!("in {}", format_tokens(usage.input_tokens)),
+        format!("out {}", format_tokens(usage.output_tokens)),
+    ];
+    // Providers report cached tokens as a subset of the input count, so the
+    // share is meaningful only once input has been counted.
+    if usage.input_tokens > 0 && usage.cached_input_tokens > 0 {
+        let percent = usage.cached_input_tokens.saturating_mul(100) / usage.input_tokens;
+        segments.push(format!("cache {percent}%"));
+    }
+    segments
+}
+
+/// Abbreviates a token count to at most four columns so the footer's width
+/// stays predictable as the numbers grow. Precision drops with magnitude: a
+/// status line is for noticing trends, not for accounting.
+fn format_tokens(tokens: u64) -> String {
+    match tokens {
+        0..1_000 => tokens.to_string(),
+        1_000..10_000 => one_decimal(tokens, 1_000, 'k'),
+        10_000..1_000_000 => format!("{}k", tokens / 1_000),
+        1_000_000..10_000_000 => one_decimal(tokens, 1_000_000, 'M'),
+        10_000_000..1_000_000_000 => format!("{}M", tokens / 1_000_000),
+        _ => one_decimal(tokens, 1_000_000_000, 'G'),
+    }
+}
+
+/// One decimal place, floored rather than rounded: `{:.1}` would turn 9_999
+/// into `10.0k` and silently widen the field the bands exist to bound.
+fn one_decimal(tokens: u64, unit: u64, suffix: char) -> String {
+    let tenths = tokens / (unit / 10);
+    format!("{}.{}{suffix}", tenths / 10, tenths % 10)
 }
 
 fn approval_lines(approval: &ApprovalRequest, width: u16, theme: Theme) -> Vec<Line<'static>> {
@@ -1054,6 +1123,119 @@ mod tests {
             rendered.contains(task),
             "an exactly-full-width plan row renders untruncated"
         );
+    }
+
+    fn usage(input: u64, output: u64, cached: u64) -> Usage {
+        Usage {
+            input_tokens: input,
+            output_tokens: output,
+            cached_input_tokens: cached,
+            ..Usage::default()
+        }
+    }
+
+    #[test]
+    fn a_fresh_session_shows_only_the_model_and_mode() {
+        let app = App::new("deepseek-v4-flash", PermissionMode::Default);
+        assert_eq!(footer_metadata(&app, 80), "deepseek-v4-flash · default");
+    }
+
+    #[test]
+    fn footer_reports_tokens_and_the_cache_share() {
+        let mut app = App::new("deepseek-v4-flash", PermissionMode::Default);
+        app.add_usage(usage(12_345, 2_100, 11_600));
+
+        assert_eq!(
+            footer_metadata(&app, 80),
+            "in 12k · out 2.1k · cache 93% · deepseek-v4-flash · default",
+        );
+    }
+
+    #[test]
+    fn a_provider_without_cache_reporting_omits_the_share() {
+        let mut app = App::new("gpt-test", PermissionMode::Default);
+        app.add_usage(usage(900, 120, 0));
+
+        assert_eq!(
+            footer_metadata(&app, 80),
+            "in 900 · out 120 · gpt-test · default"
+        );
+    }
+
+    #[test]
+    fn a_narrow_footer_drops_whole_segments_least_important_first() {
+        let mut app = App::new("deepseek-v4-flash", PermissionMode::Default);
+        app.add_usage(usage(12_345, 2_100, 11_600));
+
+        // Wide enough for the cache share but not the raw counts.
+        assert_eq!(
+            footer_metadata(&app, 45),
+            "cache 93% · deepseek-v4-flash · default",
+        );
+        // Only the identity survives; no label is cut in half.
+        assert_eq!(footer_metadata(&app, 30), "deepseek-v4-flash · default");
+        assert_eq!(footer_metadata(&app, 12), "default");
+    }
+
+    #[test]
+    fn one_oversized_segment_is_truncated_rather_than_dropped() {
+        let app = App::new("a-very-long-model-identifier", PermissionMode::Default);
+        let metadata = footer_metadata(&app, 5);
+
+        assert_eq!(display_width(&metadata), 5, "{metadata}");
+        assert!(metadata.ends_with('…'), "{metadata}");
+    }
+
+    #[test]
+    fn the_scroll_hint_and_the_metadata_share_the_footer_row() {
+        let mut app = App::new("m", PermissionMode::Default);
+        app.add_usage(usage(12_345, 2_100, 11_600));
+        // The hint only claims the left end once there is history to be off
+        // the tail of; an empty transcript re-follows on the next draw.
+        for line in 0..20 {
+            app.push_user(format!("line {line}"));
+        }
+        app.scroll_up(50);
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).expect("test terminal");
+        terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
+
+        let rendered = format!("{}", terminal.backend());
+        assert!(rendered.contains("↑ earlier output"), "{rendered}");
+        assert!(rendered.contains("cache 93%"), "{rendered}");
+    }
+
+    #[test]
+    fn token_counts_abbreviate_within_four_columns() {
+        // Band edges included: rounding at one of these is what widens a field.
+        for tokens in [
+            0,
+            999,
+            1_000,
+            9_999,
+            10_000,
+            999_999,
+            1_000_000,
+            9_999_999,
+            10_000_000,
+            999_999_999,
+        ] {
+            let formatted = format_tokens(tokens);
+            assert!(
+                display_width(&formatted) <= 4,
+                "{tokens} rendered as {formatted}",
+            );
+        }
+        assert_eq!(format_tokens(999), "999");
+        assert_eq!(format_tokens(1_000), "1.0k");
+        assert_eq!(
+            format_tokens(9_999),
+            "9.9k",
+            "floored, not rounded to 10.0k"
+        );
+        assert_eq!(format_tokens(12_345), "12k");
+        assert_eq!(format_tokens(999_999), "999k");
+        assert_eq!(format_tokens(1_500_000), "1.5M");
     }
 
     #[test]
