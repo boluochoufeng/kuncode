@@ -77,30 +77,36 @@ impl PromptSection for IdentitySection {
     }
 }
 
-/// Always-on environment block: working directory, OS, and today's local date.
+/// Always-on environment block: working directory, OS, and the start date.
 pub struct EnvironmentSection {
     root: PathBuf,
+    /// Local date captured once at construction. The date grounds relative-time
+    /// references ("latest", "this year") and signals that knowledge past the
+    /// model's training cutoff may be stale — but reading the clock per request
+    /// would rewrite this line the moment a session crosses midnight, and with
+    /// it the cached prefix of every message that follows. A date that goes
+    /// stale after a night of running is the cheaper error.
+    today: String,
 }
 
 impl EnvironmentSection {
-    /// `root` is the workspace directory shown to the model as the cwd.
+    /// `root` is the workspace directory shown to the model as the cwd; the
+    /// local date is read here, once, and then held for the process.
     pub fn new(root: PathBuf) -> Self {
-        Self { root }
+        Self {
+            root,
+            today: Local::now().format("%Y-%m-%d").to_string(),
+        }
     }
 }
 
 impl PromptSection for EnvironmentSection {
     fn render(&self, _ctx: &PromptContext) -> Option<String> {
-        // Local (wall-clock) date, read fresh each request. It only changes
-        // across day boundaries, so it does not thrash the prompt (or its cache)
-        // within a session. The date grounds relative-time references ("latest",
-        // "this year") and signals that knowledge past the model's training
-        // cutoff may be stale.
-        let today = Local::now().format("%Y-%m-%d");
         Some(format!(
-            "Working directory: {}\nOS: {}\nToday's date: {today}",
+            "Working directory: {}\nOS: {}\nToday's date: {}",
             self.root.display(),
             std::env::consts::OS,
+            self.today,
         ))
     }
 }
@@ -247,6 +253,14 @@ mod tests {
             chrono::NaiveDate::parse_from_str(date_line, "%Y-%m-%d").is_ok(),
             "not an ISO date: {date_line}"
         );
+    }
+
+    #[test]
+    fn environment_renders_the_same_block_every_time() {
+        // The cached request prefix depends on this: `render` must project
+        // captured state, never re-read the clock.
+        let section = EnvironmentSection::new(PathBuf::from("/work"));
+        assert_eq!(section.render(&ctx(&[])), section.render(&ctx(&[])));
     }
 
     #[test]
