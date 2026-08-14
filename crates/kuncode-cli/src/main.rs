@@ -1,5 +1,6 @@
 mod approver;
 mod config;
+mod instructions;
 mod logging;
 mod observer;
 mod resume;

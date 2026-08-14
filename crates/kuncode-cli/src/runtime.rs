@@ -24,7 +24,7 @@ use kuncode_agent::session_store::{
     turso::TursoSessionStore,
 };
 use kuncode_agent::system_prompt::{
-    EnvironmentSection, IdentitySection, SystemPrompt, ToolsSection,
+    EnvironmentSection, IdentitySection, InstructionsSection, SystemPrompt, ToolsSection,
 };
 use kuncode_agent::workspace::Workspace;
 use kuncode_core::completion::{CompletionModel, RetryModel, RetryPolicy};
@@ -35,6 +35,7 @@ use kuncode_core::providers::{
 };
 
 use crate::config::{PermissionFlags, resolve_permissions};
+use crate::instructions::load_instructions;
 use crate::settings::{
     ProjectSettings, ProjectTrust, ProviderKind, SettingsError, load_project_settings,
 };
@@ -141,11 +142,23 @@ impl CliRuntime<RetryModel<AnyChatCompletionModel>> {
             "runtime settings resolved",
         );
 
+        // Read once here, not per request: the system message is the cached
+        // request prefix, so editing an instruction file mid-session must not
+        // invalidate the transcript's KV cache. The instructions render last so
+        // the project's own rules are the final word of the prompt.
+        let instructions = load_instructions(workspace.root(), std::env::home_dir().as_deref());
+        tracing::info!(
+            target: "kuncode::runtime",
+            instruction_documents = instructions.len(),
+            "project instructions resolved",
+        );
+
         // Built before `workspace` is moved into the registry below.
         let system_prompt = SystemPrompt::new(vec![
             Box::new(IdentitySection::new(IDENTITY)),
             Box::new(EnvironmentSection::new(workspace.root().to_path_buf())),
             Box::new(ToolsSection),
+            Box::new(InstructionsSection::new(instructions)),
         ]);
 
         let project_root = workspace.root().to_path_buf();
