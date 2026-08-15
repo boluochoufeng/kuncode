@@ -412,7 +412,7 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
         Status::Running => " Working ",
         Status::Compacting => " Compacting ",
     };
-    let block = Block::bordered()
+    let mut block = Block::bordered()
         .title(Line::from(title).style(if app.status == Status::Idle {
             theme.accent_strong()
         } else {
@@ -423,6 +423,9 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
         } else {
             theme.divider()
         });
+    if let Some(tag) = mode_tag(app, area.width, theme) {
+        block = block.title_bottom(tag);
+    }
     let inner = area.inner(Margin::new(1, 1));
     frame.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
@@ -522,16 +525,39 @@ fn caret_position(input: &str, inner_width: u16) -> (u16, u16) {
     (row, col)
 }
 
-fn draw_footer(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
-    if area.width == 0 || area.height == 0 {
-        return;
-    }
-    let mode_style = if app.mode == PermissionMode::BypassPermissions {
+/// Bottom-left tag on the composer: the live permission mode and the key that
+/// cycles it.
+///
+/// This sits on the input box rather than in the footer because it is state you
+/// need *while typing* — what the next Enter is allowed to do. The affordance
+/// drops before the mode does, and both drop before anything is truncated.
+fn mode_tag(app: &App, width: u16, theme: Theme) -> Option<Line<'static>> {
+    let label = mode_label(app.mode);
+    // The one mode that removes the human from the loop is the one worth
+    // colouring; the rest are ordinary state.
+    let label_style = if app.mode == PermissionMode::BypassPermissions {
         theme.warning()
     } else {
         theme.muted()
     };
+    // Two corners plus a cell of breathing room at each end of the border.
+    let border_budget = width.saturating_sub(4);
 
+    let with_hint = format!(" {label} · shift+tab ");
+    if display_width(&with_hint) <= border_budget {
+        return Some(Line::from(vec![
+            Span::styled(format!(" {label}"), label_style),
+            Span::styled(" · shift+tab ", theme.muted()),
+        ]));
+    }
+    let bare = format!(" {label} ");
+    (display_width(&bare) <= border_budget).then(|| Line::from(Span::styled(bare, label_style)))
+}
+
+fn draw_footer(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
     // The scroll hint takes the left end, so the metadata is fitted to whatever
     // is actually left for it rather than to the whole row. The hint's slot is
     // measured from the hint itself: a fixed width silently clipped it to
@@ -551,7 +577,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
     };
     let metadata = footer_metadata(app, metadata_area.width.saturating_sub(1));
     frame.render_widget(
-        Paragraph::new(Line::from(metadata).style(mode_style)).alignment(Alignment::Right),
+        Paragraph::new(Line::from(metadata).style(theme.muted())).alignment(Alignment::Right),
         metadata_area,
     );
 }
@@ -563,9 +589,10 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
 /// a narrow terminal keeps the model and mode the run is actually using and a
 /// wide one also shows what the context is costing.
 fn footer_metadata(app: &App, width: u16) -> String {
+    // The permission mode lives on the composer ([`mode_tag`]), not here:
+    // showing it on both adjacent rows is noise.
     let mut segments = usage_segments(&app.session_usage);
     segments.push(app.model_name.clone());
-    segments.push(mode_label(app.mode).to_string());
 
     while segments.len() > 1 && display_width(&segments.join(" · ")) > width {
         segments.remove(0);
@@ -1135,9 +1162,9 @@ mod tests {
     }
 
     #[test]
-    fn a_fresh_session_shows_only_the_model_and_mode() {
+    fn a_fresh_session_shows_only_the_model() {
         let app = App::new("deepseek-v4-flash", PermissionMode::Default);
-        assert_eq!(footer_metadata(&app, 80), "deepseek-v4-flash · default");
+        assert_eq!(footer_metadata(&app, 80), "deepseek-v4-flash");
     }
 
     #[test]
@@ -1147,7 +1174,7 @@ mod tests {
 
         assert_eq!(
             footer_metadata(&app, 80),
-            "in 12k · out 2.1k · cache 93% · deepseek-v4-flash · default",
+            "in 12k · out 2.1k · cache 93% · deepseek-v4-flash",
         );
     }
 
@@ -1156,10 +1183,7 @@ mod tests {
         let mut app = App::new("gpt-test", PermissionMode::Default);
         app.add_usage(usage(900, 120, 0));
 
-        assert_eq!(
-            footer_metadata(&app, 80),
-            "in 900 · out 120 · gpt-test · default"
-        );
+        assert_eq!(footer_metadata(&app, 80), "in 900 · out 120 · gpt-test");
     }
 
     #[test]
@@ -1168,13 +1192,42 @@ mod tests {
         app.add_usage(usage(12_345, 2_100, 11_600));
 
         // Wide enough for the cache share but not the raw counts.
+        assert_eq!(footer_metadata(&app, 35), "cache 93% · deepseek-v4-flash");
+        // Only the model survives; no label is cut in half.
+        assert_eq!(footer_metadata(&app, 20), "deepseek-v4-flash");
+    }
+
+    #[test]
+    fn the_composer_carries_the_mode_and_its_key() {
+        let mut app = App::new("m", PermissionMode::AcceptEdits);
+        let theme = Theme::new(false);
+
+        let wide = mode_tag(&app, 40, theme).expect("a wide composer shows both");
+        assert_eq!(wide.to_string(), " accept-edits · shift+tab ");
+
+        // Narrow: the affordance goes before the state does.
+        let narrow = mode_tag(&app, 20, theme).expect("the mode alone still fits");
+        assert_eq!(narrow.to_string(), " accept-edits ");
+        assert!(mode_tag(&app, 8, theme).is_none(), "nothing is truncated");
+
+        app.mode = PermissionMode::Default;
         assert_eq!(
-            footer_metadata(&app, 45),
-            "cache 93% · deepseek-v4-flash · default",
+            mode_tag(&app, 40, theme)
+                .expect("always tagged")
+                .to_string(),
+            " default · shift+tab ",
         );
-        // Only the identity survives; no label is cut in half.
-        assert_eq!(footer_metadata(&app, 30), "deepseek-v4-flash · default");
-        assert_eq!(footer_metadata(&app, 12), "default");
+    }
+
+    #[test]
+    fn the_mode_tag_is_drawn_on_the_composer_border() {
+        let mut app = App::new("m", PermissionMode::Plan);
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).expect("test terminal");
+        terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
+
+        let rendered = format!("{}", terminal.backend());
+        assert!(rendered.contains("plan · shift+tab"), "{rendered}");
     }
 
     #[test]
