@@ -23,6 +23,8 @@ use super::command;
 
 const HEADER_HEIGHT: u16 = 2;
 const FOOTER_HEIGHT: u16 = 1;
+/// One row under the composer for the permission mode and its key.
+const MODE_HINT_HEIGHT: u16 = 1;
 const INPUT_MAX_ROWS: u16 = 6;
 const MENU_MAX_ROWS: usize = 8;
 const PLAN_MAX_ROWS: usize = 5;
@@ -94,13 +96,16 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     } else {
         input_height(app, area.width)
     };
-    let (bottom_height, plan_height) = pane_heights(app, area.height, requested_bottom);
+    let hint_height = mode_hint_height(app, area.height, requested_bottom);
+    let (bottom_height, plan_height) =
+        pane_heights(app, area.height, requested_bottom, hint_height);
 
-    let [header, body, plan_area, bottom, footer] = Layout::vertical([
+    let [header, body, plan_area, bottom, hint, footer] = Layout::vertical([
         Constraint::Length(HEADER_HEIGHT),
         Constraint::Min(0),
         Constraint::Length(plan_height),
         Constraint::Length(bottom_height),
+        Constraint::Length(hint_height),
         Constraint::Length(FOOTER_HEIGHT),
     ])
     .areas(area);
@@ -114,6 +119,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         draw_approval(frame, lines, bottom, theme);
     } else {
         draw_input(frame, app, bottom, theme);
+        if hint_height > 0 {
+            draw_mode_hint(frame, app, hint, theme);
+        }
+        // Drawn after the hint so a popup may cover it, never the reverse.
         draw_command_menu(frame, app, bottom, theme);
         draw_model_picker(frame, app, bottom, theme);
         draw_session_picker(frame, app, bottom, theme);
@@ -279,8 +288,42 @@ fn draw_session_picker(frame: &mut Frame, app: &App, anchor: Rect, theme: Theme)
     );
 }
 
-fn pane_heights(app: &App, frame_height: u16, requested_bottom: u16) -> (u16, u16) {
-    let fixed = HEADER_HEIGHT.saturating_add(FOOTER_HEIGHT);
+/// Whether the frame can spare a row for the mode hint.
+///
+/// The hint carries an affordance; every other pane carries content, so it is
+/// the first thing a short frame gives up: it takes its row only when doing so
+/// costs the composer and the plan nothing and still leaves the conversation
+/// its minimum. It is also hidden behind the approval panel, which replaces the
+/// composer the hint describes.
+fn mode_hint_height(app: &App, frame_height: u16, requested_bottom: u16) -> u16 {
+    if app.approval.is_some() {
+        return 0;
+    }
+    let unhinted = pane_heights(app, frame_height, requested_bottom, 0);
+    let hinted = pane_heights(app, frame_height, requested_bottom, MODE_HINT_HEIGHT);
+    if hinted != unhinted {
+        return 0;
+    }
+    // The conversation absorbs whatever the fixed panes leave, so it pays for
+    // the hint even when nothing else does.
+    let body = frame_height
+        .saturating_sub(HEADER_HEIGHT)
+        .saturating_sub(FOOTER_HEIGHT)
+        .saturating_sub(MODE_HINT_HEIGHT)
+        .saturating_sub(hinted.0)
+        .saturating_sub(hinted.1);
+    u16::from(body >= MIN_CONVERSATION_ROWS).saturating_mul(MODE_HINT_HEIGHT)
+}
+
+fn pane_heights(
+    app: &App,
+    frame_height: u16,
+    requested_bottom: u16,
+    hint_height: u16,
+) -> (u16, u16) {
+    let fixed = HEADER_HEIGHT
+        .saturating_add(FOOTER_HEIGHT)
+        .saturating_add(hint_height);
     let usable = frame_height.saturating_sub(fixed);
     let bottom = requested_bottom.min(usable);
     if app.approval.is_some() {
@@ -412,7 +455,7 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
         Status::Running => " Working ",
         Status::Compacting => " Compacting ",
     };
-    let mut block = Block::bordered()
+    let block = Block::bordered()
         .title(Line::from(title).style(if app.status == Status::Idle {
             theme.accent_strong()
         } else {
@@ -423,9 +466,6 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
         } else {
             theme.divider()
         });
-    if let Some(tag) = mode_tag(app, area.width, theme) {
-        block = block.title_bottom(tag);
-    }
     let inner = area.inner(Margin::new(1, 1));
     frame.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
@@ -525,33 +565,60 @@ fn caret_position(input: &str, inner_width: u16) -> (u16, u16) {
     (row, col)
 }
 
-/// Bottom-left tag on the composer: the live permission mode and the key that
-/// cycles it.
+/// Draws the mode hint in the row directly under the composer, left-aligned
+/// with the composer's first text column.
 ///
-/// This sits on the input box rather than in the footer because it is state you
-/// need *while typing* — what the next Enter is allowed to do. The affordance
-/// drops before the mode does, and both drop before anything is truncated.
+/// This sits beside the input box rather than in the footer because it is state
+/// you need *while typing* — what the next Enter is allowed to do — and it is a
+/// row of its own rather than a border title so the mode name is plain text at
+/// a fixed position instead of decoration on a frame.
+fn draw_mode_hint(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    if let Some(tag) = mode_tag(app, area.width, theme) {
+        frame.render_widget(Paragraph::new(tag), area);
+    }
+}
+
+/// The live permission mode and the key that cycles it.
+///
+/// The affordance drops before the mode does, and both drop before anything is
+/// truncated: a half-written mode name is worse than no mode name.
 fn mode_tag(app: &App, width: u16, theme: Theme) -> Option<Line<'static>> {
     let label = mode_label(app.mode);
-    // The one mode that removes the human from the loop is the one worth
-    // colouring; the rest are ordinary state.
-    let label_style = if app.mode == PermissionMode::BypassPermissions {
-        theme.warning()
-    } else {
-        theme.muted()
-    };
-    // Two corners plus a cell of breathing room at each end of the border.
-    let border_budget = width.saturating_sub(4);
-
-    let with_hint = format!(" {label} · shift+tab ");
-    if display_width(&with_hint) <= border_budget {
+    let label_style = mode_style(app.mode, theme);
+    // One leading cell puts the label under the composer's `›` prompt rather
+    // than under its border.
+    let with_hint = format!(" {label} · shift+tab");
+    if display_width(&with_hint) <= width {
         return Some(Line::from(vec![
             Span::styled(format!(" {label}"), label_style),
-            Span::styled(" · shift+tab ", theme.muted()),
+            Span::styled(" · shift+tab", theme.muted()),
         ]));
     }
-    let bare = format!(" {label} ");
-    (display_width(&bare) <= border_budget).then(|| Line::from(Span::styled(bare, label_style)))
+    let bare = format!(" {label}");
+    (display_width(&bare) <= width).then(|| Line::from(Span::styled(bare, label_style)))
+}
+
+/// Colours the mode by how much of the human's judgement it delegates away, so
+/// that anything other than the ordinary approval loop is visible at a glance.
+///
+/// `default` stays muted on purpose: colour here means "you are not in the
+/// mode you think you are in", which only works if the common case is quiet.
+fn mode_style(mode: PermissionMode, theme: Theme) -> Style {
+    match mode {
+        // Read-only until the mode changes; the safest place to be.
+        PermissionMode::Plan => theme.success(),
+        // Every gate still asks.
+        PermissionMode::Default => theme.muted(),
+        // File edits land without a prompt; everything else still asks.
+        PermissionMode::AcceptEdits => theme.accent(),
+        // Unattended, but anything not pre-allowed is denied rather than run.
+        PermissionMode::DontAsk => theme.warning(),
+        // Every gate is off.
+        PermissionMode::BypassPermissions => theme.danger(),
+    }
 }
 
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
@@ -1202,12 +1269,12 @@ mod tests {
         let mut app = App::new("m", PermissionMode::AcceptEdits);
         let theme = Theme::new(false);
 
-        let wide = mode_tag(&app, 40, theme).expect("a wide composer shows both");
-        assert_eq!(wide.to_string(), " accept-edits · shift+tab ");
+        let wide = mode_tag(&app, 40, theme).expect("a wide row shows both");
+        assert_eq!(wide.to_string(), " accept-edits · shift+tab");
 
         // Narrow: the affordance goes before the state does.
         let narrow = mode_tag(&app, 20, theme).expect("the mode alone still fits");
-        assert_eq!(narrow.to_string(), " accept-edits ");
+        assert_eq!(narrow.to_string(), " accept-edits");
         assert!(mode_tag(&app, 8, theme).is_none(), "nothing is truncated");
 
         app.mode = PermissionMode::Default;
@@ -1215,19 +1282,78 @@ mod tests {
             mode_tag(&app, 40, theme)
                 .expect("always tagged")
                 .to_string(),
-            " default · shift+tab ",
+            " default · shift+tab",
         );
     }
 
     #[test]
-    fn the_mode_tag_is_drawn_on_the_composer_border() {
+    fn the_mode_hint_owns_the_row_under_the_composer() {
         let mut app = App::new("m", PermissionMode::Plan);
 
         let mut terminal = Terminal::new(TestBackend::new(40, 12)).expect("test terminal");
         terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
 
+        let buffer = terminal.backend().buffer();
+        // Frame: header(2) + body + composer(3) + hint(1) + footer(1); the hint
+        // is the second-to-last row, and it starts one cell in so the label
+        // lines up with the composer's prompt column rather than its border.
+        let row: String = (0..40u16)
+            .map(|x| buffer.cell((x, 10)).expect("cell").symbol().to_string())
+            .collect();
+        assert_eq!(row.trim_end(), " plan · shift+tab", "hint row: {row:?}");
+        // The composer's own bottom border stays undecorated.
+        let border: String = (0..40u16)
+            .map(|x| buffer.cell((x, 9)).expect("cell").symbol().to_string())
+            .collect();
+        assert!(!border.contains("plan"), "composer border: {border:?}");
+    }
+
+    #[test]
+    fn each_mode_reads_differently_at_a_glance() {
+        let theme = Theme::new(true);
+        let styled: Vec<Style> = [
+            PermissionMode::Default,
+            PermissionMode::AcceptEdits,
+            PermissionMode::Plan,
+            PermissionMode::DontAsk,
+            PermissionMode::BypassPermissions,
+        ]
+        .into_iter()
+        .map(|mode| mode_style(mode, theme))
+        .collect();
+
+        for (index, style) in styled.iter().enumerate() {
+            for other in &styled[index + 1..] {
+                assert_ne!(style, other, "two modes share a style");
+            }
+        }
+        // The mode with no gates left must be the loudest one.
+        assert_eq!(
+            mode_style(PermissionMode::BypassPermissions, theme),
+            theme.danger(),
+        );
+        // `NO_COLOR` collapses the palette, so the label carries the meaning.
+        let plain = Theme::new(false);
+        assert_eq!(
+            mode_style(PermissionMode::BypassPermissions, plain).fg,
+            None,
+        );
+    }
+
+    #[test]
+    fn the_approval_panel_takes_the_hint_row_back() {
+        let mut app = App::new("m", PermissionMode::Plan);
+        app.set_approval(approval("run cargo test --workspace"));
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).expect("test terminal");
+        terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
+
         let rendered = format!("{}", terminal.backend());
-        assert!(rendered.contains("plan · shift+tab"), "{rendered}");
+        assert!(rendered.contains("Approval required"), "{rendered}");
+        assert!(
+            !rendered.contains("shift+tab"),
+            "the hint describes a composer that is not on screen:\n{rendered}"
+        );
     }
 
     #[test]
