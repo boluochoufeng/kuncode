@@ -15,8 +15,8 @@ use kuncode_core::{
 };
 
 use super::super::{
-    CompactionDependencies, CompactionError, CompactionRequestProjector, GroupTokenEstimator,
-    RequestProjectionError,
+    CompactionDependencies, CompactionError, CompactionRequestProjector, CompactionTrigger,
+    GroupTokenEstimator, RequestProjectionError,
 };
 use crate::{
     compaction::{
@@ -181,6 +181,7 @@ pub(super) struct TestDependencies<'a> {
 pub(super) fn dependencies(input: TestDependencies<'_>) -> CompactionDependencies<'_> {
     CompactionDependencies {
         config: input.config,
+        trigger: CompactionTrigger::Automatic,
         measured_before: ContextBudget::new(
             input.config.context_limit(),
             TokenEstimate::new(80, TokenCountPrecision::Exact),

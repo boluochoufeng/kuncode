@@ -29,6 +29,7 @@ use crate::{
     tool::{ToolOutput, ToolResultRetention},
 };
 
+pub use self::compaction::ManualCompaction;
 use self::request::final_text_at;
 pub use self::setup::AgentRunnerBuildError;
 

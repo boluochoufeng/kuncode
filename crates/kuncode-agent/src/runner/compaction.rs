@@ -14,7 +14,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     compaction::{
-        CompactionDependencies, CompactionError, CompactionOutcome, GroupTokenEstimator,
+        CompactionDependencies, CompactionError, CompactionOutcome, CompactionTrigger,
+        GroupTokenEstimator,
         budget::{BudgetLevel, ContextBudget, TokenEstimator},
         compact_context,
         protocol::{ProtocolGroup, flatten_groups},
@@ -130,11 +131,146 @@ where
                 precision: before.precision(),
             },
         );
+        match self
+            .execute_compaction(
+                session,
+                Some(iteration),
+                &projector,
+                runtime,
+                CompactionTrigger::Automatic,
+                before,
+                level,
+                started,
+                cancel,
+            )
+            .await?
+        {
+            // Only a replaced context changes what the model sees; every other
+            // outcome (including a recovered failure) reuses the frozen request.
+            CompactionOutcome::Compacted(_) => projector.project_agent(session.messages()),
+            CompactionOutcome::Bypassed
+            | CompactionOutcome::Observed(_)
+            | CompactionOutcome::NotNeeded(_) => Ok(original),
+        }
+    }
+
+    /// Compacts the active context on request, whatever the budget says.
+    ///
+    /// The automatic path only fires past the soft budget threshold; a user
+    /// asking for it means "now", typically before starting
+    /// unrelated work. Failure semantics deliberately match *soft* pressure: no
+    /// request is blocked on the result, so a recoverable failure warns and
+    /// leaves the context untouched instead of aborting.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentError`] when request projection or budget estimation
+    /// fails, the user cancels, or compaction fails unrecoverably.
+    pub async fn compact_now(
+        &self,
+        session: &mut AgentSession,
+        cancel: &CancellationToken,
+    ) -> Result<ManualCompaction, AgentError> {
+        use crate::compaction::budget::CompactionMode;
+
+        let Some(runtime) = self.config.compaction.as_ref() else {
+            return Ok(ManualCompaction::Unavailable {
+                reason: "compaction is not configured for this run",
+            });
+        };
+        match runtime.policy.mode() {
+            CompactionMode::Disabled => {
+                return Ok(ManualCompaction::Unavailable {
+                    reason: "compaction is disabled; set compaction.mode to enabled",
+                });
+            }
+            // Shadow only measures candidates, and honoring a manual request
+            // here would replace the context the mode exists to leave alone.
+            CompactionMode::Shadow => {
+                return Ok(ManualCompaction::Unavailable {
+                    reason: "compaction is in shadow mode; it only reports candidates",
+                });
+            }
+            CompactionMode::Enabled => {}
+        }
+
+        let projector = self.freeze_request_projector(session)?;
+        let original = projector.project_agent(session.messages())?;
+        let before =
+            ContextBudget::for_request(&runtime.policy, &original, self.token_estimator.as_ref())
+                .await
+                .map_err(|error| compaction_error(CompactionError::Budget(error)))?;
+        // Pressure is not a precondition for a manual request, but the target
+        // still is: below it every pass would be asked to shrink a context that
+        // is already small enough, and the reduction gate would reject the
+        // result anyway. Reporting that plainly beats spending a summary call.
+        if before.reached_target(&runtime.policy) {
+            self.emit(
+                session,
+                None,
+                EventKind::CompactionSkipped {
+                    reason: "manual_below_target".to_string(),
+                    before_tokens: before.current_input(),
+                    precision: before.precision(),
+                },
+            );
+            return Ok(ManualCompaction::NotNeeded);
+        }
+        let started = Instant::now();
+        self.emit(
+            session,
+            None,
+            EventKind::CompactionStarted {
+                reason: "manual_request".to_string(),
+                before_tokens: before.current_input(),
+                precision: before.precision(),
+            },
+        );
+        let outcome = self
+            .execute_compaction(
+                session,
+                None,
+                &projector,
+                runtime,
+                CompactionTrigger::Manual,
+                before,
+                BudgetLevel::Soft,
+                started,
+                cancel,
+            )
+            .await?;
+        Ok(match outcome {
+            CompactionOutcome::Compacted(_) => ManualCompaction::Compacted,
+            CompactionOutcome::Bypassed
+            | CompactionOutcome::Observed(_)
+            | CompactionOutcome::NotNeeded(_) => ManualCompaction::NotNeeded,
+        })
+    }
+
+    /// Runs the compaction pipeline and reports its outcome, shared by the
+    /// automatic and manual entry points.
+    ///
+    /// `level` selects the failure posture: at [`BudgetLevel::Soft`] a
+    /// recoverable failure degrades to [`CompactionOutcome::Bypassed`] plus a
+    /// warning, while hard pressure propagates it.
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_compaction(
+        &self,
+        session: &mut AgentSession,
+        iteration: Option<usize>,
+        projector: &super::request::FrozenRequestProjector,
+        runtime: &crate::runner::AgentCompactionConfig,
+        trigger: CompactionTrigger,
+        before: ContextBudget,
+        level: BudgetLevel,
+        started: Instant,
+        cancel: &CancellationToken,
+    ) -> Result<CompactionOutcome, AgentError> {
         let Some(store) = self.session_store.as_deref() else {
             let error = CompactionError::NonDurableSession;
             self.emit(
                 session,
-                Some(iteration),
+                iteration,
                 failure_event(&error, level, before, started),
             );
             if level == BudgetLevel::Soft {
@@ -142,12 +278,12 @@ where
                 // ambiguous outcome; fallback is still forbidden at hard pressure.
                 self.emit(
                     session,
-                    Some(iteration),
+                    iteration,
                     EventKind::Warning {
                         message: failure_message(&error),
                     },
                 );
-                return Ok(original);
+                return Ok(CompactionOutcome::Bypassed);
             }
             return Err(compaction_error(error));
         };
@@ -159,7 +295,7 @@ where
                     let error = CompactionError::Summary(error);
                     self.emit(
                         session,
-                        Some(iteration),
+                        iteration,
                         failure_event(&error, level, before, started),
                     );
                     return Err(compaction_error(error));
@@ -169,10 +305,11 @@ where
         let summarizer = CancellableSummarizer::new(&summarizer, cancel);
         let result = compact_context(CompactionDependencies {
             config: &runtime.policy,
+            trigger,
             measured_before: before,
             session,
             store,
-            projector: &projector,
+            projector,
             estimator: self.token_estimator.as_ref(),
             group_estimator: self.group_estimator.as_ref(),
             artifact_counter: &artifact_counter,
@@ -192,7 +329,7 @@ where
             Ok(CompactionOutcome::Compacted(report)) => {
                 self.emit(
                     session,
-                    Some(iteration),
+                    iteration,
                     EventKind::CompactionCompleted {
                         before_tokens: report.before.current_input(),
                         after_tokens: report.after.current_input(),
@@ -211,38 +348,51 @@ where
                         latency_ms: elapsed_ms(started),
                     },
                 );
-                projector.project_agent(session.messages())
+                Ok(CompactionOutcome::Compacted(report))
             }
-            Ok(CompactionOutcome::Bypassed)
-            | Ok(CompactionOutcome::Observed(_))
-            | Ok(CompactionOutcome::NotNeeded(_)) => Ok(original),
+            Ok(outcome) => Ok(outcome),
             Err(CompactionError::Summary(SummarizerError::Cancelled)) => Err(AgentError::Cancelled),
             Err(error) if is_recoverable(&error, level) => {
                 self.emit(
                     session,
-                    Some(iteration),
+                    iteration,
                     failure_event(&error, level, before, started),
                 );
                 self.emit(
                     session,
-                    Some(iteration),
+                    iteration,
                     EventKind::Warning {
                         message: failure_message(&error),
                     },
                 );
-                // `is_recoverable` excludes every authority-invalidating error.
-                Ok(original)
+                // `is_recoverable` excludes every authority-invalidating error;
+                // the caller reuses the context it already projected.
+                Ok(CompactionOutcome::Bypassed)
             }
             Err(error) => {
                 self.emit(
                     session,
-                    Some(iteration),
+                    iteration,
                     failure_event(&error, level, before, started),
                 );
                 Err(compaction_error(error))
             }
         }
     }
+}
+
+/// What a manual compaction request did, for a frontend to report.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManualCompaction {
+    /// The active context was replaced by a summary.
+    Compacted,
+    /// Compaction ran but found nothing to replace.
+    NotNeeded,
+    /// Compaction is not available in this configuration.
+    Unavailable {
+        /// Operator-facing reason, safe to print verbatim.
+        reason: &'static str,
+    },
 }
 
 fn compaction_error(error: CompactionError) -> AgentError {

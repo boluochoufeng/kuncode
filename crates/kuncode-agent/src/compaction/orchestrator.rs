@@ -9,7 +9,7 @@ pub(crate) use pipeline::compact_context;
 pub(crate) use types::CompactionPass;
 pub(crate) use types::{
     CompactionDependencies, CompactionError, CompactionOutcome, CompactionRequestProjector,
-    GroupTokenEstimator, RequestProjectionError,
+    CompactionTrigger, GroupTokenEstimator, RequestProjectionError,
 };
 
 #[cfg(test)]

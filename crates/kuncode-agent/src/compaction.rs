@@ -10,5 +10,5 @@ pub mod summary;
 
 pub(crate) use orchestrator::{
     CompactionDependencies, CompactionError, CompactionOutcome, CompactionRequestProjector,
-    GroupTokenEstimator, RequestProjectionError, compact_context,
+    CompactionTrigger, GroupTokenEstimator, RequestProjectionError, compact_context,
 };

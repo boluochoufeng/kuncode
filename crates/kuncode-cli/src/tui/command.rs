@@ -15,6 +15,7 @@ enum Command {
     Help,
     Model,
     Resume,
+    Compact,
     Quit,
 }
 
@@ -43,6 +44,11 @@ const COMMANDS: &[CommandSpec] = &[
         command: Command::Resume,
     },
     CommandSpec {
+        name: "compact",
+        description: "summarize the context now instead of waiting for the budget threshold",
+        command: Command::Compact,
+    },
+    CommandSpec {
         name: "quit",
         description: "quit kuncode (typing `exit` also works)",
         command: Command::Quit,
@@ -67,6 +73,9 @@ pub(super) enum Dispatch {
     /// Bare `/resume`: listing the stored sessions needs the event loop's
     /// store handle (and is async), so the picker opens there.
     PickSession,
+    /// `/compact`: compacting needs the runner + session, and streams events
+    /// like a turn, so the event loop drives it.
+    Compact,
 }
 
 /// Routes one submitted line. Command attempts execute against `app` (echo +
@@ -112,6 +121,15 @@ pub(super) fn dispatch(app: &mut App, input: &str) -> Dispatch {
             // Unlike `--resume=<ID>`, the in-TUI form is picker-only: ids are
             // long and unmemorable mid-session, and the panel shows them all.
             app.push_notice("usage: /resume — no arguments; pick from the list".to_string());
+        }
+        Some(CommandSpec {
+            command: Command::Compact,
+            ..
+        }) => {
+            if invocation.args.is_empty() {
+                return Dispatch::Compact;
+            }
+            app.push_notice("usage: /compact — no arguments".to_string());
         }
         Some(CommandSpec {
             command: Command::Quit,
@@ -231,7 +249,26 @@ mod tests {
     fn a_lone_slash_offers_every_command_in_table_order() {
         assert_eq!(
             completion_names("/"),
-            Some(vec!["help", "model", "resume", "quit"])
+            Some(vec!["help", "model", "resume", "compact", "quit"])
+        );
+    }
+
+    #[test]
+    fn slash_compact_hands_the_work_to_the_event_loop() {
+        let mut app = app();
+        assert!(matches!(dispatch(&mut app, "/compact"), Dispatch::Compact));
+
+        // Arguments are a typo, not a payload: refuse rather than compact.
+        assert!(matches!(
+            dispatch(&mut app, "/compact everything"),
+            Dispatch::Handled
+        ));
+        assert!(
+            notice_texts(&app)
+                .last()
+                .is_some_and(|text| text.starts_with("usage: /compact")),
+            "{:?}",
+            notice_texts(&app),
         );
     }
 

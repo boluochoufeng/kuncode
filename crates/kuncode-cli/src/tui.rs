@@ -23,7 +23,7 @@ use crossterm::execute;
 use futures_util::StreamExt;
 use kuncode_agent::error::AgentError;
 use kuncode_agent::observer::AgentEvent;
-use kuncode_agent::runner::AgentRunner;
+use kuncode_agent::runner::{AgentRunner, ManualCompaction};
 use kuncode_agent::session::AgentSession;
 use kuncode_agent::session_store::SessionId;
 use kuncode_core::completion::{CompletionModel, RetryModel};
@@ -295,6 +295,10 @@ async fn event_loop(
                             Err(error) => app.push_error(error.to_string()),
                         }
                     }
+                    Some(Submission::Compact) => {
+                        run_compaction(terminal, &runner, session, app, &mut events, event_rx)
+                            .await?;
+                    }
                     // Between turns, so the mode a turn was authorized under
                     // cannot change underneath it. The session overlay is the
                     // authority; `app.mode` only mirrors it for the footer.
@@ -342,6 +346,81 @@ async fn event_loop(
         }
     }
 
+    Ok(())
+}
+
+/// Drives a `/compact` request, rendering the same live event stream a turn
+/// does — the compaction pipeline reports through the observer, so the
+/// transcript already narrates what happened.
+///
+/// Unlike a turn it takes no approvals and produces no assistant message; only
+/// the outcomes the events *don't* cover land as a notice. Ctrl-C cancels.
+async fn run_compaction<M: CompletionModel>(
+    terminal: &mut ratatui::DefaultTerminal,
+    runner: &AgentRunner<M>,
+    session: &mut AgentSession,
+    app: &mut App,
+    events: &mut EventStream,
+    event_rx: &mut UnboundedReceiver<AgentEvent>,
+) -> io::Result<()> {
+    let cancel = CancellationToken::new();
+    let mut outcome = None;
+    let mut events_closed = false;
+    let mut frame = tokio::time::interval(FRAME_INTERVAL);
+    frame.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    app.status = Status::Compacting;
+    {
+        let mut task = Box::pin(runner.compact_now(session, &cancel));
+        io_stage(
+            "compaction_initial_draw",
+            terminal.draw(|frame| ui::draw(frame, app)),
+        )?;
+        while outcome.is_none() {
+            tokio::select! {
+                result = &mut task => outcome = Some(result),
+                _ = frame.tick() => {
+                    app.advance_animation();
+                    io_stage(
+                        "compaction_draw",
+                        terminal.draw(|frame| ui::draw(frame, app)),
+                    )?;
+                }
+                Some(event) = event_rx.recv() => app.apply_event(event.kind),
+                maybe = events.next(), if !events_closed => {
+                    match maybe {
+                        Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
+                            handle_running_key(app, key, &cancel);
+                        }
+                        Some(Ok(Event::Mouse(mouse))) => handle_scroll(app, mouse),
+                        Some(Err(error)) => {
+                            return Err(log_tui_io("compaction_input", &error, true));
+                        }
+                        None => events_closed = true,
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    // Same reason as a turn: the final poll can enqueue events that `select!`
+    // never consumed, and the idle loop does not drain them.
+    while let Ok(event) = event_rx.try_recv() {
+        app.apply_event(event.kind);
+    }
+    app.status = Status::Idle;
+
+    match outcome.expect("loop exits only once outcome is set") {
+        // The CompactionCompleted event already rendered the result.
+        Ok(ManualCompaction::Compacted) => {}
+        Ok(ManualCompaction::NotNeeded) => {
+            app.push_notice("nothing to compact".to_string());
+        }
+        Ok(ManualCompaction::Unavailable { reason }) => app.push_notice(reason.to_string()),
+        Err(AgentError::Cancelled) => app.push_error("compaction cancelled".to_string()),
+        Err(error) => app.push_error(error.to_string()),
+    }
     Ok(())
 }
 
@@ -491,6 +570,8 @@ enum Submission {
     ResumeSession(SessionId),
     /// Advance the permission mode one step, between turns.
     CycleMode,
+    /// Compact the context now, between turns.
+    Compact,
 }
 
 /// Handles a key in the idle state. Returns `Some` when Enter submits work for
@@ -585,6 +666,7 @@ fn handle_idle_key(app: &mut App, key: KeyEvent) -> Option<Submission> {
                     command::Dispatch::Prompt => Some(Submission::Prompt(submitted)),
                     command::Dispatch::SwitchModel(name) => Some(Submission::SwitchModel(name)),
                     command::Dispatch::PickSession => Some(Submission::PickSession),
+                    command::Dispatch::Compact => Some(Submission::Compact),
                 }
             }
         }
@@ -726,6 +808,7 @@ fn handle_menu_key(app: &mut App, key: KeyEvent) -> Option<Option<Submission>> {
                     command::Dispatch::Prompt => None,
                     command::Dispatch::SwitchModel(name) => Some(Submission::SwitchModel(name)),
                     command::Dispatch::PickSession => Some(Submission::PickSession),
+                    command::Dispatch::Compact => Some(Submission::Compact),
                 },
             );
         }
