@@ -145,7 +145,7 @@ enum TurnError {
 /// Runs one turn with a Ctrl-C-wired cancellation token, so an interrupt aborts
 /// the current turn and (in the REPL) returns to the prompt instead of killing
 /// the process.
-async fn run_turn<M: CompletionModel>(
+async fn run_turn<M: CompletionModel + 'static>(
     runner: &AgentRunner<M>,
     session: &mut AgentSession,
     input: String,

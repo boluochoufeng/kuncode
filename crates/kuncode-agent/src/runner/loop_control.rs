@@ -15,7 +15,7 @@ use super::{
 
 impl<M> AgentRunner<M>
 where
-    M: CompletionModel,
+    M: CompletionModel + 'static,
 {
     /// The model/tool loop. Returns the failing iteration alongside the error so
     /// [`continue_session_with`](Self::continue_session_with) can emit a single
@@ -106,7 +106,10 @@ where
                 });
             }
 
-            self.execute_tool_calls(session, iteration_result.tool_calls, iteration, cancel)
+            // Subagent runs happen inside tool calls; their model usage comes
+            // back from the batch so the turn's accounting stays complete.
+            usage += self
+                .execute_tool_calls(session, iteration_result.tool_calls, iteration, cancel)
                 .await
                 .map_err(|error| (Some(iteration), error))?;
         }

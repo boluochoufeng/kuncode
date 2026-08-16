@@ -15,5 +15,6 @@ mod lineage;
 mod manual_compaction;
 mod persistence_todo;
 mod persistence_warnings;
+mod subagent;
 mod todo_errors;
 mod turn_and_permissions;

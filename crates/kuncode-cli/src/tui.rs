@@ -355,7 +355,7 @@ async fn event_loop(
 ///
 /// Unlike a turn it takes no approvals and produces no assistant message; only
 /// the outcomes the events *don't* cover land as a notice. Ctrl-C cancels.
-async fn run_compaction<M: CompletionModel>(
+async fn run_compaction<M: CompletionModel + 'static>(
     terminal: &mut ratatui::DefaultTerminal,
     runner: &AgentRunner<M>,
     session: &mut AgentSession,
@@ -430,7 +430,7 @@ async fn run_compaction<M: CompletionModel>(
 /// The turn future borrows `session` mutably, so it is scoped to an inner block;
 /// only after it is dropped is `session` free again to read the final answer.
 #[allow(clippy::too_many_arguments)]
-async fn run_one_turn<M: CompletionModel>(
+async fn run_one_turn<M: CompletionModel + 'static>(
     terminal: &mut ratatui::DefaultTerminal,
     runner: &AgentRunner<M>,
     session: &mut AgentSession,

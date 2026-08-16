@@ -16,7 +16,9 @@ use super::{AgentRunner, AgentTurn, cancellation::cancellable};
 
 impl<M> AgentRunner<M>
 where
-    M: CompletionModel,
+    // `'static` because a turn may hand a snapshot of this runner to the
+    // type-erased subagent driver.
+    M: CompletionModel + 'static,
 {
     /// Appends a user prompt, then advances the transcript until a final answer.
     ///

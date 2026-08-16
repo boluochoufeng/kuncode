@@ -6,6 +6,7 @@ mod iteration;
 mod loop_control;
 mod request;
 mod setup;
+mod subagent;
 mod tool_authorization;
 mod tool_execution;
 mod turn;
@@ -137,7 +138,8 @@ pub enum AgentCompactionConfigError {
 pub struct AgentTurn {
     /// Index of the final assistant message inside the caller-owned transcript.
     pub final_message_index: usize,
-    /// Provider usage aggregated across this turn's model calls.
+    /// Provider usage aggregated across this turn's model calls, including
+    /// calls made inside subagent runs the turn delegated via `task`.
     pub usage: Usage,
     /// Number of model calls performed for this turn.
     pub iterations: usize,

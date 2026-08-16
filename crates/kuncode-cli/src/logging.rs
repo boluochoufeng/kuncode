@@ -18,7 +18,7 @@ const DEFAULT_LEVEL: &str = "info";
 /// Every target the crates actually emit on. The filter is `off` plus these, so
 /// a target missing here is discarded outright — keep it in step with the
 /// `target:` names in the source, not with module paths.
-const PROJECT_TARGETS: [&str; 9] = [
+const PROJECT_TARGETS: [&str; 10] = [
     "kuncode::agent",
     "kuncode::authorization",
     "kuncode::compaction",
@@ -27,6 +27,7 @@ const PROJECT_TARGETS: [&str; 9] = [
     "kuncode::persistence",
     "kuncode::provider",
     "kuncode::runtime",
+    "kuncode::subagent",
     "kuncode::tool",
 ];
 const LOG_DIRECTORY: &str = ".kuncode/logs";

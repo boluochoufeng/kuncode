@@ -20,6 +20,7 @@ use crate::{
         Tool,
         bash::Bash,
         filesystem::{EditFile, Glob, Grep, Ls, ReadFile, WriteFile},
+        task::{TASK_TOOL_NAME, Task},
         todo_write::TodoWrite,
         web_fetch::{WebFetch, WebFetchError},
     },
@@ -224,7 +225,43 @@ impl ToolRegistry {
             )?
             .constrain_paths_to(workspace_root)?,
         )?;
+        // Allowed by default because delegation itself does nothing: every tool
+        // call the subagent makes is re-authorized individually, and Plan mode
+        // or an explicit `Agent(...)` rule can still deny the delegation.
+        // Appended for the same cache-prefix reason as `ls`.
+        self.register_with_profile(
+            Task::new(),
+            ToolPermissionProfile::new(
+                TASK_TOOL_NAME,
+                [(PermissionNamespace::Agent, ProfileDefault::Allow)],
+                false,
+            )?,
+        )?;
         Ok(())
+    }
+
+    /// Returns a copy of this registry without the named tool, preserving the
+    /// relative order of the remaining tools.
+    ///
+    /// The runner uses this to hand a subagent every tool except `task`
+    /// itself, which is what closes the infinite-delegation loop.
+    pub fn without_tool(&self, name: &str) -> Self {
+        // Entries are copied directly instead of re-registered: each already
+        // passed profile validation against this registry's workspace root.
+        let mut registry = Self {
+            workspace_root: self.workspace_root.clone(),
+            ..Self::default()
+        };
+        for registered in &self.tools {
+            if registered.tool.name() == name {
+                continue;
+            }
+            registry
+                .index
+                .insert(registered.tool.name().to_string(), registry.tools.len());
+            registry.tools.push(registered.clone());
+        }
+        registry
     }
 
     /// Registers a tool, replacing any existing tool with the same model-facing
@@ -501,9 +538,33 @@ mod tests {
                 "todo_write",
                 "ls",
                 "web_fetch",
-                "grep"
+                "grep",
+                "task"
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn without_tool_drops_only_the_named_tool_and_keeps_order() {
+        let workspace = Workspace::from_current_dir()
+            .await
+            .expect("current directory should be a valid workspace");
+        let registry = ToolRegistry::with_default_workspace_tools(workspace)
+            .expect("built-in profiles are valid");
+
+        let subagent_view = registry.without_tool("task");
+
+        let names = subagent_view
+            .definition()
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<Vec<_>>();
+        assert!(!names.contains(&"task".to_string()));
+        assert_eq!(names.len(), registry.len() - 1);
+        // Remaining lookups still resolve through the rebuilt index.
+        assert!(subagent_view.get("grep").is_some());
+        assert!(subagent_view.get("task").is_none());
+        assert_eq!(subagent_view.workspace_root(), registry.workspace_root());
     }
 
     #[tokio::test]
