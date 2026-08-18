@@ -23,8 +23,10 @@ use kuncode_agent::session_store::{
     NewSession, SessionId, SessionStore, SessionSummary, session_store_path,
     turso::TursoSessionStore,
 };
+use kuncode_agent::skill::SkillCatalog;
 use kuncode_agent::system_prompt::{
-    EnvironmentSection, IdentitySection, InstructionsSection, SystemPrompt, ToolsSection,
+    EnvironmentSection, IdentitySection, InstructionsSection, PromptSection, SkillsSection,
+    SystemPrompt, ToolsSection,
 };
 use kuncode_agent::workspace::Workspace;
 use kuncode_core::completion::{CompletionModel, RetryModel, RetryPolicy};
@@ -146,20 +148,34 @@ impl CliRuntime<RetryModel<AnyChatCompletionModel>> {
         // request prefix, so editing an instruction file mid-session must not
         // invalidate the transcript's KV cache. The instructions render last so
         // the project's own rules are the final word of the prompt.
-        let instructions = load_instructions(workspace.root(), std::env::home_dir().as_deref());
+        let home = std::env::home_dir();
+        let instructions = load_instructions(workspace.root(), home.as_deref());
         tracing::info!(
             target: "kuncode::runtime",
             instruction_documents = instructions.len(),
             "project instructions resolved",
         );
 
+        // Same startup-frozen contract as the instructions: the catalog is a
+        // prompt prefix, so skills added mid-session appear on the next start.
+        let skill_catalog = SkillCatalog::scan(&skill_roots(workspace.root(), home.as_deref()));
+        tracing::info!(
+            target: "kuncode::runtime",
+            skills = skill_catalog.len(),
+            "skill catalog resolved",
+        );
+
         // Built before `workspace` is moved into the registry below.
-        let system_prompt = SystemPrompt::new(vec![
+        let mut sections: Vec<Box<dyn PromptSection>> = vec![
             Box::new(IdentitySection::new(IDENTITY)),
             Box::new(EnvironmentSection::new(workspace.root().to_path_buf())),
             Box::new(ToolsSection),
-            Box::new(InstructionsSection::new(instructions)),
-        ]);
+        ];
+        if !skill_catalog.is_empty() {
+            sections.push(Box::new(SkillsSection::new(skill_catalog.summaries())));
+        }
+        sections.push(Box::new(InstructionsSection::new(instructions)));
+        let system_prompt = SystemPrompt::new(sections);
 
         let project_root = workspace.root().to_path_buf();
         // Persistence discovery is non-fatal for CLI startup. Retaining the
@@ -198,7 +214,12 @@ impl CliRuntime<RetryModel<AnyChatCompletionModel>> {
         let provider_model = AnyChatCompletionModel::make(&client, model_name.clone());
         let model = RetryModel::with_policy(provider_model.clone(), RetryPolicy::default());
         let summary_model = RetryModel::with_policy(provider_model, summary_retry_policy());
-        let registry = ToolRegistry::with_default_workspace_tools(workspace)?;
+        let mut registry = ToolRegistry::with_default_workspace_tools(workspace)?;
+        // Advertised only when there is something to load; an empty catalog
+        // would make the tool pure prompt noise.
+        if !skill_catalog.is_empty() {
+            registry.register_skill_tool(Arc::new(skill_catalog))?;
+        }
 
         Ok(Self {
             model,
@@ -407,6 +428,23 @@ impl std::fmt::Display for ModelSwitchError {
 }
 
 impl std::error::Error for ModelSwitchError {}
+
+/// Skill roots ordered least to most specific — the user-global directory
+/// first, the workspace's own second — mirroring the `AGENTS.md` precedence so
+/// a project skill overrides a global one of the same name.
+fn skill_roots(root: &std::path::Path, home: Option<&std::path::Path>) -> Vec<std::path::PathBuf> {
+    let mut roots = Vec::with_capacity(2);
+    if let Some(home) = home {
+        roots.push(home.join(".kuncode").join("skills"));
+    }
+    let workspace_root = root.join(".kuncode").join("skills");
+    // Running kuncode inside the global directory itself would otherwise scan
+    // the same skills twice, with the duplicate winning as "more specific".
+    if !roots.contains(&workspace_root) {
+        roots.push(workspace_root);
+    }
+    roots
+}
 
 fn provider_client(project: &ProjectSettings) -> Result<AnyChatClient, Box<dyn std::error::Error>> {
     match project.provider {

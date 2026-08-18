@@ -124,6 +124,46 @@ impl PromptSection for ToolsSection {
     }
 }
 
+/// Catalog of the skills discovered at startup: names and one-line
+/// descriptions only. Full documents load on demand through `load_skill`, so
+/// the prompt pays for the index, not for every document on every request.
+pub struct SkillsSection {
+    summaries: Vec<crate::skill::SkillSummary>,
+}
+
+impl SkillsSection {
+    /// Wraps the catalog summaries captured at startup. Like the instruction
+    /// documents, the list is frozen for the process so the cached prompt
+    /// prefix stays stable.
+    pub fn new(summaries: Vec<crate::skill::SkillSummary>) -> Self {
+        Self { summaries }
+    }
+}
+
+impl PromptSection for SkillsSection {
+    fn render(&self, _ctx: &PromptContext) -> Option<String> {
+        if self.summaries.is_empty() {
+            return None;
+        }
+        let mut block =
+            String::from("Skills available (reusable instructions for specific kinds of work):\n");
+        for summary in &self.summaries {
+            block.push_str("- ");
+            block.push_str(summary.name());
+            if !summary.description().is_empty() {
+                block.push_str(": ");
+                block.push_str(summary.description());
+            }
+            block.push('\n');
+        }
+        block.push_str(
+            "Before doing work a skill covers, call load_skill with its name and \
+             follow the returned instructions.",
+        );
+        Some(block)
+    }
+}
+
 /// Opening delimiter of one rendered instruction document.
 const INSTRUCTIONS_OPEN_TAG: &str = "<project-instructions";
 /// Closing delimiter of one rendered instruction document.
@@ -326,6 +366,28 @@ mod tests {
             "{block}",
         );
         assert_eq!(block.matches(INSTRUCTIONS_CLOSE_TAG).count(), 2, "{block}");
+    }
+
+    #[test]
+    fn skills_section_lists_the_catalog_and_the_loading_rule() {
+        let section = SkillsSection::new(vec![
+            crate::skill::SkillSummary::new("code-review", "Review changed code."),
+            crate::skill::SkillSummary::new("pdf", ""),
+        ]);
+        let block = section.render(&ctx(&[])).expect("catalog renders");
+
+        assert!(
+            block.contains("- code-review: Review changed code."),
+            "{block}"
+        );
+        // A description-less skill lists its name without a dangling colon.
+        assert!(block.contains("- pdf\n"), "{block}");
+        assert!(block.contains("load_skill"), "{block}");
+    }
+
+    #[test]
+    fn an_empty_skills_section_adds_no_tokens() {
+        assert!(SkillsSection::new(Vec::new()).render(&ctx(&[])).is_none());
     }
 
     #[test]

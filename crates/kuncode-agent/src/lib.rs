@@ -13,6 +13,7 @@ pub mod registry;
 pub mod runner;
 pub mod session;
 pub mod session_store;
+pub mod skill;
 pub mod system_prompt;
 #[cfg(test)]
 pub(crate) mod test_support;

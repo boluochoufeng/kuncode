@@ -16,10 +16,12 @@ use crate::{
         CanonicalPath, PermissionNamespace, PermissionTargetError, ProfileDefault,
         ToolPermissionProfile, ToolProfileError,
     },
+    skill::SkillCatalog,
     tool::{
         Tool,
         bash::Bash,
         filesystem::{EditFile, Glob, Grep, Ls, ReadFile, WriteFile},
+        load_skill::{LOAD_SKILL_TOOL_NAME, LoadSkill},
         task::{TASK_TOOL_NAME, Task},
         todo_write::TodoWrite,
         web_fetch::{WebFetch, WebFetchError},
@@ -234,6 +236,25 @@ impl ToolRegistry {
             ToolPermissionProfile::new(
                 TASK_TOOL_NAME,
                 [(PermissionNamespace::Agent, ProfileDefault::Allow)],
+                false,
+            )?,
+        )?;
+        Ok(())
+    }
+
+    /// Registers the `load_skill` tool over a scanned catalog.
+    ///
+    /// Separate from the default set because the tool only makes sense when
+    /// the catalog is non-empty — advertising it with nothing to load is pure
+    /// prompt noise — and the caller owns skill discovery. Reading a skill is
+    /// a Read like any file read: allowed by default, still usable in Plan
+    /// mode, and deniable per document path.
+    pub fn register_skill_tool(&mut self, catalog: Arc<SkillCatalog>) -> Result<(), RegistryError> {
+        self.register_with_profile(
+            LoadSkill::new(catalog),
+            ToolPermissionProfile::new(
+                LOAD_SKILL_TOOL_NAME,
+                [(PermissionNamespace::Read, ProfileDefault::Allow)],
                 false,
             )?,
         )?;
@@ -542,6 +563,29 @@ mod tests {
                 "task"
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn the_skill_tool_appends_and_reaches_subagent_views() {
+        let workspace = Workspace::from_current_dir()
+            .await
+            .expect("current directory should be a valid workspace");
+        let mut registry = ToolRegistry::with_default_workspace_tools(workspace)
+            .expect("built-in profiles are valid");
+
+        registry
+            .register_skill_tool(std::sync::Arc::new(crate::skill::SkillCatalog::default()))
+            .expect("skill profile is valid");
+
+        let names = registry
+            .definition()
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<Vec<_>>();
+        assert_eq!(names.last().map(String::as_str), Some("load_skill"));
+        // A subagent loses `task` but keeps skill loading.
+        let subagent_view = registry.without_tool("task");
+        assert!(subagent_view.get("load_skill").is_some());
     }
 
     #[tokio::test]
