@@ -5,7 +5,13 @@ use super::support::{
     AgentRunner, AgentSession, ApproveAll, Arc, AssistantContent, CollectingObserver, EventKind,
     FakeModel, ToolRegistry, event_label, response, tool_result_text,
 };
-use crate::{permission::PermissionMode, workspace::Workspace};
+use crate::{
+    agent_type::AgentTypeCatalog,
+    permission::PermissionMode,
+    system_prompt::{IdentitySection, SystemPrompt},
+    workspace::Workspace,
+};
+use kuncode_core::completion::Message;
 
 async fn default_registry() -> ToolRegistry {
     let workspace = Workspace::from_current_dir()
@@ -106,6 +112,158 @@ async fn task_runs_a_nested_loop_and_only_its_report_reaches_the_parent() {
         EventKind::ToolStart { tool, summary, .. }
             if tool == "task" && summary == "Task: Inspect workspace"
     ));
+}
+
+#[tokio::test]
+async fn a_fork_delegation_inherits_the_conversation_without_the_pending_batch() {
+    let model = FakeModel::new([
+        // Turn 1: an ordinary exchange the fork must inherit.
+        response(AssistantContent::text("noted: the answer is 42")),
+        // Turn 2: delegate to a fork.
+        response(AssistantContent::tool_call(
+            "call_task",
+            "task",
+            serde_json::json!({
+                "description": "Recall the answer",
+                "prompt": "State the answer we discussed.",
+                "agent_type": "fork"
+            }),
+        )),
+        // Subagent: reports from the inherited context.
+        response(AssistantContent::text("FORK REPORT: 42")),
+        // Parent: final answer.
+        response(AssistantContent::text("done")),
+    ]);
+    let runner = AgentRunner::new(model.clone(), default_registry().await)
+        .with_approval_resolver(Arc::new(ApproveAll));
+    let mut session = AgentSession::new();
+
+    runner
+        .run_turn(&mut session, "remember: the answer is 42")
+        .await
+        .expect("first turn should complete");
+    let turn = runner
+        .run_turn(&mut session, "delegate the recall")
+        .await
+        .expect("delegating turn should complete");
+
+    assert_eq!(turn.final_text(&session), "done");
+    let result = tool_result_text(&session, 4);
+    assert!(result.contains("FORK REPORT: 42"), "task result: {result}");
+
+    let requests = model.requests();
+    assert_eq!(requests.len(), 4);
+    // The fork starts from its framing system message plus the parent
+    // conversation — both prior turns and the delegating user message — with
+    // the in-flight tool batch trimmed and the delegated prompt appended.
+    let sub_history = &requests[2].chat_history;
+    assert_eq!(sub_history.len(), 5);
+    assert!(matches!(
+        sub_history.first(),
+        Message::System { content } if content.contains("forked subagent")
+    ));
+    let serialized = serde_json::to_string(sub_history).expect("test history serializes");
+    assert!(
+        serialized.contains("remember: the answer is 42"),
+        "{serialized}"
+    );
+    assert!(
+        serialized.contains("noted: the answer is 42"),
+        "{serialized}"
+    );
+    assert!(
+        serialized.contains("State the answer we discussed."),
+        "{serialized}"
+    );
+    // The assistant message carrying the unpaired task call was trimmed.
+    assert!(!serialized.contains("call_task"), "{serialized}");
+    // A fork still cannot delegate further.
+    assert!(!requests[2].tools.iter().any(|tool| tool.name == "task"));
+    // The parent transcript keeps only its own messages: two turns of
+    // user/assistant plus the paired task result.
+    assert_eq!(session.messages().len(), 6);
+}
+
+#[tokio::test]
+async fn a_custom_agent_type_narrows_tools_and_appends_its_instructions() {
+    // A scanned catalog with one custom read-only type.
+    let root =
+        std::env::temp_dir().join(format!("kuncode-runner-agent-type-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("temp dir");
+    std::fs::write(
+        root.join("explore.md"),
+        "---\ndescription: Read-only exploration.\ntools: read_file, grep\n---\nONLY REPORT; NEVER EDIT.",
+    )
+    .expect("definition");
+    let catalog = AgentTypeCatalog::scan(std::slice::from_ref(&root));
+    let _ = std::fs::remove_dir_all(&root);
+    let mut registry = default_registry().await;
+    registry
+        .register_task_tool(Arc::new(catalog))
+        .expect("task profile is valid");
+
+    let model = FakeModel::new([
+        response(AssistantContent::tool_call(
+            "call_task",
+            "task",
+            serde_json::json!({
+                "description": "Map the crates",
+                "prompt": "List the crates.",
+                "agent_type": "explore"
+            }),
+        )),
+        response(AssistantContent::text("EXPLORED")),
+        response(AssistantContent::text("done")),
+    ]);
+    let runner = AgentRunner::new(model.clone(), registry)
+        .with_system_prompt(SystemPrompt::new(vec![Box::new(IdentitySection::new(
+            "PARENT PROMPT",
+        ))]))
+        .with_approval_resolver(Arc::new(ApproveAll));
+    let mut session = AgentSession::new();
+
+    let turn = runner
+        .run_turn(&mut session, "go")
+        .await
+        .expect("agent run should complete");
+
+    assert_eq!(turn.final_text(&session), "done");
+    let requests = model.requests();
+    assert_eq!(requests.len(), 3);
+    // The subagent sees exactly the whitelisted tools, in registry order.
+    let sub_tools: Vec<&str> = requests[1]
+        .tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect();
+    assert_eq!(sub_tools, ["read_file", "grep"]);
+    // Its system prompt is the parent's whole prompt plus the type's
+    // instructions; the parent's own requests never carry those instructions.
+    let sub_system = match sub_history_system(&requests[1].chat_history) {
+        Some(content) => content,
+        None => panic!("subagent request should carry a system message"),
+    };
+    assert!(sub_system.contains("PARENT PROMPT"), "{sub_system}");
+    assert!(
+        sub_system.contains("ONLY REPORT; NEVER EDIT."),
+        "{sub_system}"
+    );
+    let parent_system = match sub_history_system(&requests[0].chat_history) {
+        Some(content) => content,
+        None => panic!("parent request should carry a system message"),
+    };
+    assert!(!parent_system.contains("ONLY REPORT"), "{parent_system}");
+}
+
+/// The system message content of one recorded request, when present.
+fn sub_history_system(
+    history: &kuncode_core::non_empty_vec::NonEmptyVec<Message>,
+) -> Option<String> {
+    history.iter().find_map(|message| match message {
+        Message::System { content } => Some(content.clone()),
+        _ => None,
+    })
 }
 
 #[tokio::test]

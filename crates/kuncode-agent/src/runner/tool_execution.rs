@@ -56,8 +56,11 @@ where
                 .with_reads(session.read_ledger().witnessed_by(&id));
             // Snapshotted per call, not per batch, so a session grant approved
             // by an earlier call in this batch already reaches the next
-            // delegation's inherited overlay.
-            if let Some(driver) = self.turn_subagent_driver(session, &subagent_usage) {
+            // delegation's inherited overlay — and a `fork` snapshot includes
+            // results recorded earlier in this batch.
+            if let Some(driver) =
+                self.turn_subagent_driver(session, &subagent_usage, &tool_calls[index].name)
+            {
                 ctx = ctx.with_subagents(driver);
             }
             let call_id = tool_calls[index].call_id.clone();

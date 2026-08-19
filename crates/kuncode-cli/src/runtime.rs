@@ -12,6 +12,7 @@
 
 use std::sync::Arc;
 
+use kuncode_agent::agent_type::AgentTypeCatalog;
 use kuncode_agent::observer::{AgentObserver, CompositeObserver};
 use kuncode_agent::permission::{ApprovalResolver, CanonicalPath, PermissionMode, PolicySet};
 use kuncode_agent::registry::ToolRegistry;
@@ -158,11 +159,23 @@ impl CliRuntime<RetryModel<AnyChatCompletionModel>> {
 
         // Same startup-frozen contract as the instructions: the catalog is a
         // prompt prefix, so skills added mid-session appear on the next start.
-        let skill_catalog = SkillCatalog::scan(&skill_roots(workspace.root(), home.as_deref()));
+        let skill_catalog =
+            SkillCatalog::scan(&kuncode_roots(workspace.root(), home.as_deref(), "skills"));
         tracing::info!(
             target: "kuncode::runtime",
             skills = skill_catalog.len(),
             "skill catalog resolved",
+        );
+
+        // Custom agent types are frozen at startup for the same reason: the
+        // type list renders into the `task` tool definition, which is part of
+        // the cached prompt prefix.
+        let agent_types =
+            AgentTypeCatalog::scan(&kuncode_roots(workspace.root(), home.as_deref(), "agents"));
+        tracing::info!(
+            target: "kuncode::runtime",
+            custom_agent_types = agent_types.custom_len(),
+            "agent type catalog resolved",
         );
 
         // Built before `workspace` is moved into the registry below.
@@ -215,6 +228,12 @@ impl CliRuntime<RetryModel<AnyChatCompletionModel>> {
         let model = RetryModel::with_policy(provider_model.clone(), RetryPolicy::default());
         let summary_model = RetryModel::with_policy(provider_model, summary_retry_policy());
         let mut registry = ToolRegistry::with_default_workspace_tools(workspace)?;
+        // The default registration already advertises the built-in agent
+        // types; only custom definitions change the `task` description, so
+        // the slot is replaced (in place) just for them.
+        if agent_types.custom_len() > 0 {
+            registry.register_task_tool(Arc::new(agent_types))?;
+        }
         // Advertised only when there is something to load; an empty catalog
         // would make the tool pure prompt noise.
         if !skill_catalog.is_empty() {
@@ -429,17 +448,22 @@ impl std::fmt::Display for ModelSwitchError {
 
 impl std::error::Error for ModelSwitchError {}
 
-/// Skill roots ordered least to most specific — the user-global directory
-/// first, the workspace's own second — mirroring the `AGENTS.md` precedence so
-/// a project skill overrides a global one of the same name.
-fn skill_roots(root: &std::path::Path, home: Option<&std::path::Path>) -> Vec<std::path::PathBuf> {
+/// `.kuncode/<leaf>` roots ordered least to most specific — the user-global
+/// directory first, the workspace's own second — mirroring the `AGENTS.md`
+/// precedence so a project entry overrides a global one of the same name.
+/// Shared by the skill (`skills`) and agent-type (`agents`) catalogs.
+fn kuncode_roots(
+    root: &std::path::Path,
+    home: Option<&std::path::Path>,
+    leaf: &str,
+) -> Vec<std::path::PathBuf> {
     let mut roots = Vec::with_capacity(2);
     if let Some(home) = home {
-        roots.push(home.join(".kuncode").join("skills"));
+        roots.push(home.join(".kuncode").join(leaf));
     }
-    let workspace_root = root.join(".kuncode").join("skills");
+    let workspace_root = root.join(".kuncode").join(leaf);
     // Running kuncode inside the global directory itself would otherwise scan
-    // the same skills twice, with the duplicate winning as "more specific".
+    // the same entries twice, with the duplicate winning as "more specific".
     if !roots.contains(&workspace_root) {
         roots.push(workspace_root);
     }

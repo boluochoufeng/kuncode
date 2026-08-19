@@ -242,6 +242,29 @@ impl ToolRegistry {
         Ok(())
     }
 
+    /// Replaces the default `task` tool with one advertising a scanned
+    /// agent-type catalog.
+    ///
+    /// Replacement keeps the slot's position, so the definition list order —
+    /// the provider cache prefix — is unchanged; only the `task` description
+    /// gains the custom type lines. The permission profile is identical to
+    /// the default registration: delegation stays allowed by default and each
+    /// type is gated as its own `Agent(<name>)` target.
+    pub fn register_task_tool(
+        &mut self,
+        catalog: Arc<crate::agent_type::AgentTypeCatalog>,
+    ) -> Result<(), RegistryError> {
+        self.register_with_profile(
+            Task::with_types(catalog),
+            ToolPermissionProfile::new(
+                TASK_TOOL_NAME,
+                [(PermissionNamespace::Agent, ProfileDefault::Allow)],
+                false,
+            )?,
+        )?;
+        Ok(())
+    }
+
     /// Registers the `load_skill` tool over a scanned catalog.
     ///
     /// Separate from the default set because the tool only makes sense when
@@ -267,6 +290,22 @@ impl ToolRegistry {
     /// The runner uses this to hand a subagent every tool except `task`
     /// itself, which is what closes the infinite-delegation loop.
     pub fn without_tool(&self, name: &str) -> Self {
+        self.retaining(|tool| tool != name)
+    }
+
+    /// Returns a copy keeping only the named tools, preserving their relative
+    /// order.
+    ///
+    /// Names absent from this registry are ignored rather than rejected: a
+    /// whitelist can only narrow the parent set, never add to it, so a stale
+    /// name in an agent-type definition degrades to "that tool is missing"
+    /// instead of failing the delegation.
+    pub fn keeping_tools<S: AsRef<str>>(&self, names: &[S]) -> Self {
+        self.retaining(|tool| names.iter().any(|name| name.as_ref() == tool))
+    }
+
+    /// Copies the slots whose tool name satisfies `keep`, preserving order.
+    fn retaining(&self, keep: impl Fn(&str) -> bool) -> Self {
         // Entries are copied directly instead of re-registered: each already
         // passed profile validation against this registry's workspace root.
         let mut registry = Self {
@@ -274,7 +313,7 @@ impl ToolRegistry {
             ..Self::default()
         };
         for registered in &self.tools {
-            if registered.tool.name() == name {
+            if !keep(registered.tool.name()) {
                 continue;
             }
             registry
@@ -609,6 +648,27 @@ mod tests {
         assert!(subagent_view.get("grep").is_some());
         assert!(subagent_view.get("task").is_none());
         assert_eq!(subagent_view.workspace_root(), registry.workspace_root());
+    }
+
+    #[tokio::test]
+    async fn keeping_tools_narrows_to_the_whitelist_in_registry_order() {
+        let workspace = Workspace::from_current_dir()
+            .await
+            .expect("current directory should be a valid workspace");
+        let registry = ToolRegistry::with_default_workspace_tools(workspace)
+            .expect("built-in profiles are valid");
+
+        // Whitelist order does not matter; unknown names degrade to absent.
+        let narrowed = registry.keeping_tools(&["grep", "read_file", "not-a-tool"]);
+
+        let names = narrowed
+            .definition()
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["read_file", "grep"]);
+        assert!(narrowed.get("bash").is_none());
+        assert_eq!(narrowed.workspace_root(), registry.workspace_root());
     }
 
     #[tokio::test]

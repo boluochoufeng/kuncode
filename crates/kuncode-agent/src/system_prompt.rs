@@ -61,6 +61,18 @@ impl SystemPrompt {
     }
 }
 
+/// A whole assembled prompt reused as one section of another prompt.
+///
+/// The subagent driver composes with this: a custom agent type's extra
+/// instructions render as a section *after* the parent's full prompt, so the
+/// subagent keeps the environment, tool, and project-instruction blocks
+/// without this module having to splice section lists.
+impl PromptSection for std::sync::Arc<SystemPrompt> {
+    fn render(&self, ctx: &PromptContext) -> Option<String> {
+        self.assemble(ctx)
+    }
+}
+
 /// Always-on identity and behavioral instructions.
 pub struct IdentitySection(String);
 

@@ -1,12 +1,17 @@
 //! The `task` tool: delegate a self-contained subtask to a subagent.
 //!
-//! A subagent is a nested agent loop that starts from a fresh transcript
-//! containing only the delegated prompt. It shares the parent's workspace,
-//! permission gates, and approval channel, but none of its conversation: only
-//! the final report returns to the parent, so exploratory tool traffic never
-//! enters the parent's context. The tool itself holds no runtime — the runner
-//! injects a [`SubagentDriver`] through [`ToolContext::subagents`], keeping
-//! this adapter free of the model type and the registry cycle.
+//! A subagent is a nested agent loop. Its shape is picked by name from the
+//! [`AgentTypeCatalog`]: the default `general` type starts from a fresh
+//! transcript containing only the delegated prompt, the built-in `fork` type
+//! starts from a copy of the parent conversation, and custom types can narrow
+//! the tool set and append their own instructions. Every shape shares the
+//! parent's workspace, permission gates, and approval channel; only the final
+//! report returns to the parent, so exploratory tool traffic never enters the
+//! parent's context. The tool itself holds no runtime — the runner injects a
+//! [`SubagentDriver`] through [`ToolContext::subagents`], keeping this adapter
+//! free of the model type and the registry cycle.
+
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use kuncode_core::completion::{ToolDefinition, Usage};
@@ -15,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    agent_type::{AgentType, AgentTypeCatalog, GENERAL_AGENT_TYPE},
     permission::{CanonicalToolInput, PermissionCheckSpec, PermissionTarget, ToolDisplay},
     tool::{
         PreparationContext, ToolContext, ToolErrorKind, ToolOutput, TypedPreparation, TypedTool,
@@ -26,26 +32,24 @@ use crate::{
 /// registry a subagent receives.
 pub const TASK_TOOL_NAME: &str = "task";
 
-/// Permission profile name carried by the `Agent(...)` check. There is a single
-/// built-in subagent shape today; a named profile keeps rules like
-/// `Agent(general)` stable when specialized profiles arrive.
-pub const SUBAGENT_PROFILE: &str = "general";
-
 /// Reports are the distilled result of a run, so they share the bound used for
 /// raw `bash` output rather than getting a larger one.
 const REPORT_LIMIT_BYTES: usize = 20_000;
 
 const DESCRIPTION: &str = "\
-Delegate a self-contained subtask to a subagent: a fresh agent loop that shares \
-this workspace and its permission rules but none of this conversation. It works \
-with the same tools (except task itself) and returns only its final report; the \
-intermediate steps never enter your context. Use it for exploratory or \
-multi-step work whose intermediate output would flood the conversation, such as \
-searching a large codebase or running and digesting a long build.
+Delegate a self-contained subtask to a subagent: a nested agent loop that \
+shares this workspace and its permission rules. It works with the same tools \
+(except task itself) and returns only its final report; the intermediate steps \
+never enter your context. Use it for exploratory or multi-step work whose \
+intermediate output would flood the conversation, such as searching a large \
+codebase or running and digesting a long build.
 
-The subagent starts from your prompt alone and cannot ask questions, so make \
-the prompt self-contained: state the goal, the constraints, and exactly what \
-the final report must contain.";
+Pick the subagent's shape with agent_type. The default `general` starts from a \
+fresh context holding only your prompt, so make that prompt self-contained: \
+state the goal, the constraints, and exactly what the final report must \
+contain. `fork` instead starts from a copy of this conversation, for subtasks \
+that depend on what was already discussed; it still cannot ask questions, so \
+the prompt must say what to do and what to report.";
 
 /// Arguments for [`Task`].
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -54,10 +58,14 @@ pub struct TaskArgs {
     /// Short label (3-7 words) of the subtask, shown to the user while the
     /// subagent runs, e.g. "Find failing test causes".
     pub description: String,
-    /// Complete, self-contained instructions for the subagent. It sees nothing
-    /// else of this conversation, so include all context it needs and say what
-    /// its final report must contain.
+    /// Complete, self-contained instructions for the subagent. Except with
+    /// agent_type `fork`, it sees nothing else of this conversation, so
+    /// include all context it needs and say what its final report must
+    /// contain.
     pub prompt: String,
+    /// Which agent type runs the subtask, from the list in this tool's
+    /// description. Defaults to `general`.
+    pub agent_type: Option<String>,
 }
 
 /// The only part of a subagent run that returns to the parent transcript.
@@ -67,6 +75,20 @@ pub struct TaskOutput {
     pub report: String,
     /// Model calls the subagent used to produce the report.
     pub iterations: usize,
+}
+
+/// One delegation as handed to the [`SubagentDriver`]: the validated prompt
+/// plus the resolved shape to run it under.
+#[derive(Clone, Debug)]
+pub struct SubagentRequest {
+    /// Display/log label; must not influence the run.
+    pub description: String,
+    /// The delegated instructions.
+    pub prompt: String,
+    /// Resolved shape — context mode, tool whitelist, extra instructions. The
+    /// permission check for `Agent(<name>)` already passed by the time the
+    /// driver sees this.
+    pub agent_type: AgentType,
 }
 
 /// Successful subagent run as seen by the delegating tool.
@@ -108,14 +130,10 @@ impl SubagentFailure {
 /// usage toward the parent turn.
 #[async_trait]
 pub trait SubagentDriver: Send + Sync {
-    /// Executes `prompt` in a fresh subagent session and returns its report.
-    ///
-    /// `description` is display/log context only and must not influence the
-    /// run.
+    /// Executes one delegation and returns its report.
     async fn run(
         &self,
-        description: &str,
-        prompt: &str,
+        request: SubagentRequest,
         cancel: &CancellationToken,
     ) -> Result<SubagentOutcome, SubagentFailure>;
 }
@@ -124,15 +142,45 @@ pub trait SubagentDriver: Send + Sync {
 #[derive(Clone, Debug)]
 pub struct Task {
     definition: ToolDefinition,
+    catalog: Arc<AgentTypeCatalog>,
 }
 
 impl Task {
-    /// Creates the tool. Holds only its cached definition; the loop it
-    /// delegates to arrives per call via [`ToolContext::subagents`].
+    /// Creates the tool over the built-in agent types only.
     pub fn new() -> Self {
-        Self {
-            definition: definition_for::<TaskArgs>(TASK_TOOL_NAME, DESCRIPTION),
+        Self::with_types(Arc::new(AgentTypeCatalog::builtin()))
+    }
+
+    /// Creates the tool over a scanned catalog. The type list renders into the
+    /// tool description — startup-static, like the rest of the definition — so
+    /// the model picks types from the schema without a discovery step. The
+    /// loop it delegates to arrives per call via [`ToolContext::subagents`].
+    pub fn with_types(catalog: Arc<AgentTypeCatalog>) -> Self {
+        let mut description = String::from(DESCRIPTION);
+        description.push_str("\n\nAgent types:\n");
+        for agent_type in catalog.types() {
+            description.push_str("- ");
+            description.push_str(agent_type.name());
+            if !agent_type.description().is_empty() {
+                description.push_str(": ");
+                description.push_str(agent_type.description());
+            }
+            description.push('\n');
         }
+        Self {
+            definition: definition_for::<TaskArgs>(TASK_TOOL_NAME, description.trim_end()),
+            catalog,
+        }
+    }
+
+    /// A bounded name list for the not-found message, so a typo gets the model
+    /// back on track without a second discovery step.
+    fn known_types(&self) -> String {
+        self.catalog
+            .types()
+            .map(AgentType::name)
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
@@ -142,10 +190,17 @@ impl Default for Task {
     }
 }
 
+/// Payload retained between preparation and execution.
+pub struct PreparedTask {
+    description: String,
+    prompt: String,
+    agent_type: AgentType,
+}
+
 #[async_trait]
 impl TypedTool for Task {
     type Args = TaskArgs;
-    type Prepared = TaskArgs;
+    type Prepared = PreparedTask;
     type Output = TaskOutput;
 
     fn definition(&self) -> &ToolDefinition {
@@ -172,19 +227,52 @@ impl TypedTool for Task {
                 "task description must not be blank",
             ));
         }
-        let target = PermissionTarget::agent(SUBAGENT_PROFILE).map_err(|error| {
+        let requested = args
+            .agent_type
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .unwrap_or(GENERAL_AGENT_TYPE);
+        let Some(agent_type) = self.catalog.resolve(requested) else {
+            return Err(ToolOutput::failure(
+                ToolErrorKind::InvalidArguments,
+                format!(
+                    "unknown agent type `{requested}`; available types: {}",
+                    self.known_types()
+                ),
+            ));
+        };
+        // The check names the resolved type, so `Agent(<name>)` rules gate
+        // each shape independently and Plan mode still denies them all.
+        let target = PermissionTarget::agent(agent_type.name()).map_err(|error| {
             ToolOutput::failure(ToolErrorKind::InvalidArguments, error.to_string())
         })?;
-        let display = ToolDisplay::new(format!("Task: {}", args.description));
+        let display = if agent_type.name() == GENERAL_AGENT_TYPE {
+            ToolDisplay::new(format!("Task: {}", args.description))
+        } else {
+            ToolDisplay::new(format!(
+                "Task ({}): {}",
+                agent_type.name(),
+                args.description
+            ))
+        };
         Ok(TypedPreparation::new(
-            args,
+            PreparedTask {
+                description: args.description,
+                prompt: args.prompt,
+                agent_type: agent_type.clone(),
+            },
             canonical_input,
             kuncode_core::non_empty_vec::NonEmptyVec::new(PermissionCheckSpec::new(target)),
             display,
         ))
     }
 
-    async fn run_prepared(&self, prepared: TaskArgs, ctx: &ToolContext) -> ToolOutput<TaskOutput> {
+    async fn run_prepared(
+        &self,
+        prepared: PreparedTask,
+        ctx: &ToolContext,
+    ) -> ToolOutput<TaskOutput> {
         let Some(driver) = &ctx.subagents else {
             // Reachable outside a runner turn (tests, direct embedders): a
             // model-recoverable failure, not a harness error, so the loop
@@ -194,10 +282,12 @@ impl TypedTool for Task {
                 "no subagent runtime is attached to this session",
             );
         };
-        match driver
-            .run(&prepared.description, &prepared.prompt, &ctx.cancel)
-            .await
-        {
+        let request = SubagentRequest {
+            description: prepared.description,
+            prompt: prepared.prompt,
+            agent_type: prepared.agent_type,
+        };
+        match driver.run(request, &ctx.cancel).await {
             Ok(outcome) => {
                 let (report, truncated) = truncate_utf8(&outcome.report, REPORT_LIMIT_BYTES);
                 let output = ToolOutput::success(TaskOutput {
@@ -217,28 +307,41 @@ impl TypedTool for Task {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::path::PathBuf;
 
     use super::*;
+    use crate::agent_type::FORK_AGENT_TYPE;
     use crate::tool::{Tool, execute_for_test};
 
-    /// Driver stub scripted with one fixed result.
-    struct ScriptedDriver(Result<SubagentOutcome, SubagentFailure>);
+    /// Driver stub scripted with one fixed result; records the request.
+    struct ScriptedDriver {
+        result: Result<SubagentOutcome, SubagentFailure>,
+        seen: std::sync::Mutex<Vec<SubagentRequest>>,
+    }
+
+    impl ScriptedDriver {
+        fn new(result: Result<SubagentOutcome, SubagentFailure>) -> Self {
+            Self {
+                result,
+                seen: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
 
     #[async_trait]
     impl SubagentDriver for ScriptedDriver {
         async fn run(
             &self,
-            _description: &str,
-            _prompt: &str,
+            request: SubagentRequest,
             _cancel: &CancellationToken,
         ) -> Result<SubagentOutcome, SubagentFailure> {
-            self.0.clone()
+            self.seen.lock().expect("request log").push(request);
+            self.result.clone()
         }
     }
 
-    fn ctx_with(driver: ScriptedDriver) -> ToolContext {
-        ToolContext::new().with_subagents(Arc::new(driver))
+    fn ctx_with(driver: Arc<ScriptedDriver>) -> ToolContext {
+        ToolContext::new().with_subagents(driver)
     }
 
     fn args() -> serde_json::Value {
@@ -256,9 +359,32 @@ mod tests {
         }
     }
 
+    /// A catalog holding the built-ins plus one custom `explore` type.
+    fn catalog_with_explore() -> Arc<AgentTypeCatalog> {
+        let root = std::env::temp_dir().join(format!(
+            "kuncode-task-types-{}-{}",
+            std::process::id(),
+            std::thread::current()
+                .name()
+                .unwrap_or("t")
+                .replace(':', "_"),
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("temp dir");
+        std::fs::write(
+            root.join("explore.md"),
+            "---\ndescription: Read-only exploration.\ntools: read_file, grep\n---\nOnly report findings.",
+        )
+        .expect("definition");
+        let catalog = AgentTypeCatalog::scan(std::slice::from_ref::<PathBuf>(&root));
+        let _ = std::fs::remove_dir_all(&root);
+        Arc::new(catalog)
+    }
+
     #[tokio::test]
     async fn returns_only_the_subagent_report() {
-        let ctx = ctx_with(ScriptedDriver(Ok(outcome("42 crates"))));
+        let driver = Arc::new(ScriptedDriver::new(Ok(outcome("42 crates"))));
+        let ctx = ctx_with(driver.clone());
 
         let output = execute_for_test(Arc::new(Task::new()), args(), &ctx)
             .await
@@ -268,11 +394,16 @@ mod tests {
         let data = output.data.expect("data present");
         assert_eq!(data["report"], "42 crates");
         assert_eq!(data["iterations"], 3);
+        // No agent_type argument resolves to the built-in default.
+        let seen = driver.seen.lock().expect("request log");
+        assert_eq!(seen[0].agent_type.name(), GENERAL_AGENT_TYPE);
     }
 
     #[tokio::test]
     async fn oversized_reports_are_bounded_and_marked_truncated() {
-        let ctx = ctx_with(ScriptedDriver(Ok(outcome(&"x".repeat(30_000)))));
+        let ctx = ctx_with(Arc::new(ScriptedDriver::new(Ok(outcome(
+            &"x".repeat(30_000),
+        )))));
 
         let output = execute_for_test(Arc::new(Task::new()), args(), &ctx)
             .await
@@ -289,10 +420,10 @@ mod tests {
 
     #[tokio::test]
     async fn driver_failures_pass_through_with_their_kind() {
-        let ctx = ctx_with(ScriptedDriver(Err(SubagentFailure::new(
+        let ctx = ctx_with(Arc::new(ScriptedDriver::new(Err(SubagentFailure::new(
             ToolErrorKind::Cancelled,
             "subagent turn was cancelled",
-        ))));
+        )))));
 
         let output = execute_for_test(Arc::new(Task::new()), args(), &ctx)
             .await
@@ -332,7 +463,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn preparation_emits_the_agent_namespace() {
+    async fn unknown_agent_types_fail_and_list_the_catalog() {
+        let unknown = serde_json::json!({
+            "description": "d",
+            "prompt": "p",
+            "agent_type": "explorer"
+        });
+
+        let output = execute_for_test(Arc::new(Task::new()), unknown, &ToolContext::new())
+            .await
+            .expect("no harness error");
+
+        assert!(!output.ok);
+        let error = output.error.expect("error present");
+        assert_eq!(error.kind, ToolErrorKind::InvalidArguments);
+        assert!(error.message.contains("general"), "{}", error.message);
+        assert!(error.message.contains("fork"), "{}", error.message);
+    }
+
+    #[tokio::test]
+    async fn preparation_emits_the_agent_namespace_with_the_resolved_type() {
         let preparation = Arc::new(Task::new())
             .prepare(args(), &PreparationContext::new())
             .await
@@ -340,8 +490,77 @@ mod tests {
 
         assert!(matches!(
             preparation.checks().first().target(),
-            PermissionTarget::Agent(profile) if profile == SUBAGENT_PROFILE
+            PermissionTarget::Agent(profile) if profile == GENERAL_AGENT_TYPE
         ));
         assert_eq!(preparation.display().summary(), "Task: Inspect workspace");
+    }
+
+    #[tokio::test]
+    async fn a_named_type_reaches_the_check_the_display_and_the_driver() {
+        let fork_args = serde_json::json!({
+            "description": "Summarize decisions",
+            "prompt": "Summarize what we decided so far.",
+            "agent_type": "fork"
+        });
+        let tool = Arc::new(Task::new());
+
+        let preparation = tool
+            .clone()
+            .prepare(fork_args.clone(), &PreparationContext::new())
+            .await
+            .expect("valid preparation");
+        assert!(matches!(
+            preparation.checks().first().target(),
+            PermissionTarget::Agent(profile) if profile == FORK_AGENT_TYPE
+        ));
+        assert_eq!(
+            preparation.display().summary(),
+            "Task (fork): Summarize decisions"
+        );
+
+        let driver = Arc::new(ScriptedDriver::new(Ok(outcome("summary"))));
+        let output = execute_for_test(tool, fork_args, &ctx_with(driver.clone()))
+            .await
+            .expect("no harness error");
+        assert!(output.ok);
+        let seen = driver.seen.lock().expect("request log");
+        assert_eq!(seen[0].agent_type.name(), FORK_AGENT_TYPE);
+        assert_eq!(
+            seen[0].agent_type.context(),
+            crate::agent_type::SubagentContext::Fork
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_types_are_advertised_and_resolved() {
+        let tool = Task::with_types(catalog_with_explore());
+
+        let description = &tool.definition.description;
+        assert!(
+            description.contains("- explore: Read-only exploration."),
+            "{description}"
+        );
+
+        let explore_args = serde_json::json!({
+            "description": "Map the crate layout",
+            "prompt": "List every crate and its purpose.",
+            "agent_type": "explore"
+        });
+        let driver = Arc::new(ScriptedDriver::new(Ok(outcome("mapped"))));
+        let output = execute_for_test(Arc::new(tool), explore_args, &ctx_with(driver.clone()))
+            .await
+            .expect("no harness error");
+
+        assert!(output.ok);
+        let seen = driver.seen.lock().expect("request log");
+        assert_eq!(seen[0].agent_type.name(), "explore");
+        assert_eq!(
+            seen[0].agent_type.tools().expect("whitelist present"),
+            ["read_file", "grep"]
+        );
+        assert_eq!(
+            seen[0].agent_type.instructions(),
+            Some("Only report findings.")
+        );
     }
 }

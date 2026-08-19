@@ -2,8 +2,10 @@
 //!
 //! This crate owns the harness layer around `kuncode-core`.
 
+pub mod agent_type;
 pub mod compaction;
 pub mod error;
+pub(crate) mod frontmatter;
 pub mod glob;
 pub mod hook;
 pub mod observer;

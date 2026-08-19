@@ -2,24 +2,28 @@
 //!
 //! The driver is built per tool call from the live runner, so a delegation
 //! always uses the current model, hooks, policy, and approval channel. The
-//! subagent session is fresh — only the delegated prompt enters it — but it
-//! inherits the parent session's permission overlay (mode + session grants), so
-//! delegation can never widen what the user has allowed, and never re-asks for
-//! what they already granted this session.
+//! requested agent type decides the starting transcript — fresh for most
+//! types, a copy of the parent conversation for `fork` — and may narrow the
+//! tool set or append its own instructions. Every shape inherits the parent
+//! session's permission overlay (mode + session grants), so delegation can
+//! never widen what the user has allowed, and never re-asks for what they
+//! already granted this session.
 
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use kuncode_core::completion::{CompletionModel, Usage};
+use kuncode_core::completion::{AssistantContent, CompletionModel, Message, Usage};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    agent_type::{AgentType, SubagentContext},
     error::AgentError,
     permission::SessionPolicyOverlay,
     session::AgentSession,
+    system_prompt::{IdentitySection, SystemPrompt},
     tool::{
         ToolErrorKind,
-        task::{SubagentDriver, SubagentFailure, SubagentOutcome, TASK_TOOL_NAME},
+        task::{SubagentDriver, SubagentFailure, SubagentOutcome, SubagentRequest, TASK_TOOL_NAME},
     },
 };
 
@@ -42,6 +46,10 @@ pub(super) fn accrued_usage(meter: &SubagentUsageMeter) -> Usage {
 struct TurnSubagents<M> {
     runner: AgentRunner<M>,
     overlay: SessionPolicyOverlay,
+    /// Parent transcript copy serving a possible `fork` delegation. Captured
+    /// only when the call being served is `task` itself, and `take`n by the
+    /// single run this driver serves.
+    fork_messages: Mutex<Option<Vec<Message>>>,
     meter: SubagentUsageMeter,
 }
 
@@ -56,27 +64,59 @@ where
         &self,
         session: &AgentSession,
         meter: &SubagentUsageMeter,
+        call_name: &str,
     ) -> Option<Arc<dyn SubagentDriver>> {
         self.registry.registered(TASK_TOOL_NAME)?;
+        // Only a `task` call can request a fork, so the transcript copy is
+        // paid per delegation, not per tool call in the batch.
+        let fork_messages = (call_name == TASK_TOOL_NAME).then(|| session.messages().to_vec());
         Some(Arc::new(TurnSubagents {
             runner: self.clone(),
             overlay: session.permissions().clone(),
+            fork_messages: Mutex::new(fork_messages),
             meter: meter.clone(),
         }))
     }
 
     /// Derives the runner a subagent turn executes on.
     ///
-    /// Same model, system prompt, policy, approvals, and hooks as the parent —
-    /// the permission boundary must not depend on which loop makes a call.
-    /// What differs is deliberate: the registry loses `task` (no infinite
-    /// delegation), and persistence, compaction, plan nagging, and the
-    /// observer are dropped because the throwaway session has no durable
-    /// journal to compact into and the frontend cannot yet render nested
-    /// events (tracing still records the run).
-    fn subagent_runner(&self) -> AgentRunner<M> {
+    /// Same model, policy, approvals, and hooks as the parent — the permission
+    /// boundary must not depend on which loop makes a call. What differs is
+    /// deliberate: the registry loses `task` (no infinite delegation) and is
+    /// narrowed further when the agent type carries a whitelist; a type's
+    /// extra instructions render after the parent's whole prompt so the
+    /// environment and project-instruction blocks survive. Persistence,
+    /// compaction, plan nagging, and the observer are dropped because the
+    /// throwaway session has no durable journal to compact into and the
+    /// frontend cannot yet render nested events (tracing still records the
+    /// run).
+    fn subagent_runner(&self, agent_type: &AgentType) -> AgentRunner<M> {
         let mut sub = self.clone();
         sub.registry = self.registry.without_tool(TASK_TOOL_NAME);
+        if let Some(tools) = agent_type.tools() {
+            let missing: Vec<&str> = tools
+                .iter()
+                .map(String::as_str)
+                .filter(|name| sub.registry.registered(name).is_none())
+                .collect();
+            if !missing.is_empty() {
+                tracing::warn!(
+                    target: "kuncode::subagent",
+                    agent_type = %agent_type.name(),
+                    missing = %missing.join(", "),
+                    "agent type whitelists tools unavailable to subagents; ignoring those names",
+                );
+            }
+            // Filtering the already task-less registry means a whitelist can
+            // never smuggle `task` back in.
+            sub.registry = sub.registry.keeping_tools(tools);
+        }
+        if let Some(instructions) = agent_type.instructions() {
+            sub.system_prompt = Arc::new(SystemPrompt::new(vec![
+                Box::new(self.system_prompt.clone()),
+                Box::new(IdentitySection::new(instructions)),
+            ]));
+        }
         sub.config.compaction = None;
         sub.config.todo_reminder_interval = None;
         sub.session_store = None;
@@ -98,17 +138,39 @@ where
 {
     async fn run(
         &self,
-        description: &str,
-        prompt: &str,
+        request: SubagentRequest,
         cancel: &CancellationToken,
     ) -> Result<SubagentOutcome, SubagentFailure> {
-        let runner = self.runner.subagent_runner();
-        let mut session = AgentSession::new();
+        let SubagentRequest {
+            description,
+            prompt,
+            agent_type,
+        } = request;
+        let runner = self.runner.subagent_runner(&agent_type);
+        let mut session = match agent_type.context() {
+            SubagentContext::Fresh => AgentSession::new(),
+            SubagentContext::Fork => {
+                let snapshot = self.fork_messages.lock().expect("fork snapshot").take();
+                let Some(mut messages) = snapshot else {
+                    // Unreachable through the runner (the snapshot is always
+                    // captured for a `task` call), but a driver reached any
+                    // other way must fail the delegation, not panic.
+                    return Err(SubagentFailure::new(
+                        "subagent_failed",
+                        "no conversation snapshot is available for a fork delegation",
+                    ));
+                };
+                trim_unpaired_tail(&mut messages);
+                AgentSession::from_messages(messages)
+            }
+        };
         *session.permissions_mut() = self.overlay.clone();
         tracing::info!(
             target: "kuncode::subagent",
-            description,
+            description = %description,
+            agent_type = %agent_type.name(),
             prompt_chars = prompt.chars().count(),
+            starting_messages = session.messages().len(),
             "subagent turn started",
         );
         match runner
@@ -119,7 +181,8 @@ where
                 self.add_usage(turn.usage);
                 tracing::info!(
                     target: "kuncode::subagent",
-                    description,
+                    description = %description,
+                    agent_type = %agent_type.name(),
                     iterations = turn.iterations,
                     total_tokens = turn.usage.total_tokens,
                     "subagent turn completed",
@@ -133,13 +196,38 @@ where
             Err(error) => {
                 tracing::warn!(
                     target: "kuncode::subagent",
-                    description,
+                    description = %description,
+                    agent_type = %agent_type.name(),
                     error = %error,
                     "subagent turn failed",
                 );
                 Err(classify_failure(error, |usage| self.add_usage(usage)))
             }
         }
+    }
+}
+
+/// Drops the parent's in-flight tool batch from a fork snapshot.
+///
+/// The snapshot is taken while the parent is mid-batch: its last assistant
+/// message holds tool calls whose results are not all recorded yet — the
+/// delegation being served never is. Providers reject a transcript with an
+/// unpaired tool call, so the fork starts from the conversation as it stood
+/// before that batch.
+fn trim_unpaired_tail(messages: &mut Vec<Message>) {
+    let Some(last_assistant) = messages
+        .iter()
+        .rposition(|message| matches!(message, Message::Assistant { .. }))
+    else {
+        return;
+    };
+    let has_tool_calls = matches!(
+        &messages[last_assistant],
+        Message::Assistant { content, .. }
+            if content.iter().any(|block| matches!(block, AssistantContent::ToolCall(_)))
+    );
+    if has_tool_calls {
+        messages.truncate(last_assistant);
     }
 }
 
@@ -174,7 +262,7 @@ fn classify_failure(error: AgentError, account: impl FnOnce(Usage)) -> SubagentF
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kuncode_core::completion::Message;
+    use kuncode_core::{completion::Message, non_empty_vec::NonEmptyVec};
 
     #[test]
     fn max_iterations_failures_still_account_their_usage() {
@@ -206,5 +294,38 @@ mod tests {
         });
 
         assert_eq!(failure.kind, ToolErrorKind::Cancelled);
+    }
+
+    #[test]
+    fn a_fork_snapshot_drops_the_in_flight_tool_batch() {
+        let mut messages = vec![
+            Message::user("question"),
+            Message::assistant("answer"),
+            Message::Assistant {
+                id: None,
+                content: NonEmptyVec::new(AssistantContent::tool_call(
+                    "call_task",
+                    "task",
+                    serde_json::json!({}),
+                )),
+            },
+            // An earlier call of the same batch, already paired; it goes with
+            // the batch because its request message does.
+            Message::tool_result("call_earlier", "earlier result"),
+        ];
+
+        trim_unpaired_tail(&mut messages);
+
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(&messages[1], Message::Assistant { .. }));
+    }
+
+    #[test]
+    fn a_fork_snapshot_keeps_a_plain_assistant_tail() {
+        let mut messages = vec![Message::user("question"), Message::assistant("answer")];
+
+        trim_unpaired_tail(&mut messages);
+
+        assert_eq!(messages.len(), 2);
     }
 }

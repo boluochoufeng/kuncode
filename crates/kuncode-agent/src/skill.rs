@@ -15,6 +15,8 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use crate::frontmatter::{self, flatten};
+
 /// The one recognized document name inside a skill directory.
 const DOCUMENT_NAME: &str = "SKILL.md";
 
@@ -185,18 +187,21 @@ fn read_skill(dir: &Path) -> Option<Skill> {
         return None;
     }
 
-    let parsed = parse_document(&body);
+    let parsed = frontmatter::parse(&body);
     // The directory name is the stable identity; frontmatter may override it
     // but an absent or blank field must not orphan the skill.
     let fallback_name = dir.file_name()?.to_str()?;
-    let name = flatten(parsed.name.unwrap_or(fallback_name), MAX_NAME_CHARS);
+    let name = flatten(
+        parsed.field("name").unwrap_or(fallback_name),
+        MAX_NAME_CHARS,
+    );
     if name.is_empty() {
         return None;
     }
     let description = flatten(
         parsed
-            .description
-            .or_else(|| parsed.body.lines().find(|line| !line.trim().is_empty()))
+            .field("description")
+            .or_else(|| parsed.body().lines().find(|line| !line.trim().is_empty()))
             .unwrap_or(""),
         MAX_DESCRIPTION_CHARS,
     );
@@ -212,82 +217,10 @@ fn read_skill(dir: &Path) -> Option<Skill> {
     })
 }
 
-/// Frontmatter fields plus the body that follows them.
-struct ParsedDocument<'a> {
-    name: Option<&'a str>,
-    description: Option<&'a str>,
-    body: &'a str,
-}
-
-/// Splits optional `---`-delimited frontmatter from the body.
-///
-/// Only the two `key: value` fields the catalog uses are recognized; unknown
-/// keys are ignored rather than rejected, so a skill written for a richer
-/// harness still loads here. Hand-rolled because this subset needs no YAML
-/// dependency: values are single-line scalars.
-fn parse_document(document: &str) -> ParsedDocument<'_> {
-    let plain = ParsedDocument {
-        name: None,
-        description: None,
-        body: document,
-    };
-    let Some(after_open) = document
-        .strip_prefix("---\n")
-        .or_else(|| document.strip_prefix("---\r\n"))
-    else {
-        return plain;
-    };
-    let mut name = None;
-    let mut description = None;
-    let mut cursor = 0usize;
-    while cursor < after_open.len() {
-        let line_end = after_open[cursor..].find('\n').map(|found| cursor + found);
-        let line = match line_end {
-            Some(end) => &after_open[cursor..end],
-            None => &after_open[cursor..],
-        };
-        let line = line.trim_end_matches('\r');
-        if line.trim() == "---" {
-            let body = match line_end {
-                Some(end) => &after_open[end + 1..],
-                None => "",
-            };
-            return ParsedDocument {
-                name,
-                description,
-                body,
-            };
-        }
-        if let Some((key, value)) = line.split_once(':') {
-            match key.trim() {
-                "name" => name = Some(value.trim()),
-                "description" => description = Some(value.trim()),
-                _ => {}
-            }
-        }
-        match line_end {
-            Some(end) => cursor = end + 1,
-            None => break,
-        }
-    }
-    // An unterminated frontmatter block is treated as plain body: guessing
-    // where it "would" end risks hiding most of the document.
-    plain
-}
-
-/// Collapses whitespace runs to single spaces and caps the char count, so one
-/// catalog entry stays one line of bounded prompt cost.
-fn flatten(text: &str, max_chars: usize) -> String {
-    let mut flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if flat.chars().count() > max_chars {
-        flat = flat.chars().take(max_chars).collect();
-    }
-    flat
-}
-
 /// Caps a loaded body at [`MAX_SKILL_BYTES`], cutting on a char boundary and
-/// stating the cut. Returns the text and whether anything was dropped.
-pub(crate) fn bounded_body(body: String) -> (String, bool) {
+/// stating the cut; `what` names the kind of document inside that note.
+/// Returns the text and whether anything was dropped.
+pub(crate) fn bounded_body(body: String, what: &str) -> (String, bool) {
     if body.len() <= MAX_SKILL_BYTES {
         return (body, false);
     }
@@ -299,7 +232,7 @@ pub(crate) fn bounded_body(body: String) -> (String, bool) {
     let mut kept = body;
     kept.truncate(end);
     kept.push_str(&format!(
-        "\n\n[truncated: {end} of {total} bytes of this skill are shown]"
+        "\n\n[truncated: {end} of {total} bytes of this {what} are shown]"
     ));
     (kept, true)
 }
@@ -467,13 +400,14 @@ mod tests {
     fn oversized_bodies_are_cut_on_a_char_boundary_and_say_so() {
         let body = "。".repeat(MAX_SKILL_BYTES);
 
-        let (kept, truncated) = bounded_body(body.clone());
+        let (kept, truncated) = bounded_body(body.clone(), "skill");
 
         assert!(truncated);
         assert!(kept.len() < body.len());
         assert!(kept.contains("[truncated:"), "{kept}");
+        assert!(kept.contains("of this skill"), "{kept}");
 
-        let (same, untruncated) = bounded_body("small".to_string());
+        let (same, untruncated) = bounded_body("small".to_string(), "skill");
         assert!(!untruncated);
         assert_eq!(same, "small");
     }

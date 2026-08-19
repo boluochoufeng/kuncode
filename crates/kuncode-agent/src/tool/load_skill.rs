@@ -162,7 +162,7 @@ impl TypedTool for LoadSkill {
                 format!("skill `{}` is no longer valid UTF-8", prepared.name),
             );
         };
-        let (content, truncated) = bounded_body(body);
+        let (content, truncated) = bounded_body(body, "skill");
         let output = ToolOutput::success(LoadSkillOutput {
             name: prepared.name,
             source: prepared.path.as_str().to_string(),
