@@ -26,7 +26,7 @@ use super::{
 
 impl<M> AgentRunner<M>
 where
-    M: CompletionModel + 'static,
+    M: CompletionModel,
 {
     /// Executes one batch of tool calls, returning the provider usage consumed
     /// by subagent runs the batch delegated (zero when none ran). On an

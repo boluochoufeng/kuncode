@@ -44,6 +44,16 @@ use crate::settings::{
 };
 use crate::{Cli, logging::LoggingObserver};
 
+/// The one model type the CLI actually runs: the configured provider model
+/// wrapped in transparent retries. Concrete on purpose — a `/model` switch
+/// rebuilds the turn and summary models with two different retry policies,
+/// which a generic `M::make` cannot express — and named once so frontend
+/// helpers take `&CliRunner` instead of re-growing generic bounds.
+pub(crate) type CliModel = RetryModel<AnyChatCompletionModel>;
+
+/// The runner every CLI frontend drives. See [`CliModel`].
+pub(crate) type CliRunner = AgentRunner<CliModel>;
+
 /// Identity and behavioral instructions rendered as the first system-prompt
 /// block. Folds in guidance to maintain a plan via `todo_write`.
 const IDENTITY: &str = "You are kuncode, a coding agent operating in the user's \

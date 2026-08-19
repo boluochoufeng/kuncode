@@ -88,7 +88,7 @@ impl AgentObserver for SubagentEventRelay {
 
 impl<M> AgentRunner<M>
 where
-    M: CompletionModel + 'static,
+    M: CompletionModel,
 {
     /// Builds the driver injected into a tool call's context, or `None` when
     /// no registered tool can delegate (which keeps non-delegating loops free
@@ -168,7 +168,7 @@ impl<M> TurnSubagents<M> {
 #[async_trait]
 impl<M> SubagentDriver for TurnSubagents<M>
 where
-    M: CompletionModel + 'static,
+    M: CompletionModel,
 {
     async fn run(
         &self,

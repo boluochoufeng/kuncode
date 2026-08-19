@@ -23,22 +23,15 @@ use crossterm::execute;
 use futures_util::StreamExt;
 use kuncode_agent::error::AgentError;
 use kuncode_agent::observer::AgentEvent;
-use kuncode_agent::runner::{AgentRunner, ManualCompaction};
+use kuncode_agent::runner::ManualCompaction;
 use kuncode_agent::session::AgentSession;
 use kuncode_agent::session_store::SessionId;
-use kuncode_core::completion::{CompletionModel, RetryModel};
-use kuncode_core::providers::any_chat::AnyChatCompletionModel;
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 use tokio_util::sync::CancellationToken;
 
 use self::app::{App, Status, mode_label, next_mode};
 use self::bridge::{ApprovalRequest, TuiApprover, TuiObserver};
-use crate::runtime::{CliRuntime, ModelSwitcher, SessionResumer};
-
-/// The one model type the TUI runs. Concrete (unlike [`CliRuntime`]) because a
-/// `/model` switch rebuilds the turn and summary models with two different
-/// retry policies, which a generic `M::make` cannot express.
-type CliModel = RetryModel<AnyChatCompletionModel>;
+use crate::runtime::{CliModel, CliRunner, CliRuntime, ModelSwitcher, SessionResumer};
 
 /// Rows scrolled per PageUp/PageDown.
 const SCROLL_STEP: u16 = 10;
@@ -235,7 +228,7 @@ impl Drop for TerminalFeatures {
 #[allow(clippy::too_many_arguments)]
 async fn event_loop(
     terminal: &mut ratatui::DefaultTerminal,
-    mut runner: AgentRunner<CliModel>,
+    mut runner: CliRunner,
     switcher: &ModelSwitcher,
     resumer: &SessionResumer,
     session: &mut AgentSession,
@@ -355,9 +348,9 @@ async fn event_loop(
 ///
 /// Unlike a turn it takes no approvals and produces no assistant message; only
 /// the outcomes the events *don't* cover land as a notice. Ctrl-C cancels.
-async fn run_compaction<M: CompletionModel + 'static>(
+async fn run_compaction(
     terminal: &mut ratatui::DefaultTerminal,
-    runner: &AgentRunner<M>,
+    runner: &CliRunner,
     session: &mut AgentSession,
     app: &mut App,
     events: &mut EventStream,
@@ -430,9 +423,9 @@ async fn run_compaction<M: CompletionModel + 'static>(
 /// The turn future borrows `session` mutably, so it is scoped to an inner block;
 /// only after it is dropped is `session` free again to read the final answer.
 #[allow(clippy::too_many_arguments)]
-async fn run_one_turn<M: CompletionModel + 'static>(
+async fn run_one_turn(
     terminal: &mut ratatui::DefaultTerminal,
-    runner: &AgentRunner<M>,
+    runner: &CliRunner,
     session: &mut AgentSession,
     app: &mut App,
     input: String,

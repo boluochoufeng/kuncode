@@ -15,7 +15,7 @@ use super::{
 
 impl<M> AgentRunner<M>
 where
-    M: CompletionModel + 'static,
+    M: CompletionModel,
 {
     /// The model/tool loop. Returns the failing iteration alongside the error so
     /// [`continue_session_with`](Self::continue_session_with) can emit a single

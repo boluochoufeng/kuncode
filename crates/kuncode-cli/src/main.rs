@@ -15,11 +15,10 @@ use std::{
 };
 
 use clap::Parser;
-use kuncode_agent::{error::AgentError, runner::AgentRunner, session::AgentSession};
-use kuncode_core::completion::CompletionModel;
+use kuncode_agent::{error::AgentError, session::AgentSession};
 use tokio_util::sync::CancellationToken;
 
-use crate::{approver::TerminalApprover, runtime::CliRuntime};
+use crate::{approver::TerminalApprover, runtime::CliRunner, runtime::CliRuntime};
 
 /// kuncode — a coding agent operating in your shell.
 ///
@@ -145,8 +144,8 @@ enum TurnError {
 /// Runs one turn with a Ctrl-C-wired cancellation token, so an interrupt aborts
 /// the current turn and (in the REPL) returns to the prompt instead of killing
 /// the process.
-async fn run_turn<M: CompletionModel + 'static>(
-    runner: &AgentRunner<M>,
+async fn run_turn(
+    runner: &CliRunner,
     session: &mut AgentSession,
     input: String,
 ) -> Result<String, TurnError> {
