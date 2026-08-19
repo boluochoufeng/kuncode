@@ -59,7 +59,7 @@ where
             // delegation's inherited overlay — and a `fork` snapshot includes
             // results recorded earlier in this batch.
             if let Some(driver) =
-                self.turn_subagent_driver(session, &subagent_usage, &tool_calls[index].name)
+                self.turn_subagent_driver(session, &subagent_usage, &tool_calls[index])
             {
                 ctx = ctx.with_subagents(driver);
             }

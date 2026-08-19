@@ -48,6 +48,13 @@ pub enum ViewEffect {
     /// working). Shown once — the emitter already de-duplicates — and the turn
     /// continues, so it renders as a notice, not an error.
     Warning(String),
+    /// Progress from inside a subagent run, to render nested under the parent
+    /// `task` row opened for `parent_id`. The inner effect is one of the
+    /// non-nested variants — see [`nested_view`] for what surfaces.
+    Nested {
+        parent_id: String,
+        effect: Box<ViewEffect>,
+    },
 }
 
 /// Interprets one event into its visible effect, or `None` when it has none.
@@ -88,6 +95,13 @@ pub fn view(kind: EventKind) -> Option<ViewEffect> {
         // clear its plan panel (the plain renderer just prints nothing).
         EventKind::TodoUpdate { todos } => Some(ViewEffect::Plan(todos)),
         EventKind::Warning { message } => Some(ViewEffect::Warning(message)),
+        EventKind::Subagent {
+            parent_tool_call_id,
+            event,
+        } => nested_view(event.kind).map(|effect| ViewEffect::Nested {
+            parent_id: parent_tool_call_id,
+            effect: Box::new(effect),
+        }),
         EventKind::ModelStart
         | EventKind::TextDelta { .. }
         | EventKind::ReasoningDelta { .. }
@@ -98,6 +112,25 @@ pub fn view(kind: EventKind) -> Option<ViewEffect> {
         | EventKind::CompactionSkipped { .. }
         | EventKind::CompactionObserved { .. }
         | EventKind::CompactionFailed { .. } => None,
+    }
+}
+
+/// What surfaces from inside a subagent run: its tool calls and warnings.
+///
+/// Narration and streaming deltas stay hidden — the run's distilled report
+/// returns as the parent tool result, so echoing its prose nested would show
+/// everything delegation exists to keep out of view. The sub's task plan is
+/// suppressed too: it is the subagent's own scratchpad, and passing it through
+/// as [`ViewEffect::Plan`] would clobber the parent's plan panel. A deeper
+/// envelope (impossible today — subagents have no `task`) is flattened to its
+/// leaf effect so depth never multiplies indentation unexpectedly.
+fn nested_view(kind: EventKind) -> Option<ViewEffect> {
+    match view(kind)? {
+        effect @ (ViewEffect::ToolOpened { .. }
+        | ViewEffect::ToolClosed { .. }
+        | ViewEffect::Warning(_)) => Some(effect),
+        ViewEffect::Nested { effect, .. } => Some(*effect),
+        ViewEffect::Narration(_) | ViewEffect::Plan(_) => None,
     }
 }
 
@@ -257,6 +290,108 @@ mod tests {
             Some(ViewEffect::Warning(
                 "session persistence failed: disk full".to_string()
             ))
+        );
+    }
+
+    /// Wraps `kind` as a subagent envelope the way the runner's relay does.
+    fn envelope(parent: &str, kind: EventKind) -> EventKind {
+        EventKind::Subagent {
+            parent_tool_call_id: parent.to_string(),
+            event: Box::new(kuncode_agent::observer::AgentEvent {
+                seq: 7,
+                iteration: Some(0),
+                kind,
+            }),
+        }
+    }
+
+    #[test]
+    fn nested_tool_events_surface_under_their_parent() {
+        let opened = view(envelope(
+            "call_task",
+            EventKind::ToolStart {
+                tool_call_id: "sub_1".to_string(),
+                tool: "grep".to_string(),
+                summary: "grep: TODO".to_string(),
+            },
+        ));
+        assert_eq!(
+            opened,
+            Some(ViewEffect::Nested {
+                parent_id: "call_task".to_string(),
+                effect: Box::new(ViewEffect::ToolOpened {
+                    id: "sub_1".to_string(),
+                    tool: "grep".to_string(),
+                    summary: "grep: TODO".to_string(),
+                }),
+            })
+        );
+
+        let closed = view(envelope(
+            "call_task",
+            EventKind::ToolEnd {
+                tool_call_id: "sub_1".to_string(),
+                tool: "grep".to_string(),
+                ok: true,
+                truncated: false,
+                error: None,
+            },
+        ));
+        assert!(matches!(
+            closed,
+            Some(ViewEffect::Nested { parent_id, effect })
+                if parent_id == "call_task"
+                    && matches!(*effect, ViewEffect::ToolClosed { .. })
+        ));
+    }
+
+    #[test]
+    fn nested_narration_plan_and_deltas_stay_hidden() {
+        // The sub's distilled report returns as the parent tool result;
+        // its narration nested would re-show what delegation hides.
+        assert_eq!(
+            view(envelope(
+                "call_task",
+                EventKind::Assistant {
+                    text: "let me look".to_string(),
+                    tool_calls: vec!["sub_1".to_string()],
+                },
+            )),
+            None
+        );
+        // The sub's plan is its own scratchpad; surfacing it would clobber
+        // the parent's plan panel.
+        assert_eq!(
+            view(envelope(
+                "call_task",
+                EventKind::TodoUpdate { todos: vec![] }
+            )),
+            None
+        );
+        assert_eq!(
+            view(envelope(
+                "call_task",
+                EventKind::TextDelta {
+                    text: "str".to_string(),
+                },
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn nested_warnings_pass_through() {
+        assert_eq!(
+            view(envelope(
+                "call_task",
+                EventKind::Warning {
+                    message: "degraded".to_string(),
+                },
+            )),
+            Some(ViewEffect::Nested {
+                parent_id: "call_task".to_string(),
+                effect: Box::new(ViewEffect::Warning("degraded".to_string())),
+            })
         );
     }
 

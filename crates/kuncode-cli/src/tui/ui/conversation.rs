@@ -9,7 +9,7 @@ use ratatui::{
     widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
 };
 
-use super::super::app::{App, Item, ToolState};
+use super::super::app::{App, Item, SubCall, ToolState};
 use super::Theme;
 
 /// Renders the scrollable conversation viewport and its overflow indicator.
@@ -174,9 +174,10 @@ fn conversation_lines(app: &App, theme: Theme) -> Vec<Line<'static>> {
                 name,
                 summary,
                 state,
+                children,
                 ..
             } => {
-                append_tool(&mut lines, app, name, summary, state, theme);
+                append_tool(&mut lines, app, name, summary, state, children, theme);
             }
             Item::Error(text) => lines.push(Line::from(format!("× {text}")).style(theme.danger())),
             Item::Compaction => lines.push(Line::from("◇ Context compacted").style(theme.muted())),
@@ -211,6 +212,42 @@ fn append_tool(
     name: &str,
     summary: &str,
     state: &ToolState,
+    children: &[SubCall],
+    theme: Theme,
+) {
+    append_call_lines(lines, app, name, summary, state, 0, theme);
+    // Subagent activity nests one level under the delegating row; the parent's
+    // own state glyph stays on the top line, so a long nested run still reads
+    // as one delegation with its inner calls listed below.
+    for child in children {
+        append_call_lines(
+            lines,
+            app,
+            &child.name,
+            &child.summary,
+            &child.state,
+            1,
+            theme,
+        );
+    }
+}
+
+/// One tool call as rendered lines: the `glyph Head  detail` row plus a
+/// detail line for failures/denials. `depth` indents nested subagent calls.
+///
+/// Tool summaries are self-describing (`Read file: src/a.rs`) because the
+/// plain renderer and the approval prompt print them alone; repeating the
+/// tool's name in front would read `ReadFile  Read file: …`. So the row shows
+/// only the summary, split at its first `: ` into a bold head and a muted
+/// detail. The protocol name appears just as a fallback when a summary is
+/// absent (a `ToolClosed` whose call was rejected before opening).
+fn append_call_lines(
+    lines: &mut Vec<Line<'static>>,
+    app: &App,
+    name: &str,
+    summary: &str,
+    state: &ToolState,
+    depth: usize,
     theme: Theme,
 ) {
     let (glyph, glyph_style, suffix) = match state {
@@ -220,17 +257,22 @@ fn append_tool(
         ToolState::Failed(_) => ("×", theme.danger(), None),
         ToolState::Denied(_) => ("!", theme.warning(), None),
     };
+    let (head, detail) = match summary.trim() {
+        "" => (display_tool_name(name), None),
+        summary => match summary.split_once(": ") {
+            Some((head, detail)) => (head.to_string(), Some(detail.to_string())),
+            None => (summary.to_string(), None),
+        },
+    };
+    let indent = "  ".repeat(depth + 1);
     let mut spans = vec![
-        Span::raw("  "),
+        Span::raw(indent.clone()),
         Span::styled(glyph, glyph_style),
         Span::raw(" "),
-        Span::styled(
-            display_tool_name(name),
-            Style::new().add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(head, Style::new().add_modifier(Modifier::BOLD)),
     ];
-    if !summary.trim().is_empty() {
-        spans.push(Span::styled(format!("  {summary}"), theme.muted()));
+    if let Some(detail) = detail {
+        spans.push(Span::styled(format!("  {detail}"), theme.muted()));
     }
     if let Some(suffix) = suffix {
         spans.push(Span::styled(format!("  {suffix}"), theme.warning()));
@@ -238,10 +280,10 @@ fn append_tool(
     lines.push(Line::from(spans));
     match state {
         ToolState::Failed(message) => {
-            lines.push(Line::from(format!("    {message}")).style(theme.danger()));
+            lines.push(Line::from(format!("{indent}  {message}")).style(theme.danger()));
         }
         ToolState::Denied(message) => {
-            lines.push(Line::from(format!("    {message}")).style(theme.warning()));
+            lines.push(Line::from(format!("{indent}  {message}")).style(theme.warning()));
         }
         ToolState::Running | ToolState::Ok { .. } => {}
     }
@@ -387,6 +429,74 @@ mod tests {
         assert!(
             rendered.contains("  second line of output"),
             "continuation lines indent under the marker:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn subagent_children_render_indented_under_the_task_row() {
+        let mut app = App::new("m", PermissionMode::Default);
+        app.conversation.push(Item::Tool {
+            id: "task_1".to_string(),
+            name: "task".to_string(),
+            summary: "Task (explore): map the crates".to_string(),
+            state: ToolState::Running,
+            children: vec![SubCall {
+                id: "sub_1".to_string(),
+                name: "read_file".to_string(),
+                summary: "Read file: src/main.rs".to_string(),
+                state: ToolState::Ok { truncated: false },
+            }],
+        });
+        let mut terminal = Terminal::new(TestBackend::new(60, 16)).expect("test terminal");
+
+        terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
+
+        let rendered = format!("{}", terminal.backend());
+        assert!(
+            rendered.contains("Task (explore)  map the crates"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("    ✓ Read file  src/main.rs"),
+            "child row should render indented one level:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn tool_rows_do_not_repeat_the_tool_name_before_the_summary() {
+        let mut app = App::new("m", PermissionMode::Default);
+        app.conversation.push(Item::Tool {
+            id: "1".to_string(),
+            name: "read_file".to_string(),
+            summary: "Read file: src/main.rs".to_string(),
+            state: ToolState::Ok { truncated: false },
+            children: Vec::new(),
+        });
+        // A close-without-open row has no summary; the protocol name is the
+        // only label available and steps in.
+        app.conversation.push(Item::Tool {
+            id: "2".to_string(),
+            name: "mystery_tool".to_string(),
+            summary: String::new(),
+            state: ToolState::Failed("boom".to_string()),
+            children: Vec::new(),
+        });
+        let mut terminal = Terminal::new(TestBackend::new(60, 16)).expect("test terminal");
+
+        terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
+
+        let rendered = format!("{}", terminal.backend());
+        assert!(
+            rendered.contains("✓ Read file  src/main.rs"),
+            "summary head replaces the name column:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("ReadFile"),
+            "the PascalCase name must not double the summary:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("× MysteryTool"),
+            "an empty summary falls back to the protocol name:\n{rendered}"
         );
     }
 

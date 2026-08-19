@@ -35,6 +35,22 @@ impl AgentObserver for CliObserver {
             },
             // A notice, not an error: the turn keeps going.
             ViewEffect::Warning(text) => println!("⚠ {text}"),
+            // Subagent progress prints indented under the open task row. The
+            // parent's own close line (`  ⎿ …`) lands after these, which reads
+            // naturally: nested activity first, then the delegation's verdict.
+            ViewEffect::Nested { effect, .. } => match *effect {
+                ViewEffect::ToolOpened { summary, .. } => println!("    ⏺ {summary}"),
+                ViewEffect::ToolClosed { outcome, .. } => match outcome {
+                    ToolOutcome::Ok { truncated } => {
+                        println!("      ⎿ ✓{}", if truncated { " (truncated)" } else { "" });
+                    }
+                    ToolOutcome::Denied(message) => println!("      ⎿ ⛔ {message}"),
+                    ToolOutcome::Failed(message) => println!("      ⎿ ✗ {message}"),
+                },
+                ViewEffect::Warning(text) => println!("    ⚠ {text}"),
+                // `nested_view` only lets the three effects above through.
+                _ => {}
+            },
             // Reprint the whole checklist (it is small): no in-place cursor model
             // here, unlike the TUI. An empty plan prints nothing, so no lone header.
             ViewEffect::Plan(todos) => {

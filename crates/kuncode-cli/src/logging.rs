@@ -511,6 +511,19 @@ impl AgentObserver for LoggingObserver {
                 diagnostic_chars = message.chars().count(),
                 "agent turn failed",
             ),
+            // The nested run's own pipeline already logs through tracing
+            // (kuncode::agent / kuncode::tool fire globally from the sub
+            // loop), so the envelope only records the relay attribution.
+            EventKind::Subagent {
+                parent_tool_call_id,
+                event,
+            } => tracing::debug!(
+                target: "kuncode::subagent",
+                seq,
+                parent_tool_call_id = %parent_tool_call_id,
+                inner_seq = event.seq,
+                "subagent event relayed",
+            ),
             EventKind::TodoUpdate { todos } => tracing::debug!(
                 target: "kuncode::agent",
                 seq,

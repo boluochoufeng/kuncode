@@ -92,8 +92,10 @@ async fn task_runs_a_nested_loop_and_only_its_report_reaches_the_parent() {
     // subagent's intermediate messages.
     assert_eq!(requests[3].chat_history.len(), 3);
 
-    // The frontend sees the delegation as one ordinary tool call; none of the
-    // subagent's own model/tool events surface.
+    // The delegation is one tool call in the parent stream; the subagent's own
+    // activity arrives between its start and end, each event wrapped in a
+    // `Subagent` envelope naming the delegating call — never as bare events a
+    // frontend could mistake for parent progress.
     let events = observer.events();
     let labels: Vec<_> = events.iter().map(|e| event_label(&e.kind)).collect();
     assert_eq!(
@@ -102,6 +104,12 @@ async fn task_runs_a_nested_loop_and_only_its_report_reaches_the_parent() {
             "model_start",
             "assistant",
             "tool_start",
+            "subagent", // sub model_start
+            "subagent", // sub assistant (bash call)
+            "subagent", // sub tool_start (bash)
+            "subagent", // sub tool_end (bash)
+            "subagent", // sub model_start
+            "subagent", // sub assistant (report)
             "tool_end",
             "model_start",
             "assistant",
@@ -112,6 +120,37 @@ async fn task_runs_a_nested_loop_and_only_its_report_reaches_the_parent() {
         EventKind::ToolStart { tool, summary, .. }
             if tool == "task" && summary == "Task: Inspect workspace"
     ));
+    // Every envelope names the delegating call; the inner events tell the
+    // nested story in order.
+    let inner: Vec<&str> = events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            EventKind::Subagent {
+                parent_tool_call_id,
+                event,
+            } => {
+                assert_eq!(parent_tool_call_id, "call_task");
+                Some(event_label(&event.kind))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        inner,
+        vec![
+            "model_start",
+            "assistant",
+            "tool_start",
+            "tool_end",
+            "model_start",
+            "assistant",
+        ],
+    );
+    assert!(events.iter().any(|event| matches!(
+        &event.kind,
+        EventKind::Subagent { event, .. }
+            if matches!(&event.kind, EventKind::ToolStart { tool, .. } if tool == "bash")
+    )));
 }
 
 #[tokio::test]

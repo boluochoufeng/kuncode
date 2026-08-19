@@ -31,6 +31,25 @@ pub enum ToolState {
     Denied(String),
 }
 
+/// One tool call inside a subagent run, rendered as a nested row under the
+/// delegating `task` entry. Same lifecycle as a parent call, one level down.
+pub struct SubCall {
+    pub id: String,
+    pub name: String,
+    pub summary: String,
+    pub state: ToolState,
+}
+
+/// Maps a closed call's outcome onto the display lifecycle — shared by parent
+/// rows and nested subagent rows so the two cannot drift.
+fn tool_state_from(outcome: ToolOutcome) -> ToolState {
+    match outcome {
+        ToolOutcome::Ok { truncated } => ToolState::Ok { truncated },
+        ToolOutcome::Denied(message) => ToolState::Denied(message),
+        ToolOutcome::Failed(message) => ToolState::Failed(message),
+    }
+}
+
 /// One rendered entry in the conversation log.
 ///
 /// Built from the agent's event stream plus the turn's final answer. Tool output
@@ -45,6 +64,9 @@ pub enum Item {
         name: String,
         summary: String,
         state: ToolState,
+        /// Nested subagent activity, populated only for `task` rows whose run
+        /// relays events. Rendered indented under the row, in arrival order.
+        children: Vec<SubCall>,
     },
     Error(String),
     /// A presentation-only marker; it never enters the agent transcript.
@@ -440,14 +462,11 @@ impl App {
                     name: tool,
                     summary,
                     state: ToolState::Running,
+                    children: Vec::new(),
                 });
             }
             ViewEffect::ToolClosed { id, tool, outcome } => {
-                let state = match outcome {
-                    ToolOutcome::Ok { truncated } => ToolState::Ok { truncated },
-                    ToolOutcome::Denied(message) => ToolState::Denied(message),
-                    ToolOutcome::Failed(message) => ToolState::Failed(message),
-                };
+                let state = tool_state_from(outcome);
                 if let Some(existing) = self.tool_state_mut(&id) {
                     *existing = state;
                 } else {
@@ -459,9 +478,47 @@ impl App {
                         name: tool,
                         summary: String::new(),
                         state,
+                        children: Vec::new(),
                     });
                 }
             }
+            ViewEffect::Nested { parent_id, effect } => match *effect {
+                ViewEffect::ToolOpened { id, tool, summary } => {
+                    // No parent row means the delegating `task` call never
+                    // opened here (shouldn't happen); dropping beats drawing
+                    // an orphan row at top level as if the parent ran it.
+                    if let Some(children) = self.tool_children_mut(&parent_id) {
+                        children.push(SubCall {
+                            id,
+                            name: tool,
+                            summary,
+                            state: ToolState::Running,
+                        });
+                    }
+                }
+                ViewEffect::ToolClosed { id, tool, outcome } => {
+                    let state = tool_state_from(outcome);
+                    if let Some(children) = self.tool_children_mut(&parent_id) {
+                        if let Some(child) = children.iter_mut().rev().find(|child| child.id == id)
+                        {
+                            child.state = state;
+                        } else {
+                            // Same close-without-open contract as parent rows.
+                            children.push(SubCall {
+                                id,
+                                name: tool,
+                                summary: String::new(),
+                                state,
+                            });
+                        }
+                    }
+                }
+                // A subagent warning is a harness notice like any other; the
+                // conversation log is flat for those.
+                ViewEffect::Warning(text) => self.conversation.push(Item::Warning(text)),
+                // `nested_view` admits only the three effects above.
+                _ => {}
+            },
             ViewEffect::Plan(todos) => {
                 // The plan is a sticky panel, not a log entry, so a wholesale
                 // replace keeps it pinned below the latest activity regardless of
@@ -480,6 +537,20 @@ impl App {
             .rev()
             .find_map(|item| match item {
                 Item::Tool { id: tid, state, .. } if tid == id => Some(state),
+                _ => None,
+            })
+    }
+
+    /// Nested-call list of the most recent tool entry with `id`, the dual of
+    /// [`tool_state_mut`](Self::tool_state_mut) for subagent envelopes.
+    fn tool_children_mut(&mut self, id: &str) -> Option<&mut Vec<SubCall>> {
+        self.conversation
+            .iter_mut()
+            .rev()
+            .find_map(|item| match item {
+                Item::Tool {
+                    id: tid, children, ..
+                } if tid == id => Some(children),
                 _ => None,
             })
     }
@@ -680,6 +751,79 @@ mod tests {
             app.approval.is_none(),
             "Ctrl+C cancels like everywhere else"
         );
+    }
+
+    /// Wraps `kind` the way the runner's subagent relay does.
+    fn sub_event(parent: &str, kind: EventKind) -> EventKind {
+        EventKind::Subagent {
+            parent_tool_call_id: parent.to_string(),
+            event: Box::new(kuncode_agent::observer::AgentEvent {
+                seq: 1,
+                iteration: Some(0),
+                kind,
+            }),
+        }
+    }
+
+    #[test]
+    fn nested_events_grow_children_under_their_task_row() {
+        let mut app = app();
+        app.apply_event(tool_start("task_1"));
+        app.apply_event(sub_event(
+            "task_1",
+            EventKind::ToolStart {
+                tool_call_id: "sub_1".to_string(),
+                tool: "grep".to_string(),
+                summary: "grep: TODO".to_string(),
+            },
+        ));
+        app.apply_event(sub_event(
+            "task_1",
+            EventKind::ToolEnd {
+                tool_call_id: "sub_1".to_string(),
+                tool: "grep".to_string(),
+                ok: true,
+                truncated: false,
+                error: None,
+            },
+        ));
+
+        match app.conversation.as_slice() {
+            [
+                Item::Tool {
+                    state: ToolState::Running,
+                    children,
+                    ..
+                },
+            ] => {
+                // One child (not two), flipped to Ok, while the parent row
+                // itself is still running.
+                assert_eq!(children.len(), 1);
+                assert_eq!(children[0].name, "grep");
+                assert_eq!(children[0].summary, "grep: TODO");
+                assert!(matches!(
+                    children[0].state,
+                    ToolState::Ok { truncated: false }
+                ));
+            }
+            other => panic!("unexpected log: {} items", other.len()),
+        }
+    }
+
+    #[test]
+    fn nested_events_without_their_parent_row_are_dropped() {
+        let mut app = app();
+        app.apply_event(sub_event(
+            "missing_task",
+            EventKind::ToolStart {
+                tool_call_id: "sub_1".to_string(),
+                tool: "grep".to_string(),
+                summary: "grep: TODO".to_string(),
+            },
+        ));
+
+        // No orphan top-level row pretending the parent ran it.
+        assert!(app.conversation.is_empty());
     }
 
     #[test]

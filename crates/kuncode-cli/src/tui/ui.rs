@@ -931,8 +931,9 @@ mod tests {
         app.conversation.push(Item::Tool {
             id: "1".to_string(),
             name: "bash".to_string(),
-            summary: "run ls".to_string(),
+            summary: "Run shell command: ls".to_string(),
             state: ToolState::Ok { truncated: false },
+            children: Vec::new(),
         });
         app.push_assistant("done".to_string());
 
@@ -949,7 +950,10 @@ mod tests {
             rendered.contains("model-x"),
             "status line should show model"
         );
-        assert!(rendered.contains("Bash"), "tool call should be visible");
+        assert!(
+            rendered.contains("Run shell command"),
+            "tool call should be visible"
+        );
     }
 
     #[test]

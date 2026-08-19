@@ -186,6 +186,25 @@ pub enum EventKind {
         /// Accuracy class of the full-request estimate.
         precision: TokenCountPrecision,
     },
+    /// An event produced inside a subagent run, relayed to the parent's
+    /// observer so a frontend can render nested progress under the delegating
+    /// `task` row.
+    ///
+    /// The inner event is unchanged: its [`seq`](AgentEvent::seq) comes from
+    /// the *subagent's* session counter, so it orders events within one nested
+    /// run but is not unique in the parent stream. The envelope's own `seq`
+    /// mirrors it; consumers needing strict parent-session ordering should
+    /// treat envelopes as ordered by arrival inside the surrounding
+    /// [`ToolStart`](Self::ToolStart)..[`ToolEnd`](Self::ToolEnd) pair of
+    /// `parent_tool_call_id`. Envelopes never nest today — a subagent's
+    /// registry has no `task` — but consumers should tolerate depth rather
+    /// than assume it.
+    Subagent {
+        /// Id of the delegating `task` tool call this run serves.
+        parent_tool_call_id: String,
+        /// The subagent's own event, unchanged.
+        event: Box<AgentEvent>,
+    },
     /// An attempt failed before candidate installation.
     CompactionFailed {
         /// Stable pipeline category containing the failure.

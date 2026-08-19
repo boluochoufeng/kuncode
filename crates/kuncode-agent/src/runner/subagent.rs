@@ -7,7 +7,9 @@
 //! tool set or append its own instructions. Every shape inherits the parent
 //! session's permission overlay (mode + session grants), so delegation can
 //! never widen what the user has allowed, and never re-asks for what they
-//! already granted this session.
+//! already granted this session. The run's own events flow back to the parent
+//! observer wrapped in [`EventKind::Subagent`] envelopes, so frontends can
+//! show nested progress under the delegating `task` row.
 
 use std::sync::{Arc, Mutex};
 
@@ -18,6 +20,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     agent_type::{AgentType, SubagentContext},
     error::AgentError,
+    observer::{AgentEvent, AgentObserver, EventKind},
     permission::SessionPolicyOverlay,
     session::AgentSession,
     system_prompt::{IdentitySection, SystemPrompt},
@@ -27,7 +30,7 @@ use crate::{
     },
 };
 
-use super::AgentRunner;
+use super::{AgentRunner, PendingToolCall};
 
 /// Batch-scoped accumulator for provider usage consumed inside subagent runs.
 ///
@@ -46,11 +49,41 @@ pub(super) fn accrued_usage(meter: &SubagentUsageMeter) -> Usage {
 struct TurnSubagents<M> {
     runner: AgentRunner<M>,
     overlay: SessionPolicyOverlay,
+    /// Id of the tool call this driver serves — the attribution key nested
+    /// events are enveloped with.
+    tool_call_id: String,
     /// Parent transcript copy serving a possible `fork` delegation. Captured
     /// only when the call being served is `task` itself, and `take`n by the
     /// single run this driver serves.
     fork_messages: Mutex<Option<Vec<Message>>>,
     meter: SubagentUsageMeter,
+}
+
+/// Re-emits a subagent's events through the parent observer, each wrapped in
+/// a [`EventKind::Subagent`] envelope naming the delegating tool call — so a
+/// frontend can render nested progress without mistaking the inner stream for
+/// parent-session events.
+struct SubagentEventRelay {
+    parent: Arc<dyn AgentObserver>,
+    parent_tool_call_id: String,
+}
+
+impl AgentObserver for SubagentEventRelay {
+    fn on_event(&self, event: &AgentEvent) {
+        let envelope = AgentEvent {
+            // Mirrors the inner event's ordering fields: the parent session's
+            // counter is unreachable here (the session is mutably borrowed by
+            // the batch executing this delegation), and per-run ordering is
+            // what a nested renderer needs. See the variant docs.
+            seq: event.seq,
+            iteration: event.iteration,
+            kind: EventKind::Subagent {
+                parent_tool_call_id: self.parent_tool_call_id.clone(),
+                event: Box::new(event.clone()),
+            },
+        };
+        self.parent.on_event(&envelope);
+    }
 }
 
 impl<M> AgentRunner<M>
@@ -64,15 +97,16 @@ where
         &self,
         session: &AgentSession,
         meter: &SubagentUsageMeter,
-        call_name: &str,
+        call: &PendingToolCall,
     ) -> Option<Arc<dyn SubagentDriver>> {
         self.registry.registered(TASK_TOOL_NAME)?;
         // Only a `task` call can request a fork, so the transcript copy is
         // paid per delegation, not per tool call in the batch.
-        let fork_messages = (call_name == TASK_TOOL_NAME).then(|| session.messages().to_vec());
+        let fork_messages = (call.name == TASK_TOOL_NAME).then(|| session.messages().to_vec());
         Some(Arc::new(TurnSubagents {
             runner: self.clone(),
             overlay: session.permissions().clone(),
+            tool_call_id: call.id.clone(),
             fork_messages: Mutex::new(fork_messages),
             meter: meter.clone(),
         }))
@@ -86,10 +120,10 @@ where
     /// narrowed further when the agent type carries a whitelist; a type's
     /// extra instructions render after the parent's whole prompt so the
     /// environment and project-instruction blocks survive. Persistence,
-    /// compaction, plan nagging, and the observer are dropped because the
-    /// throwaway session has no durable journal to compact into and the
-    /// frontend cannot yet render nested events (tracing still records the
-    /// run).
+    /// compaction, and plan nagging are dropped because the throwaway session
+    /// has no durable journal to compact into. The observer is dropped *here*
+    /// and re-attached by the driver as an enveloping relay, so the raw inner
+    /// stream never reaches the frontend unmarked.
     fn subagent_runner(&self, agent_type: &AgentType) -> AgentRunner<M> {
         let mut sub = self.clone();
         sub.registry = self.registry.without_tool(TASK_TOOL_NAME);
@@ -146,7 +180,15 @@ where
             prompt,
             agent_type,
         } = request;
-        let runner = self.runner.subagent_runner(&agent_type);
+        let mut runner = self.runner.subagent_runner(&agent_type);
+        // Nested progress reaches the parent frontend wrapped in `Subagent`
+        // envelopes carrying this delegation's tool call id.
+        if let Some(parent) = self.runner.observer.clone() {
+            runner.observer = Some(Arc::new(SubagentEventRelay {
+                parent,
+                parent_tool_call_id: self.tool_call_id.clone(),
+            }));
+        }
         let mut session = match agent_type.context() {
             SubagentContext::Fresh => AgentSession::new(),
             SubagentContext::Fork => {
