@@ -58,6 +58,9 @@ pub struct AgentType {
     tools: Option<Vec<String>>,
     /// Extra instructions appended after the parent's system prompt.
     instructions: Option<String>,
+    /// Requested model — a profile name or model id the harness resolves;
+    /// `None` inherits the delegating turn's model.
+    model: Option<String>,
 }
 
 impl AgentType {
@@ -85,6 +88,13 @@ impl AgentType {
     /// Extra instructions for the subagent's system prompt, when defined.
     pub fn instructions(&self) -> Option<&str> {
         self.instructions.as_deref()
+    }
+
+    /// Requested model name, when the definition asks for one. Resolution —
+    /// and what happens when the name is unknown — belongs to the harness
+    /// that owns the model registry.
+    pub fn model(&self) -> Option<&str> {
+        self.model.as_deref()
     }
 }
 
@@ -119,6 +129,7 @@ impl AgentTypeCatalog {
                     context: SubagentContext::Fresh,
                     tools: None,
                     instructions: None,
+                    model: None,
                 },
                 AgentType {
                     name: FORK_AGENT_TYPE.to_string(),
@@ -143,6 +154,7 @@ impl AgentTypeCatalog {
                          answer with the report it asks for."
                             .to_string(),
                     ),
+                    model: None,
                 },
             ],
             custom: BTreeMap::new(),
@@ -278,6 +290,10 @@ fn read_agent_type(path: &Path) -> Option<AgentType> {
         MAX_DESCRIPTION_CHARS,
     );
     let tools = parsed.field("tools").and_then(parse_tools);
+    let model = parsed
+        .field("model")
+        .map(|field| flatten(field, MAX_NAME_CHARS))
+        .filter(|name| !name.is_empty());
     let instructions = match parsed.body().trim() {
         "" => None,
         body => {
@@ -306,6 +322,7 @@ fn read_agent_type(path: &Path) -> Option<AgentType> {
         context: SubagentContext::Fresh,
         tools,
         instructions,
+        model,
     })
 }
 
@@ -389,6 +406,42 @@ mod tests {
         // Advertised order: builtins first, then customs.
         let names: Vec<&str> = catalog.types().map(AgentType::name).collect();
         assert_eq!(names, ["general", "fork", "explore"]);
+    }
+
+    #[test]
+    fn a_model_request_is_parsed_from_frontmatter() {
+        let root = unique_dir("model");
+        write_definition(
+            &root,
+            "heavy.md",
+            "---\nmodel: pro-profile\n---\nThink hard.",
+        );
+        write_definition(&root, "plain.md", "---\nmodel:   \n---\nNo request.");
+
+        let catalog = AgentTypeCatalog::scan(std::slice::from_ref(&root));
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(
+            catalog.resolve("heavy").expect("scanned type").model(),
+            Some("pro-profile")
+        );
+        // A blank field is no request, and the built-ins never carry one —
+        // `general` and `fork` always run on the delegating turn's model.
+        assert!(
+            catalog
+                .resolve("plain")
+                .expect("scanned type")
+                .model()
+                .is_none()
+        );
+        assert!(
+            catalog
+                .resolve("general")
+                .expect("builtin")
+                .model()
+                .is_none()
+        );
+        assert!(catalog.resolve("fork").expect("builtin").model().is_none());
     }
 
     #[test]

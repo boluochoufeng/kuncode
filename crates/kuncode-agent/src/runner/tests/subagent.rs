@@ -295,6 +295,62 @@ async fn a_custom_agent_type_narrows_tools_and_appends_its_instructions() {
     assert!(!parent_system.contains("ONLY REPORT"), "{parent_system}");
 }
 
+#[tokio::test]
+async fn a_type_model_override_swaps_the_subagent_model_and_budget() {
+    let root =
+        std::env::temp_dir().join(format!("kuncode-runner-agent-model-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("temp dir");
+    std::fs::write(root.join("explore.md"), "Read-only exploration.").expect("definition");
+    let catalog = AgentTypeCatalog::scan(std::slice::from_ref(&root));
+    let _ = std::fs::remove_dir_all(&root);
+    let mut registry = default_registry().await;
+    registry
+        .register_task_tool(Arc::new(catalog))
+        .expect("task profile is valid");
+
+    let parent_model = FakeModel::new([
+        response(AssistantContent::tool_call(
+            "call_task",
+            "task",
+            serde_json::json!({
+                "description": "Map the crates",
+                "prompt": "List the crates.",
+                "agent_type": "explore"
+            }),
+        )),
+        response(AssistantContent::text("done")),
+    ]);
+    let override_model = FakeModel::new([response(AssistantContent::text("EXPLORED"))]);
+    let overrides = std::collections::HashMap::from([(
+        "explore".to_string(),
+        crate::runner::SubagentModel {
+            model: override_model.clone(),
+            max_tokens: 1234,
+            model_name: "fake-override".to_string(),
+        },
+    )]);
+    let runner = AgentRunner::new(parent_model.clone(), registry)
+        .with_subagent_models(overrides)
+        .with_approval_resolver(Arc::new(ApproveAll));
+    let mut session = AgentSession::new();
+
+    let turn = runner
+        .run_turn(&mut session, "go")
+        .await
+        .expect("agent run should complete");
+
+    assert_eq!(turn.final_text(&session), "done");
+    // The delegation ran on the override model with its own budget; the
+    // parent model saw only the parent's two calls.
+    assert_eq!(parent_model.requests().len(), 2);
+    let sub_requests = override_model.requests();
+    assert_eq!(sub_requests.len(), 1);
+    assert_eq!(sub_requests[0].max_tokens, Some(1234));
+    // The subagent's usage still lands in the parent turn's accounting.
+    assert_eq!(turn.usage.total_tokens, 9);
+}
+
 /// The system message content of one recorded request, when present.
 fn sub_history_system(
     history: &kuncode_core::non_empty_vec::NonEmptyVec<Message>,

@@ -114,19 +114,24 @@ where
 
     /// Derives the runner a subagent turn executes on.
     ///
-    /// Same model, policy, approvals, and hooks as the parent — the permission
+    /// Same policy, approvals, and hooks as the parent — the permission
     /// boundary must not depend on which loop makes a call. What differs is
     /// deliberate: the registry loses `task` (no infinite delegation) and is
     /// narrowed further when the agent type carries a whitelist; a type's
     /// extra instructions render after the parent's whole prompt so the
-    /// environment and project-instruction blocks survive. Persistence,
-    /// compaction, and plan nagging are dropped because the throwaway session
-    /// has no durable journal to compact into. The observer is dropped *here*
-    /// and re-attached by the driver as an enveloping relay, so the raw inner
-    /// stream never reaches the frontend unmarked.
+    /// environment and project-instruction blocks survive; a type with a
+    /// model override runs on that model and budget instead of the turn's.
+    /// Persistence, compaction, and plan nagging are dropped because the
+    /// throwaway session has no durable journal to compact into. The observer
+    /// is dropped *here* and re-attached by the driver as an enveloping relay,
+    /// so the raw inner stream never reaches the frontend unmarked.
     fn subagent_runner(&self, agent_type: &AgentType) -> AgentRunner<M> {
         let mut sub = self.clone();
         sub.registry = self.registry.without_tool(TASK_TOOL_NAME);
+        if let Some(entry) = self.subagent_models.get(agent_type.name()) {
+            sub.model = entry.model.clone();
+            sub.config.max_tokens = Some(entry.max_tokens);
+        }
         if let Some(tools) = agent_type.tools() {
             let missing: Vec<&str> = tools
                 .iter()
@@ -211,6 +216,11 @@ where
             target: "kuncode::subagent",
             description = %description,
             agent_type = %agent_type.name(),
+            model = self
+                .runner
+                .subagent_models
+                .get(agent_type.name())
+                .map_or("inherit", |entry| entry.model_name.as_str()),
             prompt_chars = prompt.chars().count(),
             starting_messages = session.messages().len(),
             "subagent turn started",

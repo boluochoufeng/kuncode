@@ -102,6 +102,7 @@ where
             session_store: None,
             group_estimator: Arc::new(RequestGroupEstimator::new(token_estimator.clone())),
             token_estimator,
+            subagent_models: Arc::new(std::collections::HashMap::new()),
         }
     }
 
@@ -189,6 +190,21 @@ where
     /// boundaries; replacing the model does not create a separate session path.
     pub fn with_summary_model(mut self, model: M) -> Self {
         self.summary_model = model;
+        self
+    }
+
+    /// Installs per-agent-type model overrides, keyed by type name.
+    ///
+    /// A `task` delegation to a listed type runs on that entry's model and
+    /// output budget instead of the turn model; every other type — and every
+    /// name absent here — inherits the turn model. Resolving type definitions
+    /// to models (and rejecting unknown names) is the caller's job; by this
+    /// point every entry is already a working model.
+    pub fn with_subagent_models(
+        mut self,
+        models: std::collections::HashMap<String, super::SubagentModel<M>>,
+    ) -> Self {
+        self.subagent_models = Arc::new(models);
         self
     }
 

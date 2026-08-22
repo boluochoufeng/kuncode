@@ -11,7 +11,7 @@ mod tool_authorization;
 mod tool_execution;
 mod turn;
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use kuncode_core::completion::{ReasoningEffort, ToolChoice, Usage};
 
@@ -152,6 +152,18 @@ impl AgentTurn {
     }
 }
 
+/// One agent type's model override: the prebuilt model, its output budget,
+/// and a display name for logs (the model type itself carries no identifier).
+#[derive(Clone)]
+pub struct SubagentModel<M> {
+    /// Model a delegation to this type runs on.
+    pub model: M,
+    /// Output-token budget resolved for that model.
+    pub max_tokens: u64,
+    /// Identifier logged when the override applies.
+    pub model_name: String,
+}
+
 /// Minimal agent loop for model/tool/model interaction.
 #[derive(Clone)]
 pub struct AgentRunner<M> {
@@ -173,6 +185,9 @@ pub struct AgentRunner<M> {
     // final-request accounting remain comparable.
     token_estimator: Arc<dyn TokenEstimator>,
     group_estimator: Arc<dyn GroupTokenEstimator>,
+    /// Per-agent-type model overrides, keyed by type name; a type without an
+    /// entry delegates on the turn model.
+    subagent_models: Arc<HashMap<String, SubagentModel<M>>>,
 }
 
 #[derive(Debug)]

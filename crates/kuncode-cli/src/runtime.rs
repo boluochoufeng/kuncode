@@ -10,6 +10,7 @@
 //! out of `main`, and gives each frontend a single argument instead of a long
 //! positional list.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use kuncode_agent::agent_type::AgentTypeCatalog;
@@ -17,7 +18,7 @@ use kuncode_agent::observer::{AgentObserver, CompositeObserver};
 use kuncode_agent::permission::{ApprovalResolver, CanonicalPath, PermissionMode, PolicySet};
 use kuncode_agent::registry::ToolRegistry;
 use kuncode_agent::runner::{
-    AgentCompactionConfigError, AgentConfig, AgentRunner, AgentRunnerBuildError,
+    AgentCompactionConfigError, AgentConfig, AgentRunner, AgentRunnerBuildError, SubagentModel,
 };
 use kuncode_agent::session::AgentSession;
 use kuncode_agent::session_store::{
@@ -89,6 +90,10 @@ pub struct CliRuntime<M> {
     client: AnyChatClient,
     /// Switchable models resolved at startup; `/model` consults only this.
     model_registry: ModelRegistry,
+    /// Per-agent-type model overrides prebuilt from the registry; a `/model`
+    /// switch leaves them pinned, while non-overridden types keep inheriting
+    /// whatever the turn model currently is.
+    subagent_models: HashMap<String, SubagentModel<M>>,
 }
 
 impl CliRuntime<RetryModel<AnyChatCompletionModel>> {
@@ -185,6 +190,7 @@ impl CliRuntime<RetryModel<AnyChatCompletionModel>> {
             custom_agent_types = agent_types.custom_len(),
             "agent type catalog resolved",
         );
+        let subagent_models = subagent_model_table(&agent_types, &model_registry, &client);
 
         // Built before `workspace` is moved into the registry below.
         let mut sections: Vec<Box<dyn PromptSection>> = vec![
@@ -263,6 +269,7 @@ impl CliRuntime<RetryModel<AnyChatCompletionModel>> {
             resume_target: None,
             client,
             model_registry,
+            subagent_models,
         })
     }
 
@@ -457,6 +464,55 @@ fn kuncode_roots(
     roots
 }
 
+/// Prebuilds the per-agent-type model table from the startup model registry.
+///
+/// Only custom types can request a model (the built-ins carry none), and the
+/// requested name is a registry lookup — a profile name or a registered model
+/// id. An unknown name degrades that type to inheriting the turn model, with
+/// a warning: one wrong name in one agent file must not fail startup, and the
+/// delegation itself still works.
+fn subagent_model_table(
+    agent_types: &AgentTypeCatalog,
+    registry: &crate::settings::ModelRegistry,
+    client: &AnyChatClient,
+) -> HashMap<String, SubagentModel<CliModel>> {
+    let mut table = HashMap::new();
+    for agent_type in agent_types.types() {
+        let Some(requested) = agent_type.model() else {
+            continue;
+        };
+        let Some(entry) = registry.get(requested) else {
+            tracing::warn!(
+                target: "kuncode::subagent",
+                agent_type = %agent_type.name(),
+                model = %requested,
+                "agent type requests an unknown model or profile; it will inherit the turn model",
+            );
+            continue;
+        };
+        let model = RetryModel::with_policy(
+            AnyChatCompletionModel::make(client, entry.model_name.clone()),
+            RetryPolicy::default(),
+        );
+        tracing::info!(
+            target: "kuncode::subagent",
+            agent_type = %agent_type.name(),
+            model = %entry.model_name,
+            max_tokens = entry.max_tokens,
+            "agent type model override resolved",
+        );
+        table.insert(
+            agent_type.name().to_string(),
+            SubagentModel {
+                model,
+                max_tokens: entry.max_tokens,
+                model_name: entry.model_name.clone(),
+            },
+        );
+    }
+    table
+}
+
 fn provider_client(project: &ProjectSettings) -> Result<AnyChatClient, Box<dyn std::error::Error>> {
     match project.provider {
         ProviderKind::DeepSeek => Ok(AnyChatClient::DeepSeek(DeepSeekClient::from_env()?)),
@@ -571,6 +627,7 @@ impl<M: CompletionModel> CliRuntime<M> {
         ]));
         let runner = AgentRunner::try_with_config(self.model, self.registry, self.config)?
             .with_summary_model(self.summary_model)
+            .with_subagent_models(self.subagent_models)
             .with_system_prompt(self.system_prompt)
             .with_policy(self.policy)?
             .with_approval_resolver(approver)
@@ -748,6 +805,42 @@ mod tests {
             switcher.known_models(),
             vec!["fast", "deepseek-v4-pro", "deepseek-v4-flash"]
         );
+    }
+
+    #[test]
+    fn subagent_model_table_resolves_profiles_and_skips_unknown_names() {
+        let dir = std::env::temp_dir().join(format!("kuncode-sub-models-{}", std::process::id()));
+        fs::create_dir_all(dir.join(".kuncode")).expect("temp dir");
+        fs::write(
+            dir.join(".kuncode/settings.json"),
+            r#"{ "modelProfiles": {
+                "fast": { "name": "deepseek-v4-flash", "maxTokens": 32768 }
+            } }"#,
+        )
+        .expect("write settings");
+        let settings =
+            load_project_settings_from(&dir, ModelOverrides::default(), ProjectTrust::Untrusted)
+                .expect("load settings");
+        let agents = dir.join("agents");
+        fs::create_dir_all(&agents).expect("agents dir");
+        fs::write(agents.join("explore.md"), "---\nmodel: fast\n---\nExplore.")
+            .expect("definition");
+        fs::write(agents.join("broken.md"), "---\nmodel: nope\n---\nBroken.").expect("definition");
+        let catalog = AgentTypeCatalog::scan(std::slice::from_ref(&agents));
+        let _ = fs::remove_dir_all(&dir);
+        let client = AnyChatClient::DeepSeek(
+            kuncode_core::providers::deepseek::DeepSeekClient::new("test-key").expect("client"),
+        );
+
+        let table = subagent_model_table(&catalog, &settings.model_registry, &client);
+
+        let explore = table.get("explore").expect("profile-backed override");
+        assert_eq!(explore.model_name, "deepseek-v4-flash");
+        assert_eq!(explore.max_tokens, 32_768);
+        // An unknown name degrades to inheritance; built-ins never override.
+        assert!(!table.contains_key("broken"));
+        assert!(!table.contains_key("general"));
+        assert!(!table.contains_key("fork"));
     }
 
     #[test]
