@@ -83,8 +83,11 @@ TUI 中按 `Enter` 提交，`Ctrl+J` 插入换行，`PageUp` / `PageDown` 浏览
 丢弃，而不是把标签截断成半截。
 输入 `/` 弹出命令列表，`↑` / `↓` 选择、`Tab` 补全、
 `Enter` 执行；`/help` 列出可用命令，`/model` 弹出模型选择列表（`↑` / `↓`
-选择、`Enter` 切换、`Esc` 取消），`/model <名称>` 直接切换到指定模型
-（provider 不变；`--resume` 恢复的会话仍使用启动时解析的模型），`/compact`
+选择、`Enter` 切换、`Esc` 取消），`/model <名称>` 直接切换到指定模型或
+`modelProfiles` 中的 profile。可切换的候选在启动时一次性解析成注册表
+（profile ∪ provider 内置模型 ∪ 启动模型），切换只查表、不重读配置文件，
+名称不在注册表中会报错并列出全部可用项（provider 不变；`--resume`
+恢复的会话仍使用启动时解析的模型）。`/compact`
 立即压缩上下文，`/quit`（或输入 `exit`）退出。终端设置了 `NO_COLOR` 时界面自动使用无颜色样式；移除该
 环境变量即可启用 ANSI 语义色。
 
@@ -112,6 +115,9 @@ cargo build --release -p kuncode-cli
     "name": "deepseek-v4-flash",
     "maxTokens": 65536
   },
+  "modelProfiles": {
+    "fast": { "name": "deepseek-v4-flash", "maxTokens": 32768 }
+  },
   "agent": {
     "maxIterations": 50,
     "todoReminderInterval": 3
@@ -133,6 +139,11 @@ cargo build --release -p kuncode-cli
   并读取 `DEEPSEEK_API_KEY` 或 `OPENAI_API_KEY`。
 - 内置模型配置包括 `deepseek-v4-flash` 和 `deepseek-v4-pro`；未指定 `model.name`
   时，DeepSeek provider 默认使用 `deepseek-v4-flash`。
+- `modelProfiles` 定义可按名字引用的具名模型档案（`name` 必填，`maxTokens` 与
+  `provider` 可选，`provider` 默认取 `model.provider`）。profile 与内置模型、
+  启动模型在启动时合并为模型注册表，供 `/model` 切换；同名时 profile 优先。
+  每个条目的输出预算和压缩配置各自独立校验，无效的 profile 会在启动时报错并
+  指明是哪一个；指向其他 provider 的 profile 本次运行不可切换，仅记录警告。
 - 没有内置能力档案的模型，`model.maxTokens` 默认值为 `16384`；从旧版
   `32768` 默认值升级时，如配置了 `compaction.reservedOutput`，需同步调整或显式设置
   `model.maxTokens`。
