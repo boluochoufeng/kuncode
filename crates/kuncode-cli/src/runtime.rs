@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use kuncode_agent::agent_type::AgentTypeCatalog;
+use kuncode_agent::memory::{MemoryCatalog, memory_root};
 use kuncode_agent::observer::{AgentObserver, CompositeObserver};
 use kuncode_agent::permission::{ApprovalResolver, CanonicalPath, PermissionMode, PolicySet};
 use kuncode_agent::registry::ToolRegistry;
@@ -27,8 +28,8 @@ use kuncode_agent::session_store::{
 };
 use kuncode_agent::skill::SkillCatalog;
 use kuncode_agent::system_prompt::{
-    EnvironmentSection, IdentitySection, InstructionsSection, PromptSection, SkillsSection,
-    SystemPrompt, ToolsSection,
+    EnvironmentSection, IdentitySection, InstructionsSection, MemorySection, PromptSection,
+    SkillsSection, SystemPrompt, ToolsSection,
 };
 use kuncode_agent::workspace::Workspace;
 use kuncode_core::completion::{CompletionModel, RetryModel, RetryPolicy};
@@ -180,6 +181,23 @@ impl CliRuntime<RetryModel<AnyChatCompletionModel>> {
             "skill catalog resolved",
         );
 
+        // Memory mirrors the skill contract: a startup-frozen index in the
+        // prompt, full documents on demand. No home directory means no memory
+        // root, and the feature silently stays unregistered — the session
+        // store's degradation.
+        let memory_root = home
+            .as_deref()
+            .map(|home| memory_root(home, workspace.root()));
+        let memory_catalog = memory_root
+            .as_deref()
+            .map(MemoryCatalog::scan)
+            .unwrap_or_default();
+        tracing::info!(
+            target: "kuncode::runtime",
+            memories = memory_catalog.len(),
+            "memory catalog resolved",
+        );
+
         // Custom agent types are frozen at startup for the same reason: the
         // type list renders into the `task` tool definition, which is part of
         // the cached prompt prefix.
@@ -201,6 +219,8 @@ impl CliRuntime<RetryModel<AnyChatCompletionModel>> {
         if !skill_catalog.is_empty() {
             sections.push(Box::new(SkillsSection::new(skill_catalog.summaries())));
         }
+        // An empty index omits itself, so the section is pushed unconditionally.
+        sections.push(Box::new(MemorySection::new(memory_catalog.summaries())));
         sections.push(Box::new(InstructionsSection::new(instructions)));
         let system_prompt = SystemPrompt::new(sections);
 
@@ -252,6 +272,12 @@ impl CliRuntime<RetryModel<AnyChatCompletionModel>> {
         // would make the tool pure prompt noise.
         if !skill_catalog.is_empty() {
             registry.register_skill_tool(Arc::new(skill_catalog))?;
+        }
+        // Unlike `load_skill`, an empty catalog does not make the memory pair
+        // noise: `write_memory` is how the first memory comes to exist, and a
+        // memory written this session must be loadable in it.
+        if let Some(root) = memory_root {
+            registry.register_memory_tools(root)?;
         }
 
         Ok(Self {

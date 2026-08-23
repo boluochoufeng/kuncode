@@ -13,6 +13,11 @@ mod ls;
 mod read_file;
 mod write_file;
 
+// The memory tools reuse the same open-refusing-symlinks base and read stamps;
+// widened here rather than made fully public because the helpers stay an
+// implementation detail of this crate's tools.
+pub(crate) use self::helpers::{OpenError, file_stamp, write_no_follow};
+
 pub use self::edit_file::{EditFile, EditFileArgs, EditFileOutput};
 pub use self::glob::{Glob, GlobArgs, GlobOutput};
 pub use self::grep::{Grep, GrepArgs, GrepFile, GrepLine, GrepOutput, GrepOutputMode};

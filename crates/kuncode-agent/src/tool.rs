@@ -16,10 +16,12 @@ use crate::todo::TodoHandle;
 
 pub mod bash;
 pub mod filesystem;
+pub mod load_memory;
 pub mod load_skill;
 pub mod task;
 pub mod todo_write;
 pub mod web_fetch;
+pub mod write_memory;
 
 mod output;
 mod read_ledger;

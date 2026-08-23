@@ -2,6 +2,7 @@
 
 use std::{
     collections::HashMap,
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -21,10 +22,12 @@ use crate::{
         Tool,
         bash::Bash,
         filesystem::{EditFile, Glob, Grep, Ls, ReadFile, WriteFile},
+        load_memory::{LOAD_MEMORY_TOOL_NAME, LoadMemory},
         load_skill::{LOAD_SKILL_TOOL_NAME, LoadSkill},
         task::{TASK_TOOL_NAME, Task},
         todo_write::TodoWrite,
         web_fetch::{WebFetch, WebFetchError},
+        write_memory::{WRITE_MEMORY_TOOL_NAME, WriteMemory},
     },
     workspace::Workspace,
 };
@@ -278,6 +281,41 @@ impl ToolRegistry {
             ToolPermissionProfile::new(
                 LOAD_SKILL_TOOL_NAME,
                 [(PermissionNamespace::Read, ProfileDefault::Allow)],
+                false,
+            )?,
+        )?;
+        Ok(())
+    }
+
+    /// Registers the memory pair — `load_memory` and `write_memory` — over
+    /// the per-project memory root.
+    ///
+    /// Separate from the default set because the root only exists when a home
+    /// directory does: the caller owns discovery, and no home degrades to "no
+    /// memory feature", like the session store. Registered even when nothing
+    /// is stored yet — `write_memory` is how the first memory comes to exist,
+    /// and a memory written this session must be loadable in it.
+    ///
+    /// Loading is a Read (allowed by default, Plan-safe); writing is an Edit
+    /// requiring approval. Neither profile constrains paths: the root lives
+    /// outside the workspace, where [`ToolPermissionProfile::constrain_paths_to`]
+    /// would trip the workspace-mismatch guard — like `load_skill`, path
+    /// confinement is the tool's own job, done by the slug grammar that pins
+    /// every target directly under the root.
+    pub fn register_memory_tools(&mut self, root: PathBuf) -> Result<(), RegistryError> {
+        self.register_with_profile(
+            LoadMemory::new(root.clone()),
+            ToolPermissionProfile::new(
+                LOAD_MEMORY_TOOL_NAME,
+                [(PermissionNamespace::Read, ProfileDefault::Allow)],
+                false,
+            )?,
+        )?;
+        self.register_with_profile(
+            WriteMemory::new(root),
+            ToolPermissionProfile::new(
+                WRITE_MEMORY_TOOL_NAME,
+                [(PermissionNamespace::Edit, ProfileDefault::RequireApproval)],
                 false,
             )?,
         )?;
@@ -625,6 +663,46 @@ mod tests {
         // A subagent loses `task` but keeps skill loading.
         let subagent_view = registry.without_tool("task");
         assert!(subagent_view.get("load_skill").is_some());
+    }
+
+    #[tokio::test]
+    async fn the_memory_tools_append_and_reach_subagent_views() {
+        let workspace = Workspace::from_current_dir()
+            .await
+            .expect("current directory should be a valid workspace");
+        let root = workspace.root().to_path_buf();
+        let mut registry = ToolRegistry::with_default_workspace_tools(workspace)
+            .expect("built-in profiles are valid");
+
+        registry
+            .register_memory_tools(std::env::temp_dir().join("kuncode-registry-memory"))
+            .expect("memory profiles are valid");
+
+        let names = registry
+            .definition()
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            &names[names.len() - 2..],
+            ["load_memory", "write_memory"],
+            "memory tools append in order"
+        );
+        // The path-unconstrained profiles must not disturb the workspace root
+        // the path-constrained default tools were registered under.
+        assert_eq!(
+            registry.workspace_root().map(|r| r.as_str().to_string()),
+            Some(
+                crate::permission::CanonicalPath::from_absolute(&root)
+                    .expect("workspace root is canonical")
+                    .as_str()
+                    .to_string()
+            ),
+        );
+        // A subagent loses `task` but keeps both memory tools.
+        let subagent_view = registry.without_tool("task");
+        assert!(subagent_view.get("load_memory").is_some());
+        assert!(subagent_view.get("write_memory").is_some());
     }
 
     #[tokio::test]

@@ -13,6 +13,7 @@ mod hooks_tool_stop;
 mod large_tool_result_compaction;
 mod lineage;
 mod manual_compaction;
+mod memory_tools;
 mod persistence_todo;
 mod persistence_warnings;
 mod skill_loading;

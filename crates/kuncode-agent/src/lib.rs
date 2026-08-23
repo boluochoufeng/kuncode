@@ -8,6 +8,7 @@ pub mod error;
 pub(crate) mod frontmatter;
 pub mod glob;
 pub mod hook;
+pub mod memory;
 pub mod observer;
 pub(crate) mod path_text;
 pub mod permission;
