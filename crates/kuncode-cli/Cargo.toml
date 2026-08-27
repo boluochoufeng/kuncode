@@ -20,7 +20,6 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true }
-dotenvy = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 futures-util = { workspace = true }

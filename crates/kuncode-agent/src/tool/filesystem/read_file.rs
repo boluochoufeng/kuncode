@@ -1,6 +1,6 @@
 //! The `read_file` tool: read a UTF-8 workspace file with line pagination.
 
-use std::path::PathBuf;
+use std::{io, path::PathBuf};
 
 use async_trait::async_trait;
 use kuncode_core::completion::ToolDefinition;
@@ -9,7 +9,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::{
     fs::OpenOptions,
-    io::{AsyncBufReadExt, BufReader},
+    io::{AsyncBufRead, AsyncBufReadExt, BufReader},
 };
 
 use super::helpers::{
@@ -21,7 +21,7 @@ use crate::{
     },
     tool::{
         FileStamp, PreparationContext, PreparedInvocationState, ToolContext, ToolError, ToolOutput,
-        TypedPreparation, TypedTool, definition_for, output::truncate_utf8,
+        TypedPreparation, TypedTool, definition_for,
     },
     workspace::Workspace,
 };
@@ -188,13 +188,13 @@ impl TypedTool for ReadFile {
             .as_ref()
             .map(FileStamp::from_metadata)
             .unwrap_or_default();
-        let mut lines = BufReader::new(file).lines();
+        let mut lines = BufReader::new(file);
 
         // Skip the lines before `start_line` without keeping them. Cost is
         // proportional to `start_line`, not file size; nothing past the
         // requested window is read.
         for _ in 0..(start_line - 1) {
-            match lines.next_line().await {
+            match read_bounded_line(&mut lines, 0).await {
                 Ok(Some(_)) => {}
                 // `start_line` is past EOF: there is simply nothing to return.
                 Ok(None) => break,
@@ -219,7 +219,7 @@ impl TypedTool for ReadFile {
                 // A read error while peeking is a real failure (e.g. invalid
                 // UTF-8 on the next line), not EOF — surface it like every other
                 // read instead of reporting a false end-of-file via `has_more`.
-                has_more = match lines.next_line().await {
+                has_more = match read_bounded_line(&mut lines, 0).await {
                     Ok(Some(_)) => true,
                     Ok(None) => false,
                     Err(err) => return io_error("read", &resolved, err, &self.workspace),
@@ -227,14 +227,15 @@ impl TypedTool for ReadFile {
                 break;
             }
 
-            let raw = match lines.next_line().await {
+            let raw = match read_bounded_line(&mut lines, MAX_LINE_BYTES).await {
                 Ok(Some(line)) => line,
                 Ok(None) => break,
                 Err(err) => return io_error("read", &resolved, err, &self.workspace),
             };
 
-            let raw_bytes = raw.len();
-            let (mut line, line_truncated) = truncate_utf8(&raw, MAX_LINE_BYTES);
+            let raw_bytes = raw.total_bytes;
+            let mut line = raw.text;
+            let line_truncated = raw_bytes > line.len();
 
             // Honor the total byte budget, but always return at least one line
             // so a single over-long line still yields its (capped) prefix.
@@ -301,6 +302,144 @@ impl TypedTool for ReadFile {
     }
 }
 
+#[derive(Debug)]
+struct BoundedLine {
+    text: String,
+    total_bytes: usize,
+}
+
+// Reads and validates one UTF-8 line while retaining only its bounded prefix.
+// The discarded tail is still drained and validated so it cannot hide invalid
+// UTF-8 or leave the reader in the middle of a line.
+async fn read_bounded_line<R>(
+    reader: &mut R,
+    retain_limit: usize,
+) -> io::Result<Option<BoundedLine>>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let retain_limit = retain_limit.min(MAX_LINE_BYTES);
+    let mut retained = Vec::with_capacity(retain_limit);
+    let mut validator = Utf8Validator::default();
+    let mut total_bytes = 0usize;
+    let mut last_byte = None;
+    let mut terminated = false;
+
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            break;
+        }
+
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let content_end = newline.unwrap_or(available.len());
+        let content = &available[..content_end];
+
+        validator.push(content)?;
+        total_bytes = total_bytes.checked_add(content.len()).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "line length exceeds usize")
+        })?;
+        if let Some(byte) = content.last() {
+            last_byte = Some(*byte);
+        }
+
+        let remaining = retain_limit.saturating_sub(retained.len());
+        retained.extend_from_slice(&content[..content.len().min(remaining)]);
+
+        let consumed = content_end + usize::from(newline.is_some());
+        terminated = newline.is_some();
+        reader.consume(consumed);
+        if terminated {
+            break;
+        }
+    }
+
+    if total_bytes == 0 && !terminated {
+        return Ok(None);
+    }
+    validator.finish()?;
+
+    // Match `AsyncBufReadExt::lines`: strip a carriage return only when it is
+    // immediately before a newline, after validating it as part of the input.
+    if terminated && last_byte == Some(b'\r') {
+        let unstripped_bytes = total_bytes;
+        total_bytes -= 1;
+        if retained.len() == unstripped_bytes {
+            retained.pop();
+        }
+    }
+
+    // A bounded prefix may end midway through an otherwise valid code point.
+    // Back up to the last complete boundary, matching `truncate_utf8` semantics.
+    let valid_prefix_len = match std::str::from_utf8(&retained) {
+        Ok(_) => retained.len(),
+        Err(error) if error.error_len().is_none() => error.valid_up_to(),
+        Err(_) => return Err(invalid_utf8_error()),
+    };
+    retained.truncate(valid_prefix_len);
+    let text = String::from_utf8(retained).map_err(|_| invalid_utf8_error())?;
+
+    Ok(Some(BoundedLine { text, total_bytes }))
+}
+
+#[derive(Debug, Default)]
+struct Utf8Validator {
+    pending: Vec<u8>,
+}
+
+impl Utf8Validator {
+    fn push(&mut self, mut bytes: &[u8]) -> io::Result<()> {
+        if !self.pending.is_empty() {
+            let sequence_len = utf8_sequence_len(self.pending[0]).ok_or_else(invalid_utf8_error)?;
+            if self.pending.len() >= sequence_len {
+                return Err(invalid_utf8_error());
+            }
+            let take = (sequence_len - self.pending.len()).min(bytes.len());
+            self.pending.extend_from_slice(&bytes[..take]);
+            if self.pending.len() < sequence_len {
+                return Ok(());
+            }
+            std::str::from_utf8(&self.pending).map_err(|_| invalid_utf8_error())?;
+            self.pending.clear();
+            bytes = &bytes[take..];
+        }
+
+        if let Err(error) = std::str::from_utf8(bytes) {
+            if error.error_len().is_some() {
+                return Err(invalid_utf8_error());
+            }
+            self.pending
+                .extend_from_slice(&bytes[error.valid_up_to()..]);
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> io::Result<()> {
+        if self.pending.is_empty() {
+            Ok(())
+        } else {
+            Err(invalid_utf8_error())
+        }
+    }
+}
+
+fn utf8_sequence_len(first_byte: u8) -> Option<usize> {
+    match first_byte {
+        0x00..=0x7f => Some(1),
+        0xc2..=0xdf => Some(2),
+        0xe0..=0xef => Some(3),
+        0xf0..=0xf4 => Some(4),
+        _ => None,
+    }
+}
+
+fn invalid_utf8_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "stream did not contain valid UTF-8",
+    )
+}
+
 /// Inline marker appended to a line whose tail was dropped to fit
 /// `MAX_LINE_BYTES`. Deliberately explicit: the elided tail is neither in the
 /// returned content nor reachable via `next_line` (which advances by whole
@@ -315,7 +454,9 @@ fn line_truncated_marker(elided_bytes: usize) -> String {
 mod tests {
     use std::{fs, sync::Arc};
 
-    use super::{MAX_LINE_BYTES, ReadFile};
+    use tokio::io::BufReader;
+
+    use super::{MAX_LINE_BYTES, ReadFile, read_bounded_line};
     use crate::test_support::TestDir;
     use crate::tool::{ToolContext, ToolOutput, execute_for_test};
 
@@ -376,6 +517,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_file_preserves_carriage_return_at_unterminated_eof() {
+        let tmp = TestDir::new();
+        fs::write(tmp.path().join("notes.txt"), "tail\r").expect("file should be written");
+        let tool = ReadFile::new(tmp.workspace().await);
+
+        let output = call(tool, serde_json::json!({ "path": "notes.txt" })).await;
+
+        assert!(output.ok);
+        assert_eq!(output.data.expect("data present")["content"], "tail\r");
+    }
+
+    #[tokio::test]
     async fn read_file_start_past_end_returns_empty() {
         let tmp = TestDir::new();
         fs::write(tmp.path().join("notes.txt"), "a\nb").expect("file should be written");
@@ -398,7 +551,7 @@ mod tests {
     #[tokio::test]
     async fn read_file_truncates_an_overlong_line() {
         let tmp = TestDir::new();
-        let long_line = "x".repeat(MAX_LINE_BYTES + 1_000);
+        let long_line = "x".repeat(4 * 1024 * 1024);
         fs::write(tmp.path().join("min.js"), &long_line).expect("file should be written");
         let tool = ReadFile::new(tmp.workspace().await);
 
@@ -417,6 +570,88 @@ mod tests {
         assert_eq!(data["has_more"], false);
         // The cut is reported on the horizontal axis, located to line 1.
         assert_eq!(data["truncated_lines"], serde_json::json!([1]));
+    }
+
+    #[tokio::test]
+    async fn bounded_line_reader_retains_only_the_requested_prefix() {
+        let input = vec![b'x'; 4 * 1024 * 1024];
+        // A deliberately small transport buffer forces the line and its UTF-8
+        // validation state across many reads.
+        let mut reader = BufReader::with_capacity(257, input.as_slice());
+
+        let line = read_bounded_line(&mut reader, MAX_LINE_BYTES)
+            .await
+            .expect("line should be read")
+            .expect("line should be present");
+
+        assert_eq!(line.total_bytes, input.len());
+        assert_eq!(line.text.len(), MAX_LINE_BYTES);
+    }
+
+    #[tokio::test]
+    async fn bounded_line_reader_validates_code_points_across_buffers() {
+        let input = "你".repeat(MAX_LINE_BYTES);
+        // Five-byte buffers split successive three-byte code points at
+        // different offsets instead of accidentally preserving alignment.
+        let mut reader = BufReader::with_capacity(5, input.as_bytes());
+
+        let line = read_bounded_line(&mut reader, MAX_LINE_BYTES)
+            .await
+            .expect("line should be read")
+            .expect("line should be present");
+
+        assert_eq!(line.total_bytes, input.len());
+        assert!(line.text.len() <= MAX_LINE_BYTES);
+        assert!(line.text.chars().all(|character| character == '你'));
+    }
+
+    #[tokio::test]
+    async fn read_file_skips_an_overlong_line_without_retaining_it() {
+        let tmp = TestDir::new();
+        let long_line = "x".repeat(4 * 1024 * 1024);
+        fs::write(
+            tmp.path().join("generated.txt"),
+            format!("{long_line}\r\nselected\r\ntrailing"),
+        )
+        .expect("file should be written");
+        let tool = ReadFile::new(tmp.workspace().await);
+
+        let output = call(
+            tool,
+            serde_json::json!({
+                "path": "generated.txt",
+                "start_line": 2,
+                "limit": 1
+            }),
+        )
+        .await;
+
+        assert!(output.ok);
+        let data = output.data.expect("data present");
+        assert_eq!(data["content"], "selected");
+        assert_eq!(data["start_line"], 2);
+        assert_eq!(data["returned_lines"], 1);
+        assert_eq!(data["has_more"], true);
+        assert_eq!(data["next_line"], 3);
+    }
+
+    #[tokio::test]
+    async fn read_file_rejects_invalid_utf8_in_a_discarded_line_tail() {
+        let tmp = TestDir::new();
+        let mut body = vec![b'x'; 4 * 1024 * 1024];
+        body.extend_from_slice(&[0xff, b'\n']);
+        body.extend_from_slice(b"selected\n");
+        fs::write(tmp.path().join("mixed.bin"), body).expect("file should be written");
+        let tool = ReadFile::new(tmp.workspace().await);
+
+        let output = call(
+            tool,
+            serde_json::json!({ "path": "mixed.bin", "start_line": 2 }),
+        )
+        .await;
+
+        assert!(!output.ok);
+        assert_eq!(output.error.expect("error present").kind.as_str(), "read");
     }
 
     #[tokio::test]

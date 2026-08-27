@@ -1895,7 +1895,6 @@ dependencies = [
  "chrono",
  "clap",
  "crossterm",
- "dotenvy",
  "futures-util",
  "kuncode-agent",
  "kuncode-core",

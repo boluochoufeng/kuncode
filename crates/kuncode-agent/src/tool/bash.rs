@@ -1,3 +1,5 @@
+//! Executes approved shell commands with bounded output and descendant cleanup.
+
 use std::{
     num::NonZeroU64,
     process::Stdio,
@@ -12,7 +14,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
-    process::{Child, Command},
+    process::{Child, ChildStderr, ChildStdout, Command},
     time::timeout,
 };
 
@@ -152,24 +154,27 @@ impl TypedTool for Bash {
         #[cfg(unix)]
         command.process_group(0);
 
-        let mut child = match command.spawn() {
+        let child = match command.spawn() {
             Ok(child) => child,
             Err(err) => {
                 return ToolOutput::failure("execution", format!("failed to run command: {err}"));
             }
         };
-        let stdout_pump = Pump::start(child.stdout.take());
-        let stderr_pump = Pump::start(child.stderr.take());
+        let mut child = ManagedChild::new(child);
+        let stdout_pump = Pump::start(child.take_stdout());
+        let stderr_pump = Pump::start(child.take_stderr());
 
         let (status, timed_out) = match timeout(limit, child.wait()).await {
-            Ok(Ok(status)) => (Some(status), false),
+            Ok(Ok(status)) => {
+                child.disarm();
+                (Some(status), false)
+            }
             Ok(Err(err)) => {
-                kill_group(&mut child);
+                child.terminate_and_reap().await;
                 return ToolOutput::failure("execution", format!("failed to run command: {err}"));
             }
             Err(_) => {
-                kill_group(&mut child);
-                let _ = child.wait().await;
+                child.terminate_and_reap().await;
                 (None, true)
             }
         };
@@ -216,6 +221,73 @@ impl TypedTool for Bash {
     }
 }
 
+/// Keeps process-group cleanup armed until the direct child has been reaped.
+///
+/// The guard's synchronous [`Drop`] path covers task cancellation, where there
+/// is no opportunity to await explicit cleanup.
+struct ManagedChild {
+    child: Child,
+    cleanup_armed: bool,
+    #[cfg(unix)]
+    process_group: Option<libc::pid_t>,
+}
+
+impl ManagedChild {
+    fn new(child: Child) -> Self {
+        #[cfg(unix)]
+        let process_group = child.id().and_then(|id| libc::pid_t::try_from(id).ok());
+
+        Self {
+            child,
+            cleanup_armed: true,
+            #[cfg(unix)]
+            process_group,
+        }
+    }
+
+    fn take_stdout(&mut self) -> Option<ChildStdout> {
+        self.child.stdout.take()
+    }
+
+    fn take_stderr(&mut self) -> Option<ChildStderr> {
+        self.child.stderr.take()
+    }
+
+    async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.child.wait().await
+    }
+
+    fn signal_termination(&mut self) {
+        #[cfg(unix)]
+        if let Some(process_group) = self.process_group {
+            // SAFETY: spawn configured the child as leader of this isolated
+            // process group; killpg only reads the scalar group id and signal.
+            let _ = unsafe { libc::killpg(process_group, libc::SIGKILL) };
+        }
+
+        // Also covers non-Unix targets and a failed process-group signal.
+        let _ = self.child.start_kill();
+    }
+
+    async fn terminate_and_reap(&mut self) {
+        self.signal_termination();
+        let _ = self.child.wait().await;
+        self.cleanup_armed = false;
+    }
+
+    fn disarm(&mut self) {
+        self.cleanup_armed = false;
+    }
+}
+
+impl Drop for ManagedChild {
+    fn drop(&mut self) {
+        if self.cleanup_armed {
+            self.signal_termination();
+        }
+    }
+}
+
 /// Resolves the effective timeout: default 120s, capped at 600s. The cap is a
 /// clamp rather than a rejection — the schema advertises the maximum, so an
 /// oversized request costs a shorter wait, not a wasted round-trip.
@@ -223,20 +295,6 @@ fn effective_timeout(timeout_secs: Option<NonZeroU64>) -> Duration {
     Duration::from_secs(timeout_secs.map_or(DEFAULT_TIMEOUT_SECS, |secs| {
         secs.get().min(MAX_TIMEOUT_SECS)
     }))
-}
-
-/// Kills the whole process group created via `process_group(0)`. Killing only
-/// bash would orphan grandchildren mid-build; they keep running and keep the
-/// output pipes open.
-fn kill_group(child: &mut Child) {
-    #[cfg(unix)]
-    if let Some(pid) = child.id() {
-        // The child leads a group whose id is its own pid, so killpg reaches
-        // every process still in it.
-        unsafe { libc::killpg(pid as libc::pid_t, libc::SIGKILL) };
-        return;
-    }
-    let _ = child.start_kill();
 }
 
 /// What a [`Pump`] captured from one stream: the retained head, the total byte
@@ -485,7 +543,12 @@ fn is_dynamic_shell_command(command: &str) -> bool {
 mod tests {
     use std::sync::Arc;
 
+    #[cfg(unix)]
+    use std::time::Duration;
+
     use super::{Bash, simple_command_chain};
+    #[cfg(unix)]
+    use crate::test_support::TestDir;
     use crate::{
         tool::{Tool, ToolContext, execute_for_test},
         workspace::Workspace,
@@ -576,6 +639,31 @@ mod tests {
         assert!(stdout.contains("stdout truncated"));
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drains_large_stdout_and_stderr_concurrently() {
+        let out = execute_for_test(
+            Arc::new(bash().await),
+            serde_json::json!({
+                "cmd": "(head -c 2000000 /dev/zero | tr '\\000' o) & \
+                         (head -c 2000000 /dev/zero | tr '\\000' e >&2) & wait"
+            }),
+            &ToolContext::new(),
+        )
+        .await
+        .expect("no harness-level error");
+
+        assert!(out.ok);
+        assert!(out.truncated);
+        let data = out.data.expect("data present");
+        let stdout = data["stdout"].as_str().expect("stdout is a string");
+        let stderr = data["stderr"].as_str().expect("stderr is a string");
+        assert!(stdout.starts_with(&"o".repeat(super::OUTPUT_LIMIT_BYTES)));
+        assert!(stdout.contains("of 2000000 bytes"));
+        assert!(stderr.starts_with(&"e".repeat(super::OUTPUT_LIMIT_BYTES)));
+        assert!(stderr.contains("of 2000000 bytes"));
+    }
+
     #[tokio::test]
     async fn runs_commands_from_workspace_root() {
         let workspace = Workspace::new(std::env::current_dir().expect("current directory exists"))
@@ -649,6 +737,37 @@ mod tests {
         let stdout = data["stdout"].as_str().expect("stdout is a string");
         assert!(stdout.contains("bg"));
         assert!(!stdout.contains("did not close"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_terminates_descendants() {
+        let tmp = TestDir::new();
+        let bash = Arc::new(Bash::new(tmp.workspace().await));
+        let task = tokio::spawn({
+            let bash = Arc::clone(&bash);
+            async move {
+                execute_for_test(
+                    bash,
+                    serde_json::json!({
+                        "cmd": "(printf ready > started; \
+                                 while [ ! -e release ]; do sleep 0.01; done; \
+                                 printf survived > descendant-survived) & wait"
+                    }),
+                    &ToolContext::new(),
+                )
+                .await
+            }
+        });
+
+        wait_for_path(&tmp.path().join("started")).await;
+        task.abort();
+        assert!(
+            task.await
+                .expect_err("aborted execution should be cancelled")
+                .is_cancelled()
+        );
+        release_and_assert_descendant_stopped(&tmp).await;
     }
 
     #[tokio::test]
@@ -725,5 +844,27 @@ mod tests {
         ] {
             assert_eq!(simple_command_chain(command), None, "{command}");
         }
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_path(path: &std::path::Path) {
+        for _ in 0..200 {
+            if path.exists() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("{} should have been created", path.display());
+    }
+
+    #[cfg(unix)]
+    async fn release_and_assert_descendant_stopped(tmp: &TestDir) {
+        std::fs::write(tmp.path().join("release"), b"go").expect("release gate should be created");
+        let survivor = tmp.path().join("descendant-survived");
+        for _ in 0..100 {
+            assert!(!survivor.exists(), "descendant survived process-group kill");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!survivor.exists(), "descendant survived process-group kill");
     }
 }
