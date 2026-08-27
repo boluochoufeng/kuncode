@@ -19,6 +19,7 @@ pub mod filesystem;
 pub mod load_memory;
 pub mod load_skill;
 pub mod task;
+pub mod tasks;
 pub mod todo_write;
 pub mod web_fetch;
 pub mod write_memory;

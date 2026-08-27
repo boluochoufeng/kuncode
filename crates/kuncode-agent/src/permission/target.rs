@@ -33,6 +33,8 @@ pub enum PermissionNamespace {
     Agent,
     /// Mutates the session-owned task plan.
     TodoWrite,
+    /// Mutates the durable cross-session task store.
+    TaskWrite,
     /// Safely identifies a tool without a more specific trusted adapter.
     ExactTool,
 }
@@ -236,6 +238,8 @@ pub enum PermissionTarget {
     Agent(String),
     /// Session task-plan mutation.
     TodoWrite,
+    /// Durable task-store mutation.
+    TaskWrite,
     /// Exact fallback tool identity.
     ExactTool(String),
 }
@@ -251,6 +255,7 @@ impl PermissionTarget {
             Self::Mcp(_) => PermissionNamespace::Mcp,
             Self::Agent(_) => PermissionNamespace::Agent,
             Self::TodoWrite => PermissionNamespace::TodoWrite,
+            Self::TaskWrite => PermissionNamespace::TaskWrite,
             Self::ExactTool(_) => PermissionNamespace::ExactTool,
         }
     }
@@ -315,6 +320,7 @@ impl std::fmt::Display for PermissionTarget {
             }
             Self::Agent(profile) => write!(f, "Agent({})", safe_ui_text(profile)),
             Self::TodoWrite => f.write_str("TodoWrite"),
+            Self::TaskWrite => f.write_str("TaskWrite"),
             Self::ExactTool(tool) => write!(f, "ExactTool({})", safe_ui_text(tool)),
         }
     }

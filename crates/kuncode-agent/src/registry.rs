@@ -25,6 +25,11 @@ use crate::{
         load_memory::{LOAD_MEMORY_TOOL_NAME, LoadMemory},
         load_skill::{LOAD_SKILL_TOOL_NAME, LoadSkill},
         task::{TASK_TOOL_NAME, Task},
+        tasks::{
+            CLAIM_TASK_TOOL_NAME, COMPLETE_TASK_TOOL_NAME, CREATE_TASK_TOOL_NAME, ClaimTask,
+            CompleteTask, CreateTask, GET_TASK_TOOL_NAME, GetTask, LIST_TASKS_TOOL_NAME, ListTasks,
+            UPDATE_TASK_TOOL_NAME, UpdateTask,
+        },
         todo_write::TodoWrite,
         web_fetch::{WebFetch, WebFetchError},
         write_memory::{WRITE_MEMORY_TOOL_NAME, WriteMemory},
@@ -319,6 +324,55 @@ impl ToolRegistry {
                 false,
             )?,
         )?;
+        Ok(())
+    }
+
+    /// Registers the six task-store tools over the per-project tasks root.
+    ///
+    /// Same degradation contract as the memory pair: no home directory means
+    /// the caller never calls this. The four mutators share the `TaskWrite`
+    /// namespace — allowed by default like `todo_write`, but denied in Plan
+    /// mode because the store is a cross-session disk side effect. The two
+    /// readers are ordinary Reads (allowed by default, Plan-safe, deniable
+    /// per path). No `constrain_paths_to`: the root lives outside the
+    /// workspace, where it would trip the workspace-mismatch guard —
+    /// confinement is the id grammar's job.
+    pub fn register_task_store_tools(&mut self, root: PathBuf) -> Result<(), RegistryError> {
+        let write_profile = |name: &str| {
+            ToolPermissionProfile::new(
+                name,
+                [(PermissionNamespace::TaskWrite, ProfileDefault::Allow)],
+                false,
+            )
+        };
+        let read_profile = |name: &str| {
+            ToolPermissionProfile::new(
+                name,
+                [(PermissionNamespace::Read, ProfileDefault::Allow)],
+                false,
+            )
+        };
+        self.register_with_profile(
+            CreateTask::new(root.clone()),
+            write_profile(CREATE_TASK_TOOL_NAME)?,
+        )?;
+        self.register_with_profile(
+            UpdateTask::new(root.clone()),
+            write_profile(UPDATE_TASK_TOOL_NAME)?,
+        )?;
+        self.register_with_profile(
+            ClaimTask::new(root.clone()),
+            write_profile(CLAIM_TASK_TOOL_NAME)?,
+        )?;
+        self.register_with_profile(
+            CompleteTask::new(root.clone()),
+            write_profile(COMPLETE_TASK_TOOL_NAME)?,
+        )?;
+        self.register_with_profile(
+            GetTask::new(root.clone()),
+            read_profile(GET_TASK_TOOL_NAME)?,
+        )?;
+        self.register_with_profile(ListTasks::new(root), read_profile(LIST_TASKS_TOOL_NAME)?)?;
         Ok(())
     }
 
@@ -703,6 +757,53 @@ mod tests {
         let subagent_view = registry.without_tool("task");
         assert!(subagent_view.get("load_memory").is_some());
         assert!(subagent_view.get("write_memory").is_some());
+    }
+
+    #[tokio::test]
+    async fn the_task_store_tools_append_and_reach_subagent_views() {
+        let workspace = Workspace::from_current_dir()
+            .await
+            .expect("current directory should be a valid workspace");
+        let root = workspace.root().to_path_buf();
+        let mut registry = ToolRegistry::with_default_workspace_tools(workspace)
+            .expect("built-in profiles are valid");
+
+        registry
+            .register_task_store_tools(std::env::temp_dir().join("kuncode-registry-tasks"))
+            .expect("task profiles are valid");
+
+        let names = registry
+            .definition()
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            &names[names.len() - 6..],
+            [
+                "create_task",
+                "update_task",
+                "claim_task",
+                "complete_task",
+                "get_task",
+                "list_tasks"
+            ],
+            "task tools append in order"
+        );
+        // The path-unconstrained profiles must not disturb the workspace root
+        // the path-constrained default tools were registered under.
+        assert_eq!(
+            registry.workspace_root().map(|r| r.as_str().to_string()),
+            Some(
+                crate::permission::CanonicalPath::from_absolute(&root)
+                    .expect("workspace root is canonical")
+                    .as_str()
+                    .to_string()
+            ),
+        );
+        // A subagent loses `task` but keeps the whole task-store surface.
+        let subagent_view = registry.without_tool("task");
+        assert!(subagent_view.get("create_task").is_some());
+        assert!(subagent_view.get("list_tasks").is_some());
     }
 
     #[tokio::test]

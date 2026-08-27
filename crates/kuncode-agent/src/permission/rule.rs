@@ -134,6 +134,7 @@ enum PermissionMatcher {
     Mcp { server: String, tool: String },
     Agent { profile: String },
     TodoWrite,
+    TaskWrite,
     ExactTool { tool: String },
     Exact { target: PermissionTarget },
 }
@@ -159,6 +160,7 @@ impl PermissionMatcher {
             }
             (Self::Agent { profile }, PermissionTarget::Agent(target)) => profile == target,
             (Self::TodoWrite, PermissionTarget::TodoWrite) => true,
+            (Self::TaskWrite, PermissionTarget::TaskWrite) => true,
             (Self::ExactTool { tool }, PermissionTarget::ExactTool(target)) => tool == target,
             (Self::Exact { target: expected }, target) => expected == target,
             _ => false,
@@ -236,6 +238,8 @@ pub fn compile_permission_rule(
 
     let matcher = if raw == "TodoWrite" {
         PermissionMatcher::TodoWrite
+    } else if raw == "TaskWrite" {
+        PermissionMatcher::TaskWrite
     } else if let Some(rest) = raw.strip_prefix("mcp.") {
         let (server, tool) = rest
             .split_once('.')
@@ -333,7 +337,8 @@ pub enum PermissionRuleError {
         /// Trusted product limit.
         maximum: usize,
     },
-    /// Rules other than `TodoWrite` and `mcp.*` require `Namespace(selector)`.
+    /// Rules other than `TodoWrite`, `TaskWrite` and `mcp.*` require
+    /// `Namespace(selector)`.
     #[error("permission rule `{0}` must use Namespace(selector) syntax")]
     InvalidSyntax(String),
     /// Namespace compiler is not registered.
@@ -530,6 +535,39 @@ mod permission_rule_tests {
         .expect("valid check")
         .first()
         .clone()
+    }
+
+    #[test]
+    fn bare_task_write_rules_match_the_task_write_target() {
+        let task_check = check(PermissionTarget::TaskWrite, PermissionNamespace::TaskWrite);
+        // Both effects: the matches() arm has a `_ => false` fallback, so a
+        // missing variant match would fail silently rather than at compile
+        // time — this test is the guard.
+        for effect in [PolicyEffect::Allow, PolicyEffect::Deny] {
+            let rule = compile_permission_rule("TaskWrite", effect, PolicyOrigin::User, &context())
+                .expect("valid rule");
+            assert!(rule.contribution(&task_check).is_some(), "{effect:?}");
+        }
+        // The bare rule stays scoped to its own namespace.
+        let todo_check = check(PermissionTarget::TodoWrite, PermissionNamespace::TodoWrite);
+        let rule = compile_permission_rule(
+            "TaskWrite",
+            PolicyEffect::Deny,
+            PolicyOrigin::User,
+            &context(),
+        )
+        .expect("valid rule");
+        assert!(rule.contribution(&todo_check).is_none());
+        // A selector form is not a registered namespace syntax.
+        assert!(
+            compile_permission_rule(
+                "TaskWrite(x)",
+                PolicyEffect::Deny,
+                PolicyOrigin::User,
+                &context()
+            )
+            .is_err()
+        );
     }
 
     #[test]

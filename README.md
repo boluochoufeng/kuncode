@@ -222,6 +222,41 @@ UTF-8）只记日志跳过，不影响启动。
 非 UTF-8）只记日志跳过。没有 home 目录时整个功能静默关闭，与会话持久化的降级
 一致。
 
+## 任务系统（create_task 等六个工具）
+
+任务系统是跨会话的工作账本：任务落盘、可以互相依赖、认领后带 owner。它与
+`todo_write` 分工明确——todo 是当前会话的注意力管理（内存中、整表覆写、会话结
+束即消失），任务系统是跨会话的工作协调（可恢复、可依赖、可认领），两者并存。
+
+每个任务一个 JSON 文件，按项目隔离存放在工作区之外：
+
+```text
+~/.kuncode/tasks/<项目slug>/<id>.json
+```
+
+字段为 `id`（`task_` + 8 位十六进制，创建时生成）、`subject`、`description`、
+`status`（`pending` → 认领 → `in_progress` → 完成 → `completed`）、`owner` 和
+`blockedBy`（前置任务 id 列表）。id 语法同时锁死了写入路径。
+
+六个工具：`create_task` 新建（id 用排他创建落盘，先建全部节点、再用返回的 id
+加边）；`update_task` 给 pending 且未认领的任务追加 `blockedBy`（拒绝自环和依
+赖环）；`claim_task` 认领——所有前置任务 `completed` 才放行（引用的文件缺失视
+为未完成）；`complete_task` 完成并列出因此解锁的任务；`get_task` / `list_tasks`
+读取（列表省略 description）。
+
+权限上，四个写工具共用无值命名空间 `TaskWrite`：默认放行（和 `todo_write` 一
+样是高频记账操作），`plan` 模式直接拒绝（与 `TodoWrite` 相反——这是跨会话的磁
+盘副作用，plan 轮次不能留痕），可在 settings 里用裸规则 `deny: ["TaskWrite"]`
+整体关掉。两个读工具是普通 `Read`，默认放行、`plan` 可用、可按路径 deny。
+
+启动时扫描一次任务店，存在未完成任务时系统提示中会出现一行计数
+（`Task store: N open tasks (M claimable) ...`），提示模型用 `list_tasks`
+恢复上下文；会话中途的变化通过工具查询，不进这一行。
+
+并发范围：id 分配靠排他创建保证无冲突；认领与完成目前是朴素的读改写，跨进程
+的原子认领属于后续多 agent 协作章节。任务文件是普通 JSON，可直接查看或手工修
+改；损坏的文件记日志跳过。没有 home 目录时整个功能静默关闭。
+
 ## 子代理（task 工具）
 
 模型可以调用 `task` 工具，把一个自包含的子任务委托给子代理：一个嵌套的 Agent Loop。

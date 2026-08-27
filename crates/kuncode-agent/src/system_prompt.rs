@@ -218,6 +218,34 @@ impl PromptSection for MemorySection {
     }
 }
 
+/// One-line pointer to the durable task store, rendered only when open tasks
+/// existed at startup.
+pub struct TasksSection {
+    counts: crate::tasks::TaskStoreCounts,
+}
+
+impl TasksSection {
+    /// Wraps the counts scanned once at startup, frozen for the process so
+    /// the cached prompt prefix stays stable — tasks created mid-session
+    /// surface through the tools, not through this line.
+    pub fn new(counts: crate::tasks::TaskStoreCounts) -> Self {
+        Self { counts }
+    }
+}
+
+impl PromptSection for TasksSection {
+    fn render(&self, _ctx: &PromptContext) -> Option<String> {
+        if self.counts.open == 0 {
+            return None;
+        }
+        Some(format!(
+            "Task store: {} open tasks ({} claimable). Call list_tasks to see \
+             them, get_task for details.",
+            self.counts.open, self.counts.claimable,
+        ))
+    }
+}
+
 /// Opening delimiter of one rendered instruction document.
 const INSTRUCTIONS_OPEN_TAG: &str = "<project-instructions";
 /// Closing delimiter of one rendered instruction document.
@@ -466,6 +494,25 @@ mod tests {
     #[test]
     fn an_empty_memory_section_adds_no_tokens() {
         assert!(MemorySection::new(Vec::new()).render(&ctx(&[])).is_none());
+    }
+
+    #[test]
+    fn tasks_section_renders_the_counts_or_nothing() {
+        let section = TasksSection::new(crate::tasks::TaskStoreCounts {
+            open: 3,
+            claimable: 2,
+        });
+        let block = section.render(&ctx(&[])).expect("open tasks render");
+        assert!(block.contains("3 open tasks"), "{block}");
+        assert!(block.contains("(2 claimable)"), "{block}");
+        assert!(block.contains("list_tasks"), "{block}");
+
+        // An empty store — or one with only completed tasks — adds nothing.
+        assert!(
+            TasksSection::new(crate::tasks::TaskStoreCounts::default())
+                .render(&ctx(&[]))
+                .is_none()
+        );
     }
 
     #[test]

@@ -29,8 +29,9 @@ use kuncode_agent::session_store::{
 use kuncode_agent::skill::SkillCatalog;
 use kuncode_agent::system_prompt::{
     EnvironmentSection, IdentitySection, InstructionsSection, MemorySection, PromptSection,
-    SkillsSection, SystemPrompt, ToolsSection,
+    SkillsSection, SystemPrompt, TasksSection, ToolsSection,
 };
+use kuncode_agent::tasks::{scan_open_counts, tasks_root};
 use kuncode_agent::workspace::Workspace;
 use kuncode_core::completion::{CompletionModel, RetryModel, RetryPolicy};
 use kuncode_core::providers::{
@@ -198,6 +199,22 @@ impl CliRuntime<RetryModel<AnyChatCompletionModel>> {
             "memory catalog resolved",
         );
 
+        // The task store follows the same contract: a startup-frozen count in
+        // the prompt, the live graph behind the tools.
+        let task_store_root = home
+            .as_deref()
+            .map(|home| tasks_root(home, workspace.root()));
+        let task_counts = task_store_root
+            .as_deref()
+            .map(scan_open_counts)
+            .unwrap_or_default();
+        tracing::info!(
+            target: "kuncode::runtime",
+            open_tasks = task_counts.open,
+            claimable_tasks = task_counts.claimable,
+            "task store resolved",
+        );
+
         // Custom agent types are frozen at startup for the same reason: the
         // type list renders into the `task` tool definition, which is part of
         // the cached prompt prefix.
@@ -221,6 +238,7 @@ impl CliRuntime<RetryModel<AnyChatCompletionModel>> {
         }
         // An empty index omits itself, so the section is pushed unconditionally.
         sections.push(Box::new(MemorySection::new(memory_catalog.summaries())));
+        sections.push(Box::new(TasksSection::new(task_counts)));
         sections.push(Box::new(InstructionsSection::new(instructions)));
         let system_prompt = SystemPrompt::new(sections);
 
@@ -278,6 +296,11 @@ impl CliRuntime<RetryModel<AnyChatCompletionModel>> {
         // memory written this session must be loadable in it.
         if let Some(root) = memory_root {
             registry.register_memory_tools(root)?;
+        }
+        // Registered even when the store is empty: create_task is how the
+        // first task comes to exist.
+        if let Some(root) = task_store_root {
+            registry.register_task_store_tools(root)?;
         }
 
         Ok(Self {

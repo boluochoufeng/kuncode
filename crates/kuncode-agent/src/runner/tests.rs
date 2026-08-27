@@ -18,5 +18,6 @@ mod persistence_todo;
 mod persistence_warnings;
 mod skill_loading;
 mod subagent;
+mod task_store;
 mod todo_errors;
 mod turn_and_permissions;

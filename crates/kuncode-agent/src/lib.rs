@@ -18,6 +18,7 @@ pub mod session;
 pub mod session_store;
 pub mod skill;
 pub mod system_prompt;
+pub mod tasks;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod todo;
