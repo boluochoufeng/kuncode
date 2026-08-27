@@ -9,7 +9,7 @@ use ratatui::{
     widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
 };
 
-use super::super::app::{App, Item, ToolState};
+use super::super::app::{App, Item, SubCall, ToolState};
 use super::Theme;
 
 /// Renders the scrollable conversation viewport and its overflow indicator.
@@ -119,15 +119,18 @@ pub(super) fn char_width(ch: char) -> u16 {
     Line::raw(ch.to_string()).width() as u16
 }
 
+/// Display cells `text` occupies, saturating rather than wrapping on absurd input.
+pub(super) fn display_width(text: &str) -> u16 {
+    text.chars()
+        .fold(0u16, |used, ch| used.saturating_add(char_width(ch)))
+}
+
 /// Truncates text to `width` display cells and marks omitted content.
 pub(super) fn truncate_display(text: &str, width: u16) -> String {
     if width == 0 {
         return String::new();
     }
-    let total = text
-        .chars()
-        .fold(0u16, |used, ch| used.saturating_add(char_width(ch)));
-    if total <= width {
+    if display_width(text) <= width {
         return text.to_string();
     }
 
@@ -155,7 +158,7 @@ fn conversation_lines(app: &App, theme: Theme) -> Vec<Line<'static>> {
             Item::User(text) => {
                 lines.push(Line::from(vec![
                     Span::styled("❯", theme.accent_strong()),
-                    Span::styled(" 你", Style::new().add_modifier(Modifier::BOLD)),
+                    Span::styled(" You", Style::new().add_modifier(Modifier::BOLD)),
                 ]));
                 for raw in text.split('\n') {
                     lines.push(Line::from(format!("  {raw}")));
@@ -171,14 +174,23 @@ fn conversation_lines(app: &App, theme: Theme) -> Vec<Line<'static>> {
                 name,
                 summary,
                 state,
+                children,
                 ..
             } => {
-                append_tool(&mut lines, app, name, summary, state, theme);
+                append_tool(&mut lines, app, name, summary, state, children, theme);
             }
             Item::Error(text) => lines.push(Line::from(format!("× {text}")).style(theme.danger())),
-            Item::Compaction => lines.push(Line::from("◇ 上下文已整理").style(theme.muted())),
+            Item::Compaction => lines.push(Line::from("◇ Context compacted").style(theme.muted())),
             Item::Warning(text) => {
                 lines.push(Line::from(format!("! {text}")).style(theme.warning()))
+            }
+            Item::Notice(text) => {
+                // Notices are multi-line (`/help`), so split like user/assistant
+                // bodies; a literal `\n` inside a `Line` would not break the row.
+                for (index, raw) in text.split('\n').enumerate() {
+                    let prefix = if index == 0 { "· " } else { "  " };
+                    lines.push(Line::from(format!("{prefix}{raw}")).style(theme.muted()));
+                }
             }
         }
         lines.push(Line::from(""));
@@ -200,26 +212,67 @@ fn append_tool(
     name: &str,
     summary: &str,
     state: &ToolState,
+    children: &[SubCall],
+    theme: Theme,
+) {
+    append_call_lines(lines, app, name, summary, state, 0, theme);
+    // Subagent activity nests one level under the delegating row; the parent's
+    // own state glyph stays on the top line, so a long nested run still reads
+    // as one delegation with its inner calls listed below.
+    for child in children {
+        append_call_lines(
+            lines,
+            app,
+            &child.name,
+            &child.summary,
+            &child.state,
+            1,
+            theme,
+        );
+    }
+}
+
+/// One tool call as rendered lines: the `glyph Head  detail` row plus a
+/// detail line for failures/denials. `depth` indents nested subagent calls.
+///
+/// Tool summaries are self-describing (`Read file: src/a.rs`) because the
+/// plain renderer and the approval prompt print them alone; repeating the
+/// tool's name in front would read `ReadFile  Read file: …`. So the row shows
+/// only the summary, split at its first `: ` into a bold head and a muted
+/// detail. The protocol name appears just as a fallback when a summary is
+/// absent (a `ToolClosed` whose call was rejected before opening).
+fn append_call_lines(
+    lines: &mut Vec<Line<'static>>,
+    app: &App,
+    name: &str,
+    summary: &str,
+    state: &ToolState,
+    depth: usize,
     theme: Theme,
 ) {
     let (glyph, glyph_style, suffix) = match state {
         ToolState::Running => (app.activity_glyph(), theme.accent(), None),
         ToolState::Ok { truncated: false } => ("✓", theme.success(), None),
-        ToolState::Ok { truncated: true } => ("✓", theme.warning(), Some("输出已截断")),
+        ToolState::Ok { truncated: true } => ("✓", theme.warning(), Some("output truncated")),
         ToolState::Failed(_) => ("×", theme.danger(), None),
         ToolState::Denied(_) => ("!", theme.warning(), None),
     };
+    let (head, detail) = match summary.trim() {
+        "" => (display_tool_name(name), None),
+        summary => match summary.split_once(": ") {
+            Some((head, detail)) => (head.to_string(), Some(detail.to_string())),
+            None => (summary.to_string(), None),
+        },
+    };
+    let indent = "  ".repeat(depth + 1);
     let mut spans = vec![
-        Span::raw("  "),
+        Span::raw(indent.clone()),
         Span::styled(glyph, glyph_style),
         Span::raw(" "),
-        Span::styled(
-            display_tool_name(name),
-            Style::new().add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(head, Style::new().add_modifier(Modifier::BOLD)),
     ];
-    if !summary.trim().is_empty() {
-        spans.push(Span::styled(format!("  {summary}"), theme.muted()));
+    if let Some(detail) = detail {
+        spans.push(Span::styled(format!("  {detail}"), theme.muted()));
     }
     if let Some(suffix) = suffix {
         spans.push(Span::styled(format!("  {suffix}"), theme.warning()));
@@ -227,10 +280,10 @@ fn append_tool(
     lines.push(Line::from(spans));
     match state {
         ToolState::Failed(message) => {
-            lines.push(Line::from(format!("    {message}")).style(theme.danger()));
+            lines.push(Line::from(format!("{indent}  {message}")).style(theme.danger()));
         }
         ToolState::Denied(message) => {
-            lines.push(Line::from(format!("    {message}")).style(theme.warning()));
+            lines.push(Line::from(format!("{indent}  {message}")).style(theme.warning()));
         }
         ToolState::Running | ToolState::Ok { .. } => {}
     }
@@ -253,12 +306,12 @@ fn append_stream_preview(lines: &mut Vec<Line<'static>>, app: &App, theme: Theme
     }
     if !reasoning.is_empty() {
         if answer.is_empty() {
-            lines.push(Line::from("  思考中").style(theme.muted()));
+            lines.push(Line::from("  Thinking").style(theme.muted()));
             for raw in reasoning_preview(reasoning).split('\n') {
                 lines.push(Line::from(format!("  {raw}")).style(theme.muted()));
             }
         } else {
-            lines.push(Line::from("  思考完成").style(theme.muted()));
+            lines.push(Line::from("  Finished thinking").style(theme.muted()));
         }
     }
     if !answer.is_empty() {
@@ -352,10 +405,99 @@ mod tests {
             "in-progress answer should render live"
         );
         assert!(
-            rendered.contains("思考完成"),
+            rendered.contains("Finished thinking"),
             "completed reasoning should collapse once the answer starts"
         );
         assert!(!rendered.contains("weighing options"));
+    }
+
+    #[test]
+    fn notice_renders_each_line_with_a_marker() {
+        let mut app = App::new("m", PermissionMode::Default);
+        app.push_notice("/help".to_string());
+        app.push_notice("first line of output\nsecond line of output".to_string());
+        let mut terminal = Terminal::new(TestBackend::new(60, 16)).expect("test terminal");
+
+        terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
+
+        let rendered = format!("{}", terminal.backend());
+        assert!(
+            rendered.contains("· /help"),
+            "the first notice line carries the marker:\n{rendered}"
+        );
+        assert!(rendered.contains("· first line of output"));
+        assert!(
+            rendered.contains("  second line of output"),
+            "continuation lines indent under the marker:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn subagent_children_render_indented_under_the_task_row() {
+        let mut app = App::new("m", PermissionMode::Default);
+        app.conversation.push(Item::Tool {
+            id: "task_1".to_string(),
+            name: "task".to_string(),
+            summary: "Task (explore): map the crates".to_string(),
+            state: ToolState::Running,
+            children: vec![SubCall {
+                id: "sub_1".to_string(),
+                name: "read_file".to_string(),
+                summary: "Read file: src/main.rs".to_string(),
+                state: ToolState::Ok { truncated: false },
+            }],
+        });
+        let mut terminal = Terminal::new(TestBackend::new(60, 16)).expect("test terminal");
+
+        terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
+
+        let rendered = format!("{}", terminal.backend());
+        assert!(
+            rendered.contains("Task (explore)  map the crates"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("    ✓ Read file  src/main.rs"),
+            "child row should render indented one level:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn tool_rows_do_not_repeat_the_tool_name_before_the_summary() {
+        let mut app = App::new("m", PermissionMode::Default);
+        app.conversation.push(Item::Tool {
+            id: "1".to_string(),
+            name: "read_file".to_string(),
+            summary: "Read file: src/main.rs".to_string(),
+            state: ToolState::Ok { truncated: false },
+            children: Vec::new(),
+        });
+        // A close-without-open row has no summary; the protocol name is the
+        // only label available and steps in.
+        app.conversation.push(Item::Tool {
+            id: "2".to_string(),
+            name: "mystery_tool".to_string(),
+            summary: String::new(),
+            state: ToolState::Failed("boom".to_string()),
+            children: Vec::new(),
+        });
+        let mut terminal = Terminal::new(TestBackend::new(60, 16)).expect("test terminal");
+
+        terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
+
+        let rendered = format!("{}", terminal.backend());
+        assert!(
+            rendered.contains("✓ Read file  src/main.rs"),
+            "summary head replaces the name column:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("ReadFile"),
+            "the PascalCase name must not double the summary:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("× MysteryTool"),
+            "an empty summary falls back to the protocol name:\n{rendered}"
+        );
     }
 
     #[test]
@@ -378,12 +520,17 @@ mod tests {
         let mut app = App::new("m", PermissionMode::Default);
         app.set_colors_enabled(true);
         app.push_user("你好世界".to_string());
-        let (w, h) = (20u16, 8u16);
+        // Tall enough for the role marker row itself to stay in view: the
+        // conversation pane trails a spacer line and follows the tail.
+        let (w, h) = (20u16, 10u16);
         let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("terminal");
         terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
 
         let rendered = format!("{}", terminal.backend());
-        assert!(rendered.contains("你"), "the user role should be labeled");
+        assert!(
+            rendered.contains("You"),
+            "the user role should be labeled:\n{rendered}"
+        );
         let buf = terminal.backend().buffer();
         for y in 0..h {
             for x in 0..w {

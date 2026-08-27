@@ -22,7 +22,8 @@ mod model;
 pub(crate) mod protocol;
 
 pub use model::{
-    DEEPSEEK_V4_FLASH_MODEL_ID, DEEPSEEK_V4_PRO_MODEL_ID, DeepSeekModelProfile, model_profile,
+    DEEPSEEK_V4_FLASH_MODEL_ID, DEEPSEEK_V4_PRO_MODEL_ID, DeepSeekModelProfile, known_model_ids,
+    model_profile,
 };
 
 const DEEPSEEK_API_BASE_URL: &str = "https://api.deepseek.com";
@@ -130,7 +131,10 @@ impl CompletionModel for DeepSeekCompletionModel {
         crate::completion::CompletionError,
     > {
         let mut request = request;
-        request.model.get_or_insert_with(|| self.model.clone());
+        let requested_model = request
+            .model
+            .get_or_insert_with(|| self.model.clone())
+            .clone();
 
         let extra_params = request.additional_params.take();
         let request = DeepSeekCompletionRequest::try_from(request)?;
@@ -160,6 +164,10 @@ impl CompletionModel for DeepSeekCompletionModel {
 
         let response_body = response.bytes().await?;
         let resp: DeepSeekCompletionResponse = serde_json::from_slice(&response_body)?;
+        crate::providers::chat_completions::check_served_model(
+            &requested_model,
+            Some(resp.model.as_str()),
+        );
         resp.try_into()
     }
 
@@ -168,7 +176,10 @@ impl CompletionModel for DeepSeekCompletionModel {
         request: crate::completion::CompletionRequest,
     ) -> Result<crate::completion::CompletionStream, crate::completion::CompletionError> {
         let mut request = request;
-        request.model.get_or_insert_with(|| self.model.clone());
+        let requested_model = request
+            .model
+            .get_or_insert_with(|| self.model.clone())
+            .clone();
 
         let extra_params = request.additional_params.take();
         let request = DeepSeekCompletionRequest::try_from(request)?.into_streaming();
@@ -205,6 +216,7 @@ impl CompletionModel for DeepSeekCompletionModel {
         Ok(
             crate::providers::chat_completions::streaming::stream_events::<protocol::Usage>(
                 response,
+                requested_model,
             ),
         )
     }

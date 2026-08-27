@@ -2,6 +2,7 @@
 
 use std::{
     collections::HashMap,
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -16,12 +17,22 @@ use crate::{
         CanonicalPath, PermissionNamespace, PermissionTargetError, ProfileDefault,
         ToolPermissionProfile, ToolProfileError,
     },
+    skill::SkillCatalog,
     tool::{
         Tool,
         bash::Bash,
         filesystem::{EditFile, Glob, Grep, Ls, ReadFile, WriteFile},
+        load_memory::{LOAD_MEMORY_TOOL_NAME, LoadMemory},
+        load_skill::{LOAD_SKILL_TOOL_NAME, LoadSkill},
+        task::{TASK_TOOL_NAME, Task},
+        tasks::{
+            CLAIM_TASK_TOOL_NAME, COMPLETE_TASK_TOOL_NAME, CREATE_TASK_TOOL_NAME, ClaimTask,
+            CompleteTask, CreateTask, GET_TASK_TOOL_NAME, GetTask, LIST_TASKS_TOOL_NAME, ListTasks,
+            UPDATE_TASK_TOOL_NAME, UpdateTask,
+        },
         todo_write::TodoWrite,
         web_fetch::{WebFetch, WebFetchError},
+        write_memory::{WRITE_MEMORY_TOOL_NAME, WriteMemory},
     },
     workspace::Workspace,
 };
@@ -224,7 +235,185 @@ impl ToolRegistry {
             )?
             .constrain_paths_to(workspace_root)?,
         )?;
+        // Allowed by default because delegation itself does nothing: every tool
+        // call the subagent makes is re-authorized individually, and Plan mode
+        // or an explicit `Agent(...)` rule can still deny the delegation.
+        // Appended for the same cache-prefix reason as `ls`.
+        self.register_with_profile(
+            Task::new(),
+            ToolPermissionProfile::new(
+                TASK_TOOL_NAME,
+                [(PermissionNamespace::Agent, ProfileDefault::Allow)],
+                false,
+            )?,
+        )?;
         Ok(())
+    }
+
+    /// Replaces the default `task` tool with one advertising a scanned
+    /// agent-type catalog.
+    ///
+    /// Replacement keeps the slot's position, so the definition list order —
+    /// the provider cache prefix — is unchanged; only the `task` description
+    /// gains the custom type lines. The permission profile is identical to
+    /// the default registration: delegation stays allowed by default and each
+    /// type is gated as its own `Agent(<name>)` target.
+    pub fn register_task_tool(
+        &mut self,
+        catalog: Arc<crate::agent_type::AgentTypeCatalog>,
+    ) -> Result<(), RegistryError> {
+        self.register_with_profile(
+            Task::with_types(catalog),
+            ToolPermissionProfile::new(
+                TASK_TOOL_NAME,
+                [(PermissionNamespace::Agent, ProfileDefault::Allow)],
+                false,
+            )?,
+        )?;
+        Ok(())
+    }
+
+    /// Registers the `load_skill` tool over a scanned catalog.
+    ///
+    /// Separate from the default set because the tool only makes sense when
+    /// the catalog is non-empty — advertising it with nothing to load is pure
+    /// prompt noise — and the caller owns skill discovery. Reading a skill is
+    /// a Read like any file read: allowed by default, still usable in Plan
+    /// mode, and deniable per document path.
+    pub fn register_skill_tool(&mut self, catalog: Arc<SkillCatalog>) -> Result<(), RegistryError> {
+        self.register_with_profile(
+            LoadSkill::new(catalog),
+            ToolPermissionProfile::new(
+                LOAD_SKILL_TOOL_NAME,
+                [(PermissionNamespace::Read, ProfileDefault::Allow)],
+                false,
+            )?,
+        )?;
+        Ok(())
+    }
+
+    /// Registers the memory pair — `load_memory` and `write_memory` — over
+    /// the per-project memory root.
+    ///
+    /// Separate from the default set because the root only exists when a home
+    /// directory does: the caller owns discovery, and no home degrades to "no
+    /// memory feature", like the session store. Registered even when nothing
+    /// is stored yet — `write_memory` is how the first memory comes to exist,
+    /// and a memory written this session must be loadable in it.
+    ///
+    /// Loading is a Read (allowed by default, Plan-safe); writing is an Edit
+    /// requiring approval. Neither profile constrains paths: the root lives
+    /// outside the workspace, where [`ToolPermissionProfile::constrain_paths_to`]
+    /// would trip the workspace-mismatch guard — like `load_skill`, path
+    /// confinement is the tool's own job, done by the slug grammar that pins
+    /// every target directly under the root.
+    pub fn register_memory_tools(&mut self, root: PathBuf) -> Result<(), RegistryError> {
+        self.register_with_profile(
+            LoadMemory::new(root.clone()),
+            ToolPermissionProfile::new(
+                LOAD_MEMORY_TOOL_NAME,
+                [(PermissionNamespace::Read, ProfileDefault::Allow)],
+                false,
+            )?,
+        )?;
+        self.register_with_profile(
+            WriteMemory::new(root),
+            ToolPermissionProfile::new(
+                WRITE_MEMORY_TOOL_NAME,
+                [(PermissionNamespace::Edit, ProfileDefault::RequireApproval)],
+                false,
+            )?,
+        )?;
+        Ok(())
+    }
+
+    /// Registers the six task-store tools over the per-project tasks root.
+    ///
+    /// Same degradation contract as the memory pair: no home directory means
+    /// the caller never calls this. The four mutators share the `TaskWrite`
+    /// namespace — allowed by default like `todo_write`, but denied in Plan
+    /// mode because the store is a cross-session disk side effect. The two
+    /// readers are ordinary Reads (allowed by default, Plan-safe, deniable
+    /// per path). No `constrain_paths_to`: the root lives outside the
+    /// workspace, where it would trip the workspace-mismatch guard —
+    /// confinement is the id grammar's job.
+    pub fn register_task_store_tools(&mut self, root: PathBuf) -> Result<(), RegistryError> {
+        let write_profile = |name: &str| {
+            ToolPermissionProfile::new(
+                name,
+                [(PermissionNamespace::TaskWrite, ProfileDefault::Allow)],
+                false,
+            )
+        };
+        let read_profile = |name: &str| {
+            ToolPermissionProfile::new(
+                name,
+                [(PermissionNamespace::Read, ProfileDefault::Allow)],
+                false,
+            )
+        };
+        self.register_with_profile(
+            CreateTask::new(root.clone()),
+            write_profile(CREATE_TASK_TOOL_NAME)?,
+        )?;
+        self.register_with_profile(
+            UpdateTask::new(root.clone()),
+            write_profile(UPDATE_TASK_TOOL_NAME)?,
+        )?;
+        self.register_with_profile(
+            ClaimTask::new(root.clone()),
+            write_profile(CLAIM_TASK_TOOL_NAME)?,
+        )?;
+        self.register_with_profile(
+            CompleteTask::new(root.clone()),
+            write_profile(COMPLETE_TASK_TOOL_NAME)?,
+        )?;
+        self.register_with_profile(
+            GetTask::new(root.clone()),
+            read_profile(GET_TASK_TOOL_NAME)?,
+        )?;
+        self.register_with_profile(ListTasks::new(root), read_profile(LIST_TASKS_TOOL_NAME)?)?;
+        Ok(())
+    }
+
+    /// Returns a copy of this registry without the named tool, preserving the
+    /// relative order of the remaining tools.
+    ///
+    /// The runner uses this to hand a subagent every tool except `task`
+    /// itself, which is what closes the infinite-delegation loop.
+    pub fn without_tool(&self, name: &str) -> Self {
+        self.retaining(|tool| tool != name)
+    }
+
+    /// Returns a copy keeping only the named tools, preserving their relative
+    /// order.
+    ///
+    /// Names absent from this registry are ignored rather than rejected: a
+    /// whitelist can only narrow the parent set, never add to it, so a stale
+    /// name in an agent-type definition degrades to "that tool is missing"
+    /// instead of failing the delegation.
+    pub fn keeping_tools<S: AsRef<str>>(&self, names: &[S]) -> Self {
+        self.retaining(|tool| names.iter().any(|name| name.as_ref() == tool))
+    }
+
+    /// Copies the slots whose tool name satisfies `keep`, preserving order.
+    fn retaining(&self, keep: impl Fn(&str) -> bool) -> Self {
+        // Entries are copied directly instead of re-registered: each already
+        // passed profile validation against this registry's workspace root.
+        let mut registry = Self {
+            workspace_root: self.workspace_root.clone(),
+            ..Self::default()
+        };
+        for registered in &self.tools {
+            if !keep(registered.tool.name()) {
+                continue;
+            }
+            registry
+                .index
+                .insert(registered.tool.name().to_string(), registry.tools.len());
+            registry.tools.push(registered.clone());
+        }
+        registry
     }
 
     /// Registers a tool, replacing any existing tool with the same model-facing
@@ -501,9 +690,164 @@ mod tests {
                 "todo_write",
                 "ls",
                 "web_fetch",
-                "grep"
+                "grep",
+                "task"
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn the_skill_tool_appends_and_reaches_subagent_views() {
+        let workspace = Workspace::from_current_dir()
+            .await
+            .expect("current directory should be a valid workspace");
+        let mut registry = ToolRegistry::with_default_workspace_tools(workspace)
+            .expect("built-in profiles are valid");
+
+        registry
+            .register_skill_tool(std::sync::Arc::new(crate::skill::SkillCatalog::default()))
+            .expect("skill profile is valid");
+
+        let names = registry
+            .definition()
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<Vec<_>>();
+        assert_eq!(names.last().map(String::as_str), Some("load_skill"));
+        // A subagent loses `task` but keeps skill loading.
+        let subagent_view = registry.without_tool("task");
+        assert!(subagent_view.get("load_skill").is_some());
+    }
+
+    #[tokio::test]
+    async fn the_memory_tools_append_and_reach_subagent_views() {
+        let workspace = Workspace::from_current_dir()
+            .await
+            .expect("current directory should be a valid workspace");
+        let root = workspace.root().to_path_buf();
+        let mut registry = ToolRegistry::with_default_workspace_tools(workspace)
+            .expect("built-in profiles are valid");
+
+        registry
+            .register_memory_tools(std::env::temp_dir().join("kuncode-registry-memory"))
+            .expect("memory profiles are valid");
+
+        let names = registry
+            .definition()
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            &names[names.len() - 2..],
+            ["load_memory", "write_memory"],
+            "memory tools append in order"
+        );
+        // The path-unconstrained profiles must not disturb the workspace root
+        // the path-constrained default tools were registered under.
+        assert_eq!(
+            registry.workspace_root().map(|r| r.as_str().to_string()),
+            Some(
+                crate::permission::CanonicalPath::from_absolute(&root)
+                    .expect("workspace root is canonical")
+                    .as_str()
+                    .to_string()
+            ),
+        );
+        // A subagent loses `task` but keeps both memory tools.
+        let subagent_view = registry.without_tool("task");
+        assert!(subagent_view.get("load_memory").is_some());
+        assert!(subagent_view.get("write_memory").is_some());
+    }
+
+    #[tokio::test]
+    async fn the_task_store_tools_append_and_reach_subagent_views() {
+        let workspace = Workspace::from_current_dir()
+            .await
+            .expect("current directory should be a valid workspace");
+        let root = workspace.root().to_path_buf();
+        let mut registry = ToolRegistry::with_default_workspace_tools(workspace)
+            .expect("built-in profiles are valid");
+
+        registry
+            .register_task_store_tools(std::env::temp_dir().join("kuncode-registry-tasks"))
+            .expect("task profiles are valid");
+
+        let names = registry
+            .definition()
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            &names[names.len() - 6..],
+            [
+                "create_task",
+                "update_task",
+                "claim_task",
+                "complete_task",
+                "get_task",
+                "list_tasks"
+            ],
+            "task tools append in order"
+        );
+        // The path-unconstrained profiles must not disturb the workspace root
+        // the path-constrained default tools were registered under.
+        assert_eq!(
+            registry.workspace_root().map(|r| r.as_str().to_string()),
+            Some(
+                crate::permission::CanonicalPath::from_absolute(&root)
+                    .expect("workspace root is canonical")
+                    .as_str()
+                    .to_string()
+            ),
+        );
+        // A subagent loses `task` but keeps the whole task-store surface.
+        let subagent_view = registry.without_tool("task");
+        assert!(subagent_view.get("create_task").is_some());
+        assert!(subagent_view.get("list_tasks").is_some());
+    }
+
+    #[tokio::test]
+    async fn without_tool_drops_only_the_named_tool_and_keeps_order() {
+        let workspace = Workspace::from_current_dir()
+            .await
+            .expect("current directory should be a valid workspace");
+        let registry = ToolRegistry::with_default_workspace_tools(workspace)
+            .expect("built-in profiles are valid");
+
+        let subagent_view = registry.without_tool("task");
+
+        let names = subagent_view
+            .definition()
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<Vec<_>>();
+        assert!(!names.contains(&"task".to_string()));
+        assert_eq!(names.len(), registry.len() - 1);
+        // Remaining lookups still resolve through the rebuilt index.
+        assert!(subagent_view.get("grep").is_some());
+        assert!(subagent_view.get("task").is_none());
+        assert_eq!(subagent_view.workspace_root(), registry.workspace_root());
+    }
+
+    #[tokio::test]
+    async fn keeping_tools_narrows_to_the_whitelist_in_registry_order() {
+        let workspace = Workspace::from_current_dir()
+            .await
+            .expect("current directory should be a valid workspace");
+        let registry = ToolRegistry::with_default_workspace_tools(workspace)
+            .expect("built-in profiles are valid");
+
+        // Whitelist order does not matter; unknown names degrade to absent.
+        let narrowed = registry.keeping_tools(&["grep", "read_file", "not-a-tool"]);
+
+        let names = narrowed
+            .definition()
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["read_file", "grep"]);
+        assert!(narrowed.get("bash").is_none());
+        assert_eq!(narrowed.workspace_root(), registry.workspace_root());
     }
 
     #[tokio::test]
@@ -518,7 +862,7 @@ mod tests {
 
         assert_eq!(
             snapshot,
-            r#"[{"name":"bash","description":"Run a shell command in the workspace. Use it for commands that do something — building, testing, version control, package managers — rather than to inspect the workspace: read_file, ls, glob, and grep answer those questions without an approval prompt and without spilling unbounded output into the conversation.","parameters":{"properties":{"cmd":{"description":"The shell command to run, e.g. `cargo test --workspace`.","type":"string"}},"required":["cmd"],"type":"object"}}]"#
+            r#"[{"name":"bash","description":"Run a shell command in the workspace. Use it for commands that do something — building, testing, version control, package managers — rather than to inspect the workspace: read_file, ls, glob, and grep answer those questions without an approval prompt and without spilling unbounded output into the conversation.","parameters":{"properties":{"cmd":{"description":"The shell command to run, e.g. `cargo test --workspace`.","type":"string"},"timeout_secs":{"description":"Timeout in seconds. Defaults to 120; values above 600 are capped to\n600. When the timeout trips, the whole process group is killed and the\noutput received up to that point is returned.","format":"uint64","maximum":600,"minimum":1,"type":["integer","null"]}},"required":["cmd"],"type":"object"}}]"#
         );
     }
 

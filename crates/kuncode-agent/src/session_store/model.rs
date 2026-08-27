@@ -69,6 +69,26 @@ impl NewSession {
     }
 }
 
+/// One durable session projected for project-scoped listing and resume selection.
+///
+/// Timestamps are the store's RFC 3339 strings and are ordered lexicographically
+/// by the listing query; they are surfaced for display, not re-parsed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionSummary {
+    /// Durable identity accepted by the resume path.
+    pub id: SessionId,
+    /// Optional human-facing title; absent until a naming feature writes one.
+    pub title: Option<String>,
+    /// Instant the session row was created.
+    pub created_at: String,
+    /// Instant of the last durable fact.
+    pub updated_at: String,
+    /// Number of `message` journal facts in the session.
+    pub message_count: u64,
+    /// First line of the earliest journaled message, capped for display.
+    pub preview: Option<String>,
+}
+
 /// Wire-protocol category of a journal payload.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JournalKind {
@@ -204,10 +224,10 @@ pub struct NewCheckpoint {
     pub token_usage_json: Option<Value>,
 }
 
-/// Active-context projection validated at the write boundary and persisted for future recovery.
+/// Active-context projection validated at the write boundary and persisted for recovery.
 ///
-/// The v1 runtime writes this storage substrate but does not read it to resume sessions;
-/// no CLI or runtime resume path is implemented.
+/// Resume reads the latest checkpoint as the compacted base and replays the
+/// journal after [`covers_through_seq`](Self::covers_through_seq).
 ///
 /// Stores must only materialize summary provenance when every summary field was
 /// committed together; partial provenance cannot authorize summary reconstruction.

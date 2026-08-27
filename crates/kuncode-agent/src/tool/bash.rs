@@ -1,8 +1,9 @@
 //! Executes approved shell commands with bounded output and descendant cleanup.
 
 use std::{
-    io,
-    process::{ExitStatus, Stdio},
+    num::NonZeroU64,
+    process::Stdio,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -11,7 +12,6 @@ use kuncode_core::completion::ToolDefinition;
 use kuncode_core::non_empty_vec::NonEmptyVec;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
     process::{Child, ChildStderr, ChildStdout, Command},
@@ -31,13 +31,22 @@ use crate::{
 };
 
 const OUTPUT_LIMIT_BYTES: usize = 20_000;
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
+const DEFAULT_TIMEOUT_SECS: u64 = 120;
+const MAX_TIMEOUT_SECS: u64 = 600;
+/// How long to keep reading after the command ends before abandoning a stream
+/// that has not reached EOF.
+const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 /// Arguments accepted by the [`Bash`] tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct BashArgs {
     /// The shell command to run, e.g. `cargo test --workspace`.
     cmd: String,
+    /// Timeout in seconds. Defaults to 120; values above 600 are capped to
+    /// 600. When the timeout trips, the whole process group is killed and the
+    /// output received up to that point is returned.
+    #[schemars(range(max = 600))]
+    timeout_secs: Option<NonZeroU64>,
 }
 
 /// Structured result of a [`Bash`] invocation.
@@ -78,57 +87,6 @@ impl Bash {
     pub fn workspace(&self) -> &Workspace {
         &self.workspace
     }
-
-    async fn run_command(&self, cmd: String, command_timeout: Duration) -> ToolOutput<BashOutput> {
-        let mut command = Command::new("bash");
-        command
-            .arg("-lc")
-            .arg(&cmd)
-            .current_dir(self.workspace.root())
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-
-        let output = match capture_command(command, command_timeout).await {
-            Ok(output) => output,
-            Err(error) => {
-                let kind = match error {
-                    CommandExecutionError::Execution(_) => "execution",
-                    CommandExecutionError::Timeout { .. } => "timeout",
-                };
-                return ToolOutput::failure(kind, error.to_string());
-            }
-        };
-
-        let (stdout, stdout_truncated) = output_text("stdout", &output.stdout);
-        let (stderr, stderr_truncated) = output_text("stderr", &output.stderr);
-        let truncated = stdout_truncated || stderr_truncated;
-        let ok = output.status.success();
-        let exit_code = output.status.code();
-
-        ToolOutput {
-            ok,
-            data: Some(BashOutput {
-                cmd,
-                exit_code,
-                stdout,
-                stderr,
-            }),
-            error: if ok {
-                None
-            } else {
-                Some(ToolErrorPayload {
-                    kind: "non_zero_exit".into(),
-                    message: match exit_code {
-                        Some(code) => format!("command exited with status {code}"),
-                        None => "command terminated by signal".to_string(),
-                    },
-                })
-            },
-            truncated,
-        }
-    }
 }
 
 #[async_trait]
@@ -160,9 +118,15 @@ impl TypedTool for Bash {
             .unwrap_or("command")
             .to_string();
         let checks = command_checks(&args.cmd)?;
-        let canonical_input = CanonicalToolInput::new(serde_json::json!({
-            "cmd": args.cmd,
-        }));
+        // `timeout_secs` must survive canonicalization: an approval rewrite
+        // replays this JSON through `prepare`, so a field left out here would
+        // silently reset to the default on the rewritten call.
+        let mut canonical = serde_json::Map::new();
+        canonical.insert("cmd".into(), args.cmd.clone().into());
+        if let Some(timeout_secs) = args.timeout_secs {
+            canonical.insert("timeout_secs".into(), timeout_secs.get().into());
+        }
+        let canonical_input = CanonicalToolInput::new(serde_json::Value::Object(canonical));
         Ok(TypedPreparation::new(
             args,
             canonical_input,
@@ -172,37 +136,95 @@ impl TypedTool for Bash {
     }
 
     async fn run_prepared(&self, prepared: BashArgs, _ctx: &ToolContext) -> ToolOutput<BashOutput> {
-        self.run_command(prepared.cmd, COMMAND_TIMEOUT).await
+        let BashArgs { cmd, timeout_secs } = prepared;
+        let limit = effective_timeout(timeout_secs);
+
+        let mut command = Command::new("bash");
+        command
+            .arg("-lc")
+            .arg(&cmd)
+            .current_dir(self.workspace.root())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        // Make bash the leader of its own process group so a timeout can kill
+        // its grandchildren too: they inherit the pipe write ends, and until
+        // every holder is dead the pumps never see EOF.
+        #[cfg(unix)]
+        command.process_group(0);
+
+        let child = match command.spawn() {
+            Ok(child) => child,
+            Err(err) => {
+                return ToolOutput::failure("execution", format!("failed to run command: {err}"));
+            }
+        };
+        let mut child = ManagedChild::new(child);
+        let stdout_pump = Pump::start(child.take_stdout());
+        let stderr_pump = Pump::start(child.take_stderr());
+
+        let (status, timed_out) = match timeout(limit, child.wait()).await {
+            Ok(Ok(status)) => {
+                child.disarm();
+                (Some(status), false)
+            }
+            Ok(Err(err)) => {
+                child.terminate_and_reap().await;
+                return ToolOutput::failure("execution", format!("failed to run command: {err}"));
+            }
+            Err(_) => {
+                child.terminate_and_reap().await;
+                (None, true)
+            }
+        };
+
+        // Drained together so two never-closing streams cost one grace
+        // period, not two.
+        let (stdout_capture, stderr_capture) =
+            tokio::join!(stdout_pump.drain(), stderr_pump.drain());
+        let (stdout, stdout_truncated) = output_text("stdout", stdout_capture);
+        let (stderr, stderr_truncated) = output_text("stderr", stderr_capture);
+        let ok = !timed_out && status.is_some_and(|status| status.success());
+        let exit_code = status.and_then(|status| status.code());
+
+        ToolOutput {
+            ok,
+            data: Some(BashOutput {
+                cmd,
+                exit_code,
+                stdout,
+                stderr,
+            }),
+            error: if timed_out {
+                Some(ToolErrorPayload {
+                    kind: "timeout".into(),
+                    message: format!(
+                        "command killed after exceeding its {}s timeout; stdout/stderr \
+                         received up to the kill are included",
+                        limit.as_secs()
+                    ),
+                })
+            } else if ok {
+                None
+            } else {
+                Some(ToolErrorPayload {
+                    kind: "non_zero_exit".into(),
+                    message: match exit_code {
+                        Some(code) => format!("command exited with status {code}"),
+                        None => "command terminated by signal".to_string(),
+                    },
+                })
+            },
+            truncated: stdout_truncated || stderr_truncated || timed_out,
+        }
     }
 }
 
-#[derive(Debug, Error)]
-enum CommandExecutionError {
-    #[error("failed to run command: {0}")]
-    Execution(#[source] io::Error),
-    #[error("command exceeded {seconds} seconds")]
-    Timeout { seconds: u64 },
-}
-
-#[derive(Debug)]
-struct CapturedCommand {
-    status: ExitStatus,
-    stdout: CapturedStream,
-    stderr: CapturedStream,
-}
-
-#[derive(Debug)]
-struct CapturedStream {
-    prefix: Vec<u8>,
-    total_bytes: u64,
-}
-
-impl CapturedStream {
-    fn truncated(&self) -> bool {
-        self.total_bytes > self.prefix.len() as u64
-    }
-}
-
+/// Keeps process-group cleanup armed until the direct child has been reaped.
+///
+/// The guard's synchronous [`Drop`] path covers task cancellation, where there
+/// is no opportunity to await explicit cleanup.
 struct ManagedChild {
     child: Child,
     cleanup_armed: bool,
@@ -231,21 +253,19 @@ impl ManagedChild {
         self.child.stderr.take()
     }
 
-    async fn wait(&mut self) -> io::Result<ExitStatus> {
+    async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
         self.child.wait().await
     }
 
     fn signal_termination(&mut self) {
         #[cfg(unix)]
         if let Some(process_group) = self.process_group {
-            // SAFETY: `process_group` is the positive PID assigned by the OS to
-            // the child and configured as its PGID before spawn. `killpg` only
-            // reads these scalar arguments and targets that isolated group.
+            // SAFETY: spawn configured the child as leader of this isolated
+            // process group; killpg only reads the scalar group id and signal.
             let _ = unsafe { libc::killpg(process_group, libc::SIGKILL) };
         }
 
-        // Keep this fallback on Unix too: if the group signal races process
-        // setup or fails, Tokio can still terminate the direct child.
+        // Also covers non-Unix targets and a failed process-group signal.
         let _ = self.child.start_kill();
     }
 
@@ -268,108 +288,111 @@ impl Drop for ManagedChild {
     }
 }
 
-async fn capture_command(
-    mut command: Command,
-    command_timeout: Duration,
-) -> Result<CapturedCommand, CommandExecutionError> {
-    // A separate process group lets cancellation and timeout include shell
-    // pipelines, background jobs, and grandchildren rather than only `bash`.
-    #[cfg(unix)]
-    command.process_group(0);
-
-    let child = command.spawn().map_err(CommandExecutionError::Execution)?;
-    let mut child = ManagedChild::new(child);
-    let Some(stdout) = child.take_stdout() else {
-        child.terminate_and_reap().await;
-        return Err(CommandExecutionError::Execution(io::Error::other(
-            "stdout pipe was not captured",
-        )));
-    };
-    let Some(stderr) = child.take_stderr() else {
-        child.terminate_and_reap().await;
-        return Err(CommandExecutionError::Execution(io::Error::other(
-            "stderr pipe was not captured",
-        )));
-    };
-
-    let capture = async {
-        // Leave the direct child unreaped until both pipes reach EOF. Its PID
-        // therefore cannot be reused while cleanup still addresses the PGID.
-        let (stdout, stderr) = tokio::try_join!(capture_stream(stdout), capture_stream(stderr))?;
-        let status = child.wait().await?;
-        Ok::<_, io::Error>(CapturedCommand {
-            status,
-            stdout,
-            stderr,
-        })
-    };
-
-    match timeout(command_timeout, capture).await {
-        Ok(Ok(output)) => {
-            child.disarm();
-            Ok(output)
-        }
-        Ok(Err(error)) => {
-            child.terminate_and_reap().await;
-            Err(CommandExecutionError::Execution(error))
-        }
-        Err(_) => {
-            child.terminate_and_reap().await;
-            Err(CommandExecutionError::Timeout {
-                seconds: command_timeout.as_secs(),
-            })
-        }
-    }
+/// Resolves the effective timeout: default 120s, capped at 600s. The cap is a
+/// clamp rather than a rejection — the schema advertises the maximum, so an
+/// oversized request costs a shorter wait, not a wasted round-trip.
+fn effective_timeout(timeout_secs: Option<NonZeroU64>) -> Duration {
+    Duration::from_secs(timeout_secs.map_or(DEFAULT_TIMEOUT_SECS, |secs| {
+        secs.get().min(MAX_TIMEOUT_SECS)
+    }))
 }
 
-async fn capture_stream<R>(mut reader: R) -> io::Result<CapturedStream>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut prefix = Vec::with_capacity(OUTPUT_LIMIT_BYTES);
-    let mut total_bytes = 0_u64;
-    let mut chunk = [0_u8; 8 * 1024];
-
-    loop {
-        let read = reader.read(&mut chunk).await?;
-        if read == 0 {
-            break;
-        }
-        total_bytes = total_bytes.saturating_add(read as u64);
-        let retained = (OUTPUT_LIMIT_BYTES - prefix.len()).min(read);
-        prefix.extend_from_slice(&chunk[..retained]);
-    }
-
-    Ok(CapturedStream {
-        prefix,
-        total_bytes,
-    })
+/// What a [`Pump`] captured from one stream: the retained head, the total byte
+/// count, and whether the stream actually closed.
+#[derive(Debug, Default)]
+struct StreamCapture {
+    head: Vec<u8>,
+    total: usize,
+    closed: bool,
 }
 
-/// Decodes a stream whose retained prefix is capped at `OUTPUT_LIMIT_BYTES`.
-/// Bash output may not be valid UTF-8, so decoding is intentionally lossy
-/// (`from_utf8_lossy`).
+/// Background reader for one output stream.
 ///
-/// When the cap trips, a visible marker is appended naming the stream and the
-/// byte scale, so the model knows it holds only the head of the stream and must
-/// not assume it saw everything. How to get the rest (filter, redirect, re-run)
-/// is left to the model — bash is a general shell.
-fn output_text(stream: &str, captured: &CapturedStream) -> (String, bool) {
-    if !captured.truncated() {
-        return (
-            String::from_utf8_lossy(&captured.prefix).into_owned(),
-            false,
-        );
+/// Bytes past `OUTPUT_LIMIT_BYTES` are counted and dropped as they arrive, so
+/// the pipe never backpressures the child and memory stays bounded no matter
+/// how much a command prints. The capture lives behind a shared handle rather
+/// than in the task, so whatever arrived stays reachable even when the reader
+/// has to be abandoned.
+struct Pump {
+    capture: Arc<Mutex<StreamCapture>>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Pump {
+    fn start(stream: Option<impl AsyncRead + Send + Unpin + 'static>) -> Self {
+        let capture = Arc::new(Mutex::new(StreamCapture::default()));
+        let task = stream.map(|mut stream| {
+            let capture = Arc::clone(&capture);
+            tokio::spawn(async move {
+                let mut chunk = vec![0u8; 8 * 1024];
+                loop {
+                    match stream.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => {
+                            let mut capture = capture.lock().expect("pump mutex");
+                            capture.total += read;
+                            let room = OUTPUT_LIMIT_BYTES.saturating_sub(capture.head.len());
+                            capture.head.extend_from_slice(&chunk[..read.min(room)]);
+                        }
+                    }
+                }
+                capture.lock().expect("pump mutex").closed = true;
+            })
+        });
+        Self { capture, task }
     }
 
-    // The retained byte prefix may end inside a code point; `from_utf8_lossy`
-    // turns that partial trailing sequence into U+FFFD.
-    let mut text = String::from_utf8_lossy(&captured.prefix).into_owned();
-    text.push_str(&format!(
-        "\n…⟨kuncode: {stream} truncated — showed first {OUTPUT_LIMIT_BYTES} of {total} bytes⟩",
-        total = captured.total_bytes,
-    ));
-    (text, true)
+    /// Waits briefly for EOF, then returns whatever was captured.
+    ///
+    /// The grace period covers the normal case — the command is dead, the
+    /// write ends are closed, EOF is instants away — while bounding the wait
+    /// when an escaped process still holds a write end (a daemon that left the
+    /// process group, or a backgrounded child that outlived a successful exit).
+    async fn drain(self) -> StreamCapture {
+        if let Some(task) = self.task {
+            let abort = task.abort_handle();
+            if timeout(DRAIN_GRACE, task).await.is_err() {
+                abort.abort();
+            }
+        }
+        let mut capture = self.capture.lock().expect("pump mutex");
+        std::mem::take(&mut *capture)
+    }
+}
+
+/// Renders a captured stream, appending a visible marker for anything the text
+/// alone would misrepresent. Bash output may not be valid UTF-8, so decoding is
+/// intentionally lossy (`from_utf8_lossy`).
+///
+/// Two conditions earn a marker. Bytes past `OUTPUT_LIMIT_BYTES` were dropped
+/// as they arrived — the marker names the stream and the byte scale, so the
+/// model knows it holds only the head and must not assume it saw everything;
+/// how to get the rest (filter, redirect, re-run) is left to the model — bash
+/// is a general shell. And a stream that never closed means some process the
+/// kill could not reach may still be writing — the marker says the text is only
+/// what had arrived by the time the pump was abandoned.
+fn output_text(stream: &str, capture: StreamCapture) -> (String, bool) {
+    // The head is cut at an arbitrary byte index, which never splits a `char`
+    // (that is a `str` concern); `from_utf8_lossy` turns any partial trailing
+    // sequence into U+FFFD, so the result is always valid UTF-8.
+    let mut text = String::from_utf8_lossy(&capture.head).into_owned();
+    let mut truncated = false;
+    if capture.total > capture.head.len() {
+        text.push_str(&format!(
+            "\n…⟨kuncode: {stream} truncated — showed first {shown} of {total} bytes⟩",
+            shown = capture.head.len(),
+            total = capture.total,
+        ));
+        truncated = true;
+    }
+    if !capture.closed {
+        text.push_str(&format!(
+            "\n…⟨kuncode: {stream} did not close — a surviving process may still \
+             be holding it; shown is what had arrived so far⟩"
+        ));
+        truncated = true;
+    }
+    (text, truncated)
 }
 
 fn command_checks(command: &str) -> Result<NonEmptyVec<PermissionCheckSpec>, ToolOutput> {
@@ -518,15 +541,15 @@ fn is_dynamic_shell_command(command: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::sync::Arc;
 
-    use tokio::io::AsyncReadExt;
+    #[cfg(unix)]
+    use std::time::Duration;
 
-    use super::{
-        Bash, CapturedStream, OUTPUT_LIMIT_BYTES, capture_stream, output_text, simple_command_chain,
-    };
+    use super::{Bash, simple_command_chain};
+    #[cfg(unix)]
+    use crate::test_support::TestDir;
     use crate::{
-        test_support::TestDir,
         tool::{Tool, ToolContext, execute_for_test},
         workspace::Workspace,
     };
@@ -586,6 +609,9 @@ mod tests {
         assert_eq!(params["type"], "object");
         assert_eq!(params["required"], serde_json::json!(["cmd"]));
         assert_eq!(params["properties"]["cmd"]["type"], "string");
+        // The timeout cap must be advertised so the model doesn't have to
+        // discover it by clamping.
+        assert_eq!(params["properties"]["timeout_secs"]["maximum"], 600);
     }
 
     #[tokio::test]
@@ -613,100 +639,29 @@ mod tests {
         assert!(stdout.contains("stdout truncated"));
     }
 
-    #[tokio::test]
-    async fn stream_capture_retains_only_the_bounded_prefix() {
-        let total_bytes = (OUTPUT_LIMIT_BYTES as u64) * 50;
-        let input = tokio::io::repeat(b'x').take(total_bytes);
-
-        let captured = capture_stream(input)
-            .await
-            .expect("in-memory stream should be readable");
-
-        assert_eq!(captured.prefix.len(), OUTPUT_LIMIT_BYTES);
-        assert_eq!(captured.total_bytes, total_bytes);
-        assert!(captured.prefix.iter().all(|byte| *byte == b'x'));
-    }
-
     #[cfg(unix)]
     #[tokio::test]
     async fn drains_large_stdout_and_stderr_concurrently() {
-        let bash = bash().await;
-        let out = bash
-            .run_command(
-                "(head -c 2000000 /dev/zero | tr '\\000' o) & \
-                 (head -c 2000000 /dev/zero | tr '\\000' e >&2) & wait"
-                    .to_string(),
-                super::COMMAND_TIMEOUT,
-            )
-            .await;
+        let out = execute_for_test(
+            Arc::new(bash().await),
+            serde_json::json!({
+                "cmd": "(head -c 2000000 /dev/zero | tr '\\000' o) & \
+                         (head -c 2000000 /dev/zero | tr '\\000' e >&2) & wait"
+            }),
+            &ToolContext::new(),
+        )
+        .await
+        .expect("no harness-level error");
 
         assert!(out.ok);
         assert!(out.truncated);
         let data = out.data.expect("data present");
-        assert!(data.stdout.starts_with(&"o".repeat(OUTPUT_LIMIT_BYTES)));
-        assert!(data.stdout.contains("of 2000000 bytes"));
-        assert!(data.stderr.starts_with(&"e".repeat(OUTPUT_LIMIT_BYTES)));
-        assert!(data.stderr.contains("of 2000000 bytes"));
-    }
-
-    #[test]
-    fn output_decoding_remains_lossy_without_rewriting_controls() {
-        let captured = CapturedStream {
-            prefix: vec![b'a', 0xff, 0x1b],
-            total_bytes: 3,
-        };
-
-        assert_eq!(output_text("stdout", &captured), ("a�\u{1b}".into(), false));
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn timeout_terminates_descendants() {
-        let tmp = TestDir::new();
-        let bash = Bash::new(tmp.workspace().await);
-        let out = bash
-            .run_command(
-                "(printf ready > started; \
-                 while [ ! -e release ]; do sleep 0.01; done; \
-                 printf survived > descendant-survived) & wait"
-                    .to_string(),
-                Duration::from_secs(1),
-            )
-            .await;
-
-        assert!(!out.ok);
-        assert_eq!(out.error.expect("error payload").kind.as_str(), "timeout");
-        assert!(tmp.path().join("started").exists());
-        release_and_assert_descendant_stopped(&tmp).await;
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn cancellation_terminates_descendants() {
-        let tmp = TestDir::new();
-        let bash = Arc::new(Bash::new(tmp.workspace().await));
-        let task = tokio::spawn({
-            let bash = Arc::clone(&bash);
-            async move {
-                bash.run_command(
-                    "(printf ready > started; \
-                     while [ ! -e release ]; do sleep 0.01; done; \
-                     printf survived > descendant-survived) & wait"
-                        .to_string(),
-                    Duration::from_secs(30),
-                )
-                .await
-            }
-        });
-
-        wait_for_path(&tmp.path().join("started")).await;
-        task.abort();
-        assert!(
-            task.await
-                .expect_err("aborted execution should be cancelled")
-                .is_cancelled()
-        );
-        release_and_assert_descendant_stopped(&tmp).await;
+        let stdout = data["stdout"].as_str().expect("stdout is a string");
+        let stderr = data["stderr"].as_str().expect("stderr is a string");
+        assert!(stdout.starts_with(&"o".repeat(super::OUTPUT_LIMIT_BYTES)));
+        assert!(stdout.contains("of 2000000 bytes"));
+        assert!(stderr.starts_with(&"e".repeat(super::OUTPUT_LIMIT_BYTES)));
+        assert!(stderr.contains("of 2000000 bytes"));
     }
 
     #[tokio::test]
@@ -737,6 +692,133 @@ mod tests {
                 .display()
                 .to_string()
         );
+    }
+
+    #[tokio::test]
+    async fn timeout_returns_partial_output_instead_of_discarding_it() {
+        let out = execute_for_test(
+            Arc::new(bash().await),
+            serde_json::json!({ "cmd": "echo started; sleep 30", "timeout_secs": 1 }),
+            &ToolContext::new(),
+        )
+        .await
+        .expect("no harness-level error");
+
+        assert!(!out.ok);
+        assert!(out.truncated);
+        let error = out.error.expect("error payload");
+        assert_eq!(error.kind.as_str(), "timeout");
+        // The output produced before the kill must survive it.
+        let data = out.data.expect("data present");
+        assert_eq!(data["exit_code"], serde_json::Value::Null);
+        assert!(
+            data["stdout"]
+                .as_str()
+                .expect("stdout is a string")
+                .contains("started")
+        );
+    }
+
+    #[tokio::test]
+    async fn timeout_kills_grandchildren_holding_the_pipes() {
+        // The backgrounded sleep inherits stdout. If the kill only reached
+        // bash, the pump would wait out the drain grace and flag the stream
+        // as never closed.
+        let out = execute_for_test(
+            Arc::new(bash().await),
+            serde_json::json!({ "cmd": "sleep 30 & echo bg; wait", "timeout_secs": 1 }),
+            &ToolContext::new(),
+        )
+        .await
+        .expect("no harness-level error");
+
+        assert!(!out.ok);
+        let data = out.data.expect("data present");
+        let stdout = data["stdout"].as_str().expect("stdout is a string");
+        assert!(stdout.contains("bg"));
+        assert!(!stdout.contains("did not close"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_terminates_descendants() {
+        let tmp = TestDir::new();
+        let bash = Arc::new(Bash::new(tmp.workspace().await));
+        let task = tokio::spawn({
+            let bash = Arc::clone(&bash);
+            async move {
+                execute_for_test(
+                    bash,
+                    serde_json::json!({
+                        "cmd": "(printf ready > started; \
+                                 while [ ! -e release ]; do sleep 0.01; done; \
+                                 printf survived > descendant-survived) & wait"
+                    }),
+                    &ToolContext::new(),
+                )
+                .await
+            }
+        });
+
+        wait_for_path(&tmp.path().join("started")).await;
+        task.abort();
+        assert!(
+            task.await
+                .expect_err("aborted execution should be cancelled")
+                .is_cancelled()
+        );
+        release_and_assert_descendant_stopped(&tmp).await;
+    }
+
+    #[tokio::test]
+    async fn flags_a_stream_left_open_by_a_surviving_background_process() {
+        // bash exits at once, but the backgrounded sleep keeps the inherited
+        // stdout open past the drain grace, so the pump is abandoned and the
+        // output marked as possibly incomplete. stderr is redirected away so
+        // only the stdout pump has to wait out the grace.
+        let out = execute_for_test(
+            Arc::new(bash().await),
+            serde_json::json!({ "cmd": "sleep 5 2>/dev/null & echo hi" }),
+            &ToolContext::new(),
+        )
+        .await
+        .expect("no harness-level error");
+
+        assert!(out.ok);
+        assert!(out.truncated);
+        let stdout = out.data.expect("data present")["stdout"]
+            .as_str()
+            .expect("stdout is a string")
+            .to_string();
+        assert!(stdout.contains("hi"));
+        assert!(stdout.contains("did not close"));
+    }
+
+    #[tokio::test]
+    async fn canonical_input_preserves_the_timeout_for_approval_rewrites() {
+        let preparation = Arc::new(bash().await)
+            .prepare(
+                serde_json::json!({ "cmd": "true", "timeout_secs": 30 }),
+                &crate::tool::PreparationContext::new(),
+            )
+            .await
+            .expect("prepares cleanly");
+
+        assert_eq!(
+            preparation.canonical_input().as_value(),
+            &serde_json::json!({ "cmd": "true", "timeout_secs": 30 })
+        );
+    }
+
+    #[test]
+    fn timeout_defaults_and_caps() {
+        use std::num::NonZeroU64;
+
+        use super::effective_timeout;
+
+        assert_eq!(effective_timeout(None).as_secs(), 120);
+        assert_eq!(effective_timeout(NonZeroU64::new(30)).as_secs(), 30);
+        assert_eq!(effective_timeout(NonZeroU64::new(9_999)).as_secs(), 600);
     }
 
     #[test]

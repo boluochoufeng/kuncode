@@ -1,7 +1,9 @@
 mod approver;
 mod config;
+mod instructions;
 mod logging;
 mod observer;
+mod resume;
 mod runtime;
 mod settings;
 mod tui;
@@ -13,11 +15,10 @@ use std::{
 };
 
 use clap::Parser;
-use kuncode_agent::{error::AgentError, runner::AgentRunner, session::AgentSession};
-use kuncode_core::completion::CompletionModel;
+use kuncode_agent::{error::AgentError, session::AgentSession};
 use tokio_util::sync::CancellationToken;
 
-use crate::{approver::TerminalApprover, runtime::CliRuntime};
+use crate::{approver::TerminalApprover, runtime::CliRunner, runtime::CliRuntime};
 
 /// kuncode — a coding agent operating in your shell.
 ///
@@ -27,6 +28,10 @@ use crate::{approver::TerminalApprover, runtime::CliRuntime};
 #[derive(Parser, Debug)]
 #[command(name = "kuncode", about = "A coding agent in your shell")]
 pub(crate) struct Cli {
+    /// Model name for this run (any provider); wins over KUNCODE_MODEL,
+    /// DEEPSEEK_MODEL, and the settings file.
+    #[arg(long = "model", value_name = "NAME")]
+    pub(crate) model: Option<String>,
     /// Allow rule, e.g. `Bash(cargo *)` or `Read(./src/**)` (repeatable).
     #[arg(long = "allow", value_name = "RULE")]
     pub(crate) allow: Vec<String>,
@@ -42,6 +47,14 @@ pub(crate) struct Cli {
     /// Trust this workspace's permission relaxations for the current process.
     #[arg(long)]
     pub(crate) trust_project: bool,
+    /// Resume the most recently updated session of this project.
+    #[arg(long = "continue", conflicts_with = "resume")]
+    pub(crate) continue_latest: bool,
+    /// Resume a session: `--resume=<ID>` takes an id (or unique prefix),
+    /// bare `--resume` picks interactively from this project's sessions.
+    /// `=` is required so a trailing prompt is never mistaken for an id.
+    #[arg(long = "resume", value_name = "SESSION_ID", num_args = 0..=1, require_equals = true)]
+    pub(crate) resume: Option<Option<String>>,
     /// Prompt to run. Omit to start an interactive session.
     #[arg(trailing_var_arg = true)]
     prompt: Vec<String>,
@@ -78,14 +91,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // All assembly (workspace, settings, permissions, prompt, model, tools)
     // lives in `CliRuntime`; `main` only parses, dispatches, and owns the
     // one-shot turn's terminal line.
-    let runtime = CliRuntime::assemble(&cli).await?;
+    let mut runtime = CliRuntime::assemble(&cli).await?;
+    resume::apply_resume_flags(&mut runtime, &cli).await?;
 
     let initial_prompt = cli.prompt.join(" ");
 
     // A prompt on argv (or a non-TTY pipe) runs one-shot on the plain
     // line-by-line renderer; only the bare interactive session enters the TUI.
     if !initial_prompt.trim().is_empty() {
-        let mut session = runtime.session().await;
+        let mut session = runtime.session().await?;
         let runner =
             runtime.into_runner(Arc::new(TerminalApprover), Arc::new(observer::CliObserver))?;
 
@@ -103,7 +117,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // failing inside terminal setup.
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         eprintln!(
-            "kuncode: 交互模式需要终端。用 `kuncode \"<任务>\"` 传入一次性任务,或在终端中直接运行。"
+            "kuncode: interactive mode needs a terminal. Pass a one-shot task with `kuncode \"<task>\"`, or run kuncode directly in a terminal."
         );
         tracing::info!(
             target: "kuncode::runtime",
@@ -129,8 +143,8 @@ enum TurnError {
 /// Runs one turn with a Ctrl-C-wired cancellation token, so an interrupt aborts
 /// the current turn and (in the REPL) returns to the prompt instead of killing
 /// the process.
-async fn run_turn<M: CompletionModel>(
-    runner: &AgentRunner<M>,
+async fn run_turn(
+    runner: &CliRunner,
     session: &mut AgentSession,
     input: String,
 ) -> Result<String, TurnError> {

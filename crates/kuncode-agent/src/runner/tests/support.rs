@@ -319,6 +319,7 @@ pub(super) fn completed_stream<T>(response: CompletionResponse<T>) -> Completion
             content: choice,
             usage,
             finish_reason: FinishReason::Stop,
+            model: None,
         })
     }))
 }
@@ -459,6 +460,7 @@ pub(super) fn event_label(kind: &EventKind) -> &'static str {
         EventKind::Error { .. } => "error",
         EventKind::TodoUpdate { .. } => "todo_update",
         EventKind::Warning { .. } => "warning",
+        EventKind::Subagent { .. } => "subagent",
         EventKind::CompactionStarted { .. } => "compaction_started",
         EventKind::CompactionCompleted { .. } => "compaction_completed",
         EventKind::CompactionSkipped { .. } => "compaction_skipped",

@@ -80,7 +80,7 @@ pub(super) async fn revalidate_path(
 
 /// Why a prepared path could not be opened.
 #[derive(Debug)]
-pub(super) enum OpenError {
+pub(crate) enum OpenError {
     /// The path is a symlink. A prepared path is resolved, so it is not one —
     /// something replaced it after the invocation was authorized.
     Symlink,
@@ -135,7 +135,7 @@ pub(super) async fn open_no_follow(
 
 /// Replaces the contents of a prepared path, refusing to follow a symlink in
 /// its final component; see [`open_no_follow`] for why.
-pub(super) async fn write_no_follow(path: &Path, content: &[u8]) -> Result<(), OpenError> {
+pub(crate) async fn write_no_follow(path: &Path, content: &[u8]) -> Result<(), OpenError> {
     let mut file = open_no_follow(
         path,
         OpenOptions::new().write(true).create(true).truncate(true),
@@ -153,7 +153,7 @@ pub(super) async fn write_no_follow(path: &Path, content: &[u8]) -> Result<(), O
 /// it compares a recorded reading against: a baseline and the check that
 /// consumes it have to describe the same filesystem object, or a link would let
 /// the two disagree about which file changed.
-pub(super) async fn file_stamp(path: &Path) -> FileStamp {
+pub(crate) async fn file_stamp(path: &Path) -> FileStamp {
     tokio::fs::symlink_metadata(path)
         .await
         .as_ref()

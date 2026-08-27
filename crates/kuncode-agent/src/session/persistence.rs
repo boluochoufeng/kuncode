@@ -4,6 +4,10 @@
 //! acknowledged frontiers remain observable for diagnostics, but cannot justify
 //! later compaction or reattachment.
 
+use std::collections::HashSet;
+
+use kuncode_core::completion::{Message, UserContent};
+
 use super::{AgentSession, PreparedActiveContext};
 use crate::session_store::{
     CommittedCompaction, NewSession, Seq, SessionId, SessionStore, SessionStoreError,
@@ -48,10 +52,35 @@ impl AgentSession {
         Ok(())
     }
 
+    /// Schedules a durable identity without creating it yet.
+    ///
+    /// The runner materializes the descriptor via
+    /// [`Self::start_durable_session`] immediately before the first journaled
+    /// message, so a session that never exchanges one is never persisted —
+    /// empty rows would otherwise accumulate in resume listings from every
+    /// run that quit without a prompt.
+    ///
+    /// # Errors
+    /// Returns [`SessionAttachError`] when the session already has an identity
+    /// (scheduled or installed), is not pristine, or lost persistence
+    /// authority.
+    pub fn defer_durable_session(&mut self, session: NewSession) -> Result<(), SessionAttachError> {
+        self.ensure_attachable()?;
+        self.deferred_durable = Some(session);
+        Ok(())
+    }
+
+    /// Hands out the scheduled durable identity once (take-and-clear), so the
+    /// runner creates it exactly one time.
+    pub(crate) fn take_deferred_durable_session(&mut self) -> Option<NewSession> {
+        self.deferred_durable.take()
+    }
+
     /// Attaches a newly created durable session at the empty journal frontier.
     ///
-    /// Existing journals must be reconstructed through a future resume path;
-    /// attaching their id here would skip facts that are not in memory.
+    /// Existing journals must be reconstructed through
+    /// [`Self::resume_durable_session`]; attaching their id here would skip
+    /// facts that are not in memory.
     ///
     /// # Errors
     /// Returns [`SessionAttachError`] without changing the session when it is
@@ -68,7 +97,13 @@ impl AgentSession {
         if self.non_durable {
             return Err(SessionAttachError::PersistenceFailed);
         }
-        if self.session_id.is_some() || self.last_durable_seq.is_some() {
+        // A scheduled identity counts as attached: materialization takes the
+        // descriptor before creating it, so any deferral still present here
+        // would race the identity being installed.
+        if self.session_id.is_some()
+            || self.last_durable_seq.is_some()
+            || self.deferred_durable.is_some()
+        {
             return Err(SessionAttachError::AlreadyAttached);
         }
         if !self.messages.is_empty() || self.todo_generation() != 0 {
@@ -161,6 +196,13 @@ impl AgentSession {
         self.message_lineage = prepared.lineage;
         self.active_summary = prepared.summary;
         self.last_durable_seq = Some(committed_head);
+        // The lossy candidate just replaced the conversation, so a file whose
+        // reading went out with the summary is now known here only as a
+        // paraphrase — and a whole-file write from a paraphrase is exactly the
+        // blind overwrite the ledger exists to refuse. Downgrade every sighting
+        // whose witnessing tool result did not survive into the new context.
+        self.reads
+            .evict_unwitnessed(&witnessed_result_ids(&self.messages));
         Ok(())
     }
 
@@ -190,6 +232,27 @@ impl AgentSession {
     }
 }
 
+/// Ids of the tool results present in `messages`.
+///
+/// Compaction retains or drops an assistant request and its results as one
+/// closed group, so a result id appearing here proves the whole exchange —
+/// including the contents a read returned or a write supplied — is still in
+/// the active context.
+fn witnessed_result_ids(messages: &[Message]) -> HashSet<&str> {
+    messages
+        .iter()
+        .filter_map(|message| match message {
+            Message::User { content } => Some(content.iter()),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|block| match block {
+            UserContent::ToolResult(result) => Some(result.id.as_str()),
+            UserContent::Text(_) => None,
+        })
+        .collect()
+}
+
 /// Rejects in-memory appends that would bypass an attached journal.
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 pub enum SessionAppendError {
@@ -212,7 +275,7 @@ pub enum SessionStartError {
 /// Rejects attempts to manufacture durable authority from existing state.
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 pub enum SessionAttachError {
-    /// A durable identity has already been installed.
+    /// A durable identity has already been scheduled or installed.
     #[error("session already has a durable identity")]
     AlreadyAttached,
     /// Existing messages or runtime state lack lineage for the new identity.

@@ -10,7 +10,9 @@ use thiserror::Error;
 use crate::{
     completion::{CompletionError, CompletionModel, CompletionRequest, CompletionResponse},
     json_utils,
-    providers::chat_completions::{CONNECT_TIMEOUT, READ_TIMEOUT, REQUEST_TIMEOUT, streaming},
+    providers::chat_completions::{
+        CONNECT_TIMEOUT, READ_TIMEOUT, REQUEST_TIMEOUT, check_served_model, streaming,
+    },
 };
 
 use self::protocol::{OpenAiCompletionRequest, OpenAiCompletionResponse, Usage};
@@ -105,7 +107,10 @@ impl CompletionModel for OpenAiCompletionModel {
         &self,
         mut request: CompletionRequest,
     ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
-        request.model.get_or_insert_with(|| self.model.clone());
+        let requested_model = request
+            .model
+            .get_or_insert_with(|| self.model.clone())
+            .clone();
         let extra = request.additional_params.take();
         let wire = OpenAiCompletionRequest::try_from(request)?;
         let builder = self.client.post().timeout(REQUEST_TIMEOUT);
@@ -124,6 +129,7 @@ impl CompletionModel for OpenAiCompletionModel {
             });
         }
         let raw: Value = serde_json::from_slice(&response.bytes().await?)?;
+        check_served_model(&requested_model, raw.get("model").and_then(Value::as_str));
         normalize_response(raw)
     }
 
@@ -131,7 +137,10 @@ impl CompletionModel for OpenAiCompletionModel {
         &self,
         mut request: CompletionRequest,
     ) -> Result<crate::completion::CompletionStream, CompletionError> {
-        request.model.get_or_insert_with(|| self.model.clone());
+        let requested_model = request
+            .model
+            .get_or_insert_with(|| self.model.clone())
+            .clone();
         let extra = request.additional_params.take();
         let wire = OpenAiCompletionRequest::try_from(request)?.into_streaming();
         let builder = self.client.post();
@@ -155,7 +164,7 @@ impl CompletionModel for OpenAiCompletionModel {
                 .get(CONTENT_TYPE)
                 .and_then(|value| value.to_str().ok()),
         )?;
-        Ok(streaming::stream_events::<Usage>(response))
+        Ok(streaming::stream_events::<Usage>(response, requested_model))
     }
 }
 

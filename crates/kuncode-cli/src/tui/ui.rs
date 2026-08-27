@@ -7,23 +7,33 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Margin, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Clear, Paragraph},
 };
 
 use kuncode_agent::permission::PermissionMode;
 use kuncode_agent::todo::TodoStatus;
+use kuncode_core::completion::Usage;
 
 use self::conversation::{
-    char_width, draw_conversation, plan_item_line, truncate_display, wrap_lines,
+    char_width, display_width, draw_conversation, plan_item_line, truncate_display, wrap_lines,
 };
 use super::app::{App, Status, mode_label};
 use super::bridge::ApprovalRequest;
+use super::command;
 
 const HEADER_HEIGHT: u16 = 2;
 const FOOTER_HEIGHT: u16 = 1;
+/// One row under the composer for the permission mode and its key.
+const MODE_HINT_HEIGHT: u16 = 1;
 const INPUT_MAX_ROWS: u16 = 6;
+const MENU_MAX_ROWS: usize = 8;
 const PLAN_MAX_ROWS: usize = 5;
 const MIN_CONVERSATION_ROWS: u16 = 2;
+/// Footer hint shown while the transcript is scrolled off its tail.
+const SCROLL_HINT: &str = "↑ earlier output";
+/// Columns the metadata needs before the hint is allowed to share the row;
+/// below this the hint is dropped and the metadata keeps the full width.
+const MIN_METADATA_WIDTH: u16 = 10;
 
 #[derive(Clone, Copy)]
 pub(super) struct Theme {
@@ -86,13 +96,16 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     } else {
         input_height(app, area.width)
     };
-    let (bottom_height, plan_height) = pane_heights(app, area.height, requested_bottom);
+    let hint_height = mode_hint_height(app, area.height, requested_bottom);
+    let (bottom_height, plan_height) =
+        pane_heights(app, area.height, requested_bottom, hint_height);
 
-    let [header, body, plan_area, bottom, footer] = Layout::vertical([
+    let [header, body, plan_area, bottom, hint, footer] = Layout::vertical([
         Constraint::Length(HEADER_HEIGHT),
         Constraint::Min(0),
         Constraint::Length(plan_height),
         Constraint::Length(bottom_height),
+        Constraint::Length(hint_height),
         Constraint::Length(FOOTER_HEIGHT),
     ])
     .areas(area);
@@ -106,12 +119,211 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         draw_approval(frame, lines, bottom, theme);
     } else {
         draw_input(frame, app, bottom, theme);
+        if hint_height > 0 {
+            draw_mode_hint(frame, app, hint, theme);
+        }
+        // Drawn after the hint so a popup may cover it, never the reverse.
+        draw_command_menu(frame, app, bottom, theme);
+        draw_model_picker(frame, app, bottom, theme);
+        draw_session_picker(frame, app, bottom, theme);
     }
     draw_footer(frame, app, footer, theme);
 }
 
-fn pane_heights(app: &App, frame_height: u16, requested_bottom: u16) -> (u16, u16) {
-    let fixed = HEADER_HEIGHT.saturating_add(FOOTER_HEIGHT);
+/// Floats the slash-command completion menu directly above the composer while
+/// a command name is being typed. Painted after (over) the conversation, like
+/// a dropdown; the highlighted row is what Enter will run, so the marker must
+/// survive `NO_COLOR` (a `❯` glyph, not color alone).
+fn draw_command_menu(frame: &mut Frame, app: &App, anchor: Rect, theme: Theme) {
+    let Some(menu) = command::completions(&app.input) else {
+        return;
+    };
+    if menu.is_empty() {
+        return;
+    }
+    let rows = menu.len().min(MENU_MAX_ROWS) as u16;
+    let height = rows.saturating_add(2).min(anchor.y); // borders; clipped on tiny frames
+    if height < 3 {
+        return;
+    }
+    let area = Rect::new(anchor.x, anchor.y - height, anchor.width, height);
+    let selected = app.menu_selection.min(menu.len() - 1);
+    let name_width = menu.iter().map(|spec| spec.name.len()).max().unwrap_or(0);
+    let lines: Vec<Line> = menu
+        .iter()
+        .take(rows as usize)
+        .enumerate()
+        .map(|(index, spec)| {
+            let name = format!("/{:<name_width$}", spec.name);
+            if index == selected {
+                Line::from(vec![
+                    Span::styled("❯ ", theme.accent_strong()),
+                    Span::styled(name, theme.accent_strong()),
+                    Span::styled(format!("  {}", spec.description), theme.muted()),
+                ])
+            } else {
+                Line::from(vec![
+                    Span::raw("  "),
+                    Span::raw(name),
+                    Span::styled(format!("  {}", spec.description), theme.muted()),
+                ])
+            }
+        })
+        .collect();
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).block(
+            Block::new()
+                .borders(Borders::ALL)
+                .title(Line::from(" Commands ").style(theme.accent_strong()))
+                .border_style(theme.divider()),
+        ),
+        area,
+    );
+}
+
+/// Floats the `/model` selection dialog above the composer, in the command
+/// menu's spot (the two never show together: the picker only opens after the
+/// composer was cleared, which closes the menu). Same `NO_COLOR`-surviving
+/// `❯` marker; the active model is annotated so re-picking it reads as a
+/// deliberate no-op.
+fn draw_model_picker(frame: &mut Frame, app: &App, anchor: Rect, theme: Theme) {
+    let Some(picker) = &app.model_picker else {
+        return;
+    };
+    let rows = picker.options.len().min(MENU_MAX_ROWS) as u16;
+    let height = rows.saturating_add(2).min(anchor.y); // borders; clipped on tiny frames
+    if height < 3 {
+        return;
+    }
+    let area = Rect::new(anchor.x, anchor.y - height, anchor.width, height);
+    let lines: Vec<Line> = picker
+        .options
+        .iter()
+        .take(rows as usize)
+        .enumerate()
+        .map(|(index, name)| {
+            let mut spans = if index == picker.selected {
+                vec![
+                    Span::styled("❯ ", theme.accent_strong()),
+                    Span::styled(name.clone(), theme.accent_strong()),
+                ]
+            } else {
+                vec![Span::raw("  "), Span::raw(name.clone())]
+            };
+            if *name == app.model_name {
+                spans.push(Span::styled("  (current)", theme.muted()));
+            }
+            Line::from(spans)
+        })
+        .collect();
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).block(
+            Block::new()
+                .borders(Borders::ALL)
+                .title(
+                    Line::from(" Model — Enter to switch, Esc to cancel ")
+                        .style(theme.accent_strong()),
+                )
+                .border_style(theme.divider()),
+        ),
+        area,
+    );
+}
+
+/// Floats the `/resume` session picker above the composer, in the same spot
+/// as the other dialogs (they never show together). Unlike the model picker's
+/// handful of options, a session listing can far exceed the panel, so the
+/// drawn rows window around the highlight to keep it always visible; the
+/// session this process is running is annotated so re-picking it reads as a
+/// deliberate no-op.
+fn draw_session_picker(frame: &mut Frame, app: &App, anchor: Rect, theme: Theme) {
+    let Some(picker) = &app.session_picker else {
+        return;
+    };
+    let rows = picker.sessions.len().min(MENU_MAX_ROWS);
+    let height = (rows as u16).saturating_add(2).min(anchor.y); // borders; clipped on tiny frames
+    if height < 3 {
+        return;
+    }
+    let area = Rect::new(anchor.x, anchor.y - height, anchor.width, height);
+    // Stateless window derived from the selection alone: top-anchored while
+    // the highlight fits, then the highlight rides the bottom row.
+    let start = picker.selected.saturating_sub(rows.saturating_sub(1));
+    let lines: Vec<Line> = picker
+        .sessions
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(rows)
+        .map(|(index, session)| {
+            let label = crate::resume::session_label(session);
+            let mut spans = if index == picker.selected {
+                vec![
+                    Span::styled("❯ ", theme.accent_strong()),
+                    Span::styled(label, theme.accent_strong()),
+                ]
+            } else {
+                vec![Span::raw("  "), Span::raw(label)]
+            };
+            if picker.current == Some(index) {
+                spans.push(Span::styled("  (current)", theme.muted()));
+            }
+            Line::from(spans)
+        })
+        .collect();
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).block(
+            Block::new()
+                .borders(Borders::ALL)
+                .title(
+                    Line::from(" Resume session — Enter to load, Esc to cancel ")
+                        .style(theme.accent_strong()),
+                )
+                .border_style(theme.divider()),
+        ),
+        area,
+    );
+}
+
+/// Whether the frame can spare a row for the mode hint.
+///
+/// The hint carries an affordance; every other pane carries content, so it is
+/// the first thing a short frame gives up: it takes its row only when doing so
+/// costs the composer and the plan nothing and still leaves the conversation
+/// its minimum. It is also hidden behind the approval panel, which replaces the
+/// composer the hint describes.
+fn mode_hint_height(app: &App, frame_height: u16, requested_bottom: u16) -> u16 {
+    if app.approval.is_some() {
+        return 0;
+    }
+    let unhinted = pane_heights(app, frame_height, requested_bottom, 0);
+    let hinted = pane_heights(app, frame_height, requested_bottom, MODE_HINT_HEIGHT);
+    if hinted != unhinted {
+        return 0;
+    }
+    // The conversation absorbs whatever the fixed panes leave, so it pays for
+    // the hint even when nothing else does.
+    let body = frame_height
+        .saturating_sub(HEADER_HEIGHT)
+        .saturating_sub(FOOTER_HEIGHT)
+        .saturating_sub(MODE_HINT_HEIGHT)
+        .saturating_sub(hinted.0)
+        .saturating_sub(hinted.1);
+    u16::from(body >= MIN_CONVERSATION_ROWS).saturating_mul(MODE_HINT_HEIGHT)
+}
+
+fn pane_heights(
+    app: &App,
+    frame_height: u16,
+    requested_bottom: u16,
+    hint_height: u16,
+) -> (u16, u16) {
+    let fixed = HEADER_HEIGHT
+        .saturating_add(FOOTER_HEIGHT)
+        .saturating_add(hint_height);
     let usable = frame_height.saturating_sub(fixed);
     let bottom = requested_bottom.min(usable);
     if app.approval.is_some() {
@@ -138,14 +350,17 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
     }
 
     let state = match app.status {
-        Status::Idle => Line::from(vec![Span::styled("●", theme.success()), Span::raw(" 就绪")]),
+        Status::Idle => Line::from(vec![
+            Span::styled("●", theme.success()),
+            Span::raw(" Ready"),
+        ]),
         Status::Running => Line::from(vec![
             Span::styled(app.activity_glyph(), theme.accent()),
-            Span::raw(" 处理中"),
+            Span::raw(" Working"),
         ]),
         Status::Compacting => Line::from(vec![
             Span::styled(app.activity_glyph(), theme.warning()),
-            Span::raw(" 整理上下文"),
+            Span::raw(" Compacting"),
         ]),
     };
     let brand_width = 12u16.min(area.width);
@@ -177,7 +392,7 @@ fn draw_plan(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
         .into_iter()
         .map(|task| plan_item_line(task, inner_width, theme))
         .collect();
-    let title = format!(" 计划 {completed}/{} ", app.plan.len());
+    let title = format!(" Plan {completed}/{} ", app.plan.len());
     let panel = Paragraph::new(Text::from(rows)).block(
         Block::new()
             .borders(Borders::TOP)
@@ -236,9 +451,9 @@ fn input_height(app: &App, width: u16) -> u16 {
 
 fn draw_input(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
     let title = match app.status {
-        Status::Idle => " 提问 ",
-        Status::Running => " 处理中 ",
-        Status::Compacting => " 整理上下文 ",
+        Status::Idle => " Prompt ",
+        Status::Running => " Working ",
+        Status::Compacting => " Compacting ",
     };
     let block = Block::bordered()
         .title(Line::from(title).style(if app.status == Status::Idle {
@@ -297,9 +512,9 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
 
     let content = if app.input.is_empty() {
         let placeholder = match app.status {
-            Status::Idle => "描述你想完成的任务",
-            Status::Running => "等待当前任务完成",
-            Status::Compacting => "正在整理会话上下文",
+            Status::Idle => "Describe what you want to get done",
+            Status::Running => "Waiting for the current turn to finish",
+            Status::Compacting => "Compacting session context",
         };
         Text::from(Line::from(placeholder).style(theme.muted()))
     } else {
@@ -350,46 +565,160 @@ fn caret_position(input: &str, inner_width: u16) -> (u16, u16) {
     (row, col)
 }
 
+/// Draws the mode hint in the row directly under the composer, left-aligned
+/// with the composer's first text column.
+///
+/// This sits beside the input box rather than in the footer because it is state
+/// you need *while typing* — what the next Enter is allowed to do — and it is a
+/// row of its own rather than a border title so the mode name is plain text at
+/// a fixed position instead of decoration on a frame.
+fn draw_mode_hint(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    if let Some(tag) = mode_tag(app, area.width, theme) {
+        frame.render_widget(Paragraph::new(tag), area);
+    }
+}
+
+/// The live permission mode and the key that cycles it.
+///
+/// The affordance drops before the mode does, and both drop before anything is
+/// truncated: a half-written mode name is worse than no mode name.
+fn mode_tag(app: &App, width: u16, theme: Theme) -> Option<Line<'static>> {
+    let label = mode_label(app.mode);
+    let label_style = mode_style(app.mode, theme);
+    // One leading cell puts the label under the composer's `›` prompt rather
+    // than under its border.
+    let with_hint = format!(" {label} · shift+tab");
+    if display_width(&with_hint) <= width {
+        return Some(Line::from(vec![
+            Span::styled(format!(" {label}"), label_style),
+            Span::styled(" · shift+tab", theme.muted()),
+        ]));
+    }
+    let bare = format!(" {label}");
+    (display_width(&bare) <= width).then(|| Line::from(Span::styled(bare, label_style)))
+}
+
+/// Colours the mode by how much of the human's judgement it delegates away, so
+/// that anything other than the ordinary approval loop is visible at a glance.
+///
+/// `default` stays muted on purpose: colour here means "you are not in the
+/// mode you think you are in", which only works if the common case is quiet.
+fn mode_style(mode: PermissionMode, theme: Theme) -> Style {
+    match mode {
+        // Read-only until the mode changes; the safest place to be.
+        PermissionMode::Plan => theme.success(),
+        // Every gate still asks.
+        PermissionMode::Default => theme.muted(),
+        // File edits land without a prompt; everything else still asks.
+        PermissionMode::AcceptEdits => theme.accent(),
+        // Unattended, but anything not pre-allowed is denied rather than run.
+        PermissionMode::DontAsk => theme.warning(),
+        // Every gate is off.
+        PermissionMode::BypassPermissions => theme.danger(),
+    }
+}
+
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let metadata = format!("{} · {}", app.model_name, mode_label(app.mode));
-    let metadata = truncate_display(&metadata, area.width.saturating_sub(1));
-    let mode_style = if app.mode == PermissionMode::BypassPermissions {
-        theme.warning()
-    } else {
-        theme.muted()
-    };
-
-    if !app.follow && area.width >= 24 {
-        let left_width = 14u16.min(area.width);
+    // The scroll hint takes the left end, so the metadata is fitted to whatever
+    // is actually left for it rather than to the whole row. The hint's slot is
+    // measured from the hint itself: a fixed width silently clipped it to
+    // "↑ earlier outp".
+    let hint_width = display_width(SCROLL_HINT);
+    let metadata_area = if !app.follow && area.width >= hint_width + MIN_METADATA_WIDTH {
         let [left, right] =
-            Layout::horizontal([Constraint::Length(left_width), Constraint::Min(0)]).areas(area);
+            Layout::horizontal([Constraint::Length(hint_width + 1), Constraint::Min(0)])
+                .areas(area);
         frame.render_widget(
-            Paragraph::new(Line::from("↑ 较早内容").style(theme.warning())),
+            Paragraph::new(Line::from(SCROLL_HINT).style(theme.warning())),
             left,
         );
-        frame.render_widget(
-            Paragraph::new(Line::from(metadata).style(mode_style)).alignment(Alignment::Right),
-            right,
-        );
+        right
     } else {
-        frame.render_widget(
-            Paragraph::new(Line::from(metadata).style(mode_style)).alignment(Alignment::Right),
-            area,
-        );
+        area
+    };
+    let metadata = footer_metadata(app, metadata_area.width.saturating_sub(1));
+    frame.render_widget(
+        Paragraph::new(Line::from(metadata).style(theme.muted())).alignment(Alignment::Right),
+        metadata_area,
+    );
+}
+
+/// Right-hand status text, fitted to `width` by dropping whole segments instead
+/// of truncating mid-label — a clipped `cach…` reads as a broken number.
+///
+/// Segments run least to most important, and dropping starts from the left, so
+/// a narrow terminal keeps the model and mode the run is actually using and a
+/// wide one also shows what the context is costing.
+fn footer_metadata(app: &App, width: u16) -> String {
+    // The permission mode lives on the composer ([`mode_tag`]), not here:
+    // showing it on both adjacent rows is noise.
+    let mut segments = usage_segments(&app.session_usage);
+    segments.push(app.model_name.clone());
+
+    while segments.len() > 1 && display_width(&segments.join(" · ")) > width {
+        segments.remove(0);
     }
+    // One segment may still overflow (a long model name on a narrow frame);
+    // only then is a truncation the lesser evil.
+    truncate_display(&segments.join(" · "), width)
+}
+
+/// Token counters worth showing, or nothing at all before the first response.
+///
+/// The cache share is the point of the whole prefix-stability design, so it is
+/// listed last: it is the segment that survives longest as the frame narrows.
+fn usage_segments(usage: &Usage) -> Vec<String> {
+    if usage.input_tokens == 0 && usage.output_tokens == 0 {
+        return Vec::new();
+    }
+    let mut segments = vec![
+        format!("in {}", format_tokens(usage.input_tokens)),
+        format!("out {}", format_tokens(usage.output_tokens)),
+    ];
+    // Providers report cached tokens as a subset of the input count, so the
+    // share is meaningful only once input has been counted.
+    if usage.input_tokens > 0 && usage.cached_input_tokens > 0 {
+        let percent = usage.cached_input_tokens.saturating_mul(100) / usage.input_tokens;
+        segments.push(format!("cache {percent}%"));
+    }
+    segments
+}
+
+/// Abbreviates a token count to at most four columns so the footer's width
+/// stays predictable as the numbers grow. Precision drops with magnitude: a
+/// status line is for noticing trends, not for accounting.
+fn format_tokens(tokens: u64) -> String {
+    match tokens {
+        0..1_000 => tokens.to_string(),
+        1_000..10_000 => one_decimal(tokens, 1_000, 'k'),
+        10_000..1_000_000 => format!("{}k", tokens / 1_000),
+        1_000_000..10_000_000 => one_decimal(tokens, 1_000_000, 'M'),
+        10_000_000..1_000_000_000 => format!("{}M", tokens / 1_000_000),
+        _ => one_decimal(tokens, 1_000_000_000, 'G'),
+    }
+}
+
+/// One decimal place, floored rather than rounded: `{:.1}` would turn 9_999
+/// into `10.0k` and silently widen the field the bands exist to bound.
+fn one_decimal(tokens: u64, unit: u64, suffix: char) -> String {
+    let tenths = tokens / (unit / 10);
+    format!("{}.{}{suffix}", tenths / 10, tenths % 10)
 }
 
 fn approval_lines(approval: &ApprovalRequest, width: u16, theme: Theme) -> Vec<Line<'static>> {
     let detail_rows = if width >= 46 { 2 } else { 1 };
     let summary = truncate_display(
-        &format!("操作  {}", approval.summary),
+        &format!("Action  {}", approval.summary),
         width.saturating_mul(detail_rows),
     );
     let scope = truncate_display(
-        &format!("范围  {}", approval.persistence_label()),
+        &format!("Scope  {}", approval.persistence_label()),
         width.saturating_mul(detail_rows),
     );
     let mut lines = wrap_lines(
@@ -400,15 +729,15 @@ fn approval_lines(approval: &ApprovalRequest, width: u16, theme: Theme) -> Vec<L
         width,
     );
 
-    let mut actions = vec![("y", "允许一次")];
+    let mut actions = vec![("y", "allow once")];
     if approval.allow_session.is_some() {
-        actions.push(("a", "本次会话允许"));
+        actions.push(("a", "allow for session"));
     }
-    actions.push(("n", "拒绝一次"));
+    actions.push(("n", "deny once"));
     if approval.deny_session.is_some() {
-        actions.push(("d", "本次会话拒绝"));
+        actions.push(("d", "deny for session"));
     }
-    actions.push(("Esc", "取消任务"));
+    actions.push(("Esc", "cancel turn"));
     lines.extend(action_lines(&actions, width, theme));
     lines
 }
@@ -451,7 +780,7 @@ fn char_widths(text: &str) -> u16 {
 fn draw_approval(frame: &mut Frame, lines: Vec<Line<'static>>, area: Rect, theme: Theme) {
     let panel = Paragraph::new(Text::from(lines)).block(
         Block::bordered()
-            .title(Line::from(" 需要授权 ").style(theme.warning()))
+            .title(Line::from(" Approval required ").style(theme.warning()))
             .border_style(theme.warning()),
     );
     frame.render_widget(panel, area);
@@ -482,14 +811,129 @@ mod tests {
     }
 
     #[test]
+    fn command_menu_pops_up_while_typing_a_command_name() {
+        let mut app = App::new("m", PermissionMode::Default);
+        app.set_input("/".to_string());
+        let mut terminal = Terminal::new(TestBackend::new(60, 16)).expect("test terminal");
+
+        terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
+
+        let rendered = format!("{}", terminal.backend());
+        assert!(rendered.contains("Commands"), "menu panel:\n{rendered}");
+        assert!(
+            rendered.contains("❯ /help"),
+            "first row starts highlighted:\n{rendered}"
+        );
+        assert!(rendered.contains("/quit"));
+
+        // Narrowing the prefix filters rows; the highlight follows the clamp.
+        app.set_input("/q".to_string());
+        terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
+        let rendered = format!("{}", terminal.backend());
+        assert!(rendered.contains("❯ /quit"));
+        assert!(
+            !rendered.contains("/help"),
+            "help filtered out:\n{rendered}"
+        );
+
+        // Leaving the command-name position hides the menu entirely.
+        app.set_input("hello".to_string());
+        terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
+        assert!(!format!("{}", terminal.backend()).contains("Commands"));
+    }
+
+    #[test]
+    fn model_picker_renders_options_with_the_current_model_annotated() {
+        let mut app = App::new("deepseek-v4-flash", PermissionMode::Default);
+        app.available_models = vec![
+            "deepseek-v4-pro".to_string(),
+            "deepseek-v4-flash".to_string(),
+        ];
+        app.open_model_picker();
+        let mut terminal = Terminal::new(TestBackend::new(60, 16)).expect("test terminal");
+
+        terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
+
+        let rendered = format!("{}", terminal.backend());
+        assert!(rendered.contains("Model"), "picker panel:\n{rendered}");
+        assert!(
+            rendered.contains("❯ deepseek-v4-flash"),
+            "the active model starts highlighted:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("(current)"),
+            "the active model is annotated:\n{rendered}"
+        );
+        assert!(rendered.contains("deepseek-v4-pro"));
+
+        // Closing the picker removes the panel.
+        app.model_picker = None;
+        terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
+        assert!(!format!("{}", terminal.backend()).contains("(current)"));
+    }
+
+    #[test]
+    fn session_picker_renders_and_windows_around_the_selection() {
+        use kuncode_agent::session_store::{SessionId, SessionSummary};
+
+        let mut app = App::new("m", PermissionMode::Default);
+        let sessions: Vec<SessionSummary> = (0..12u64)
+            .map(|index| SessionSummary {
+                id: SessionId::new(format!("session-{index:02}")),
+                title: None,
+                created_at: "2026-08-10T00:00:00.000Z".to_string(),
+                updated_at: "2026-08-10T00:00:00.000Z".to_string(),
+                message_count: index,
+                preview: Some(format!("task number {index:02}")),
+            })
+            .collect();
+        let active = SessionId::new("session-00");
+        app.open_session_picker(sessions, Some(&active));
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).expect("test terminal");
+
+        terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
+
+        let rendered = format!("{}", terminal.backend());
+        assert!(
+            rendered.contains("Resume session"),
+            "picker panel:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("❯ ") && rendered.contains("task number 00"),
+            "the active session starts highlighted:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("(current)"),
+            "the active session is annotated:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("task number 11"),
+            "rows beyond the window stay hidden:\n{rendered}"
+        );
+
+        // Moving the highlight past the window slides later rows into view.
+        app.session_picker.as_mut().expect("open").selected = 11;
+        terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
+        let rendered = format!("{}", terminal.backend());
+        assert!(rendered.contains("task number 11"));
+        assert!(!rendered.contains("task number 00"));
+
+        // Closing the picker removes the panel.
+        app.session_picker = None;
+        terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
+        assert!(!format!("{}", terminal.backend()).contains("Resume session"));
+    }
+
+    #[test]
     fn renders_key_elements_without_panicking() {
         let mut app = App::new("model-x", PermissionMode::Default);
         app.push_user("hi".to_string());
         app.conversation.push(Item::Tool {
             id: "1".to_string(),
             name: "bash".to_string(),
-            summary: "run ls".to_string(),
+            summary: "Run shell command: ls".to_string(),
             state: ToolState::Ok { truncated: false },
+            children: Vec::new(),
         });
         app.push_assistant("done".to_string());
 
@@ -506,7 +950,10 @@ mod tests {
             rendered.contains("model-x"),
             "status line should show model"
         );
-        assert!(rendered.contains("Bash"), "tool call should be visible");
+        assert!(
+            rendered.contains("Run shell command"),
+            "tool call should be visible"
+        );
     }
 
     #[test]
@@ -532,7 +979,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(60, 20)).expect("test terminal");
         terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
         let rendered = format!("{}", terminal.backend());
-        assert!(rendered.contains("计划 1/2"), "plan progress is shown");
+        assert!(rendered.contains("Plan 1/2"), "plan progress is shown");
         // The in_progress row shows the present-tense active_form, not content.
         assert!(
             rendered.contains("Doing second step"),
@@ -566,7 +1013,7 @@ mod tests {
 
         // All tasks done → the panel collapses, so its title is gone.
         assert!(
-            !rendered.contains("计划 2/2"),
+            !rendered.contains("Plan 2/2"),
             "an all-completed plan hides the panel"
         );
     }
@@ -592,7 +1039,7 @@ mod tests {
         terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
         let rendered = format!("{}", terminal.backend());
 
-        assert!(rendered.contains("计划 8/10"));
+        assert!(rendered.contains("Plan 8/10"));
         assert!(rendered.contains("Executing task 9"));
 
         let mut terminal = Terminal::new(TestBackend::new(32, 10)).expect("small terminal");
@@ -646,7 +1093,7 @@ mod tests {
                 .draw(|frame| draw(frame, &mut app))
                 .expect("responsive draw");
             let rendered = format!("{}", terminal.backend());
-            assert!(rendered.contains("需要授权"));
+            assert!(rendered.contains("Approval required"));
             assert!(rendered.contains("[y]"));
             assert!(rendered.contains("[n]"));
         }
@@ -776,6 +1223,204 @@ mod tests {
         );
     }
 
+    fn usage(input: u64, output: u64, cached: u64) -> Usage {
+        Usage {
+            input_tokens: input,
+            output_tokens: output,
+            cached_input_tokens: cached,
+            ..Usage::default()
+        }
+    }
+
+    #[test]
+    fn a_fresh_session_shows_only_the_model() {
+        let app = App::new("deepseek-v4-flash", PermissionMode::Default);
+        assert_eq!(footer_metadata(&app, 80), "deepseek-v4-flash");
+    }
+
+    #[test]
+    fn footer_reports_tokens_and_the_cache_share() {
+        let mut app = App::new("deepseek-v4-flash", PermissionMode::Default);
+        app.add_usage(usage(12_345, 2_100, 11_600));
+
+        assert_eq!(
+            footer_metadata(&app, 80),
+            "in 12k · out 2.1k · cache 93% · deepseek-v4-flash",
+        );
+    }
+
+    #[test]
+    fn a_provider_without_cache_reporting_omits_the_share() {
+        let mut app = App::new("gpt-test", PermissionMode::Default);
+        app.add_usage(usage(900, 120, 0));
+
+        assert_eq!(footer_metadata(&app, 80), "in 900 · out 120 · gpt-test");
+    }
+
+    #[test]
+    fn a_narrow_footer_drops_whole_segments_least_important_first() {
+        let mut app = App::new("deepseek-v4-flash", PermissionMode::Default);
+        app.add_usage(usage(12_345, 2_100, 11_600));
+
+        // Wide enough for the cache share but not the raw counts.
+        assert_eq!(footer_metadata(&app, 35), "cache 93% · deepseek-v4-flash");
+        // Only the model survives; no label is cut in half.
+        assert_eq!(footer_metadata(&app, 20), "deepseek-v4-flash");
+    }
+
+    #[test]
+    fn the_composer_carries_the_mode_and_its_key() {
+        let mut app = App::new("m", PermissionMode::AcceptEdits);
+        let theme = Theme::new(false);
+
+        let wide = mode_tag(&app, 40, theme).expect("a wide row shows both");
+        assert_eq!(wide.to_string(), " accept-edits · shift+tab");
+
+        // Narrow: the affordance goes before the state does.
+        let narrow = mode_tag(&app, 20, theme).expect("the mode alone still fits");
+        assert_eq!(narrow.to_string(), " accept-edits");
+        assert!(mode_tag(&app, 8, theme).is_none(), "nothing is truncated");
+
+        app.mode = PermissionMode::Default;
+        assert_eq!(
+            mode_tag(&app, 40, theme)
+                .expect("always tagged")
+                .to_string(),
+            " default · shift+tab",
+        );
+    }
+
+    #[test]
+    fn the_mode_hint_owns_the_row_under_the_composer() {
+        let mut app = App::new("m", PermissionMode::Plan);
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).expect("test terminal");
+        terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
+
+        let buffer = terminal.backend().buffer();
+        // Frame: header(2) + body + composer(3) + hint(1) + footer(1); the hint
+        // is the second-to-last row, and it starts one cell in so the label
+        // lines up with the composer's prompt column rather than its border.
+        let row: String = (0..40u16)
+            .map(|x| buffer.cell((x, 10)).expect("cell").symbol().to_string())
+            .collect();
+        assert_eq!(row.trim_end(), " plan · shift+tab", "hint row: {row:?}");
+        // The composer's own bottom border stays undecorated.
+        let border: String = (0..40u16)
+            .map(|x| buffer.cell((x, 9)).expect("cell").symbol().to_string())
+            .collect();
+        assert!(!border.contains("plan"), "composer border: {border:?}");
+    }
+
+    #[test]
+    fn each_mode_reads_differently_at_a_glance() {
+        let theme = Theme::new(true);
+        let styled: Vec<Style> = [
+            PermissionMode::Default,
+            PermissionMode::AcceptEdits,
+            PermissionMode::Plan,
+            PermissionMode::DontAsk,
+            PermissionMode::BypassPermissions,
+        ]
+        .into_iter()
+        .map(|mode| mode_style(mode, theme))
+        .collect();
+
+        for (index, style) in styled.iter().enumerate() {
+            for other in &styled[index + 1..] {
+                assert_ne!(style, other, "two modes share a style");
+            }
+        }
+        // The mode with no gates left must be the loudest one.
+        assert_eq!(
+            mode_style(PermissionMode::BypassPermissions, theme),
+            theme.danger(),
+        );
+        // `NO_COLOR` collapses the palette, so the label carries the meaning.
+        let plain = Theme::new(false);
+        assert_eq!(
+            mode_style(PermissionMode::BypassPermissions, plain).fg,
+            None,
+        );
+    }
+
+    #[test]
+    fn the_approval_panel_takes_the_hint_row_back() {
+        let mut app = App::new("m", PermissionMode::Plan);
+        app.set_approval(approval("run cargo test --workspace"));
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).expect("test terminal");
+        terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
+
+        let rendered = format!("{}", terminal.backend());
+        assert!(rendered.contains("Approval required"), "{rendered}");
+        assert!(
+            !rendered.contains("shift+tab"),
+            "the hint describes a composer that is not on screen:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn one_oversized_segment_is_truncated_rather_than_dropped() {
+        let app = App::new("a-very-long-model-identifier", PermissionMode::Default);
+        let metadata = footer_metadata(&app, 5);
+
+        assert_eq!(display_width(&metadata), 5, "{metadata}");
+        assert!(metadata.ends_with('…'), "{metadata}");
+    }
+
+    #[test]
+    fn the_scroll_hint_and_the_metadata_share_the_footer_row() {
+        let mut app = App::new("m", PermissionMode::Default);
+        app.add_usage(usage(12_345, 2_100, 11_600));
+        // The hint only claims the left end once there is history to be off
+        // the tail of; an empty transcript re-follows on the next draw.
+        for line in 0..20 {
+            app.push_user(format!("line {line}"));
+        }
+        app.scroll_up(50);
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).expect("test terminal");
+        terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
+
+        let rendered = format!("{}", terminal.backend());
+        assert!(rendered.contains("↑ earlier output"), "{rendered}");
+        assert!(rendered.contains("cache 93%"), "{rendered}");
+    }
+
+    #[test]
+    fn token_counts_abbreviate_within_four_columns() {
+        // Band edges included: rounding at one of these is what widens a field.
+        for tokens in [
+            0,
+            999,
+            1_000,
+            9_999,
+            10_000,
+            999_999,
+            1_000_000,
+            9_999_999,
+            10_000_000,
+            999_999_999,
+        ] {
+            let formatted = format_tokens(tokens);
+            assert!(
+                display_width(&formatted) <= 4,
+                "{tokens} rendered as {formatted}",
+            );
+        }
+        assert_eq!(format_tokens(999), "999");
+        assert_eq!(format_tokens(1_000), "1.0k");
+        assert_eq!(
+            format_tokens(9_999),
+            "9.9k",
+            "floored, not rounded to 10.0k"
+        );
+        assert_eq!(format_tokens(12_345), "12k");
+        assert_eq!(format_tokens(999_999), "999k");
+        assert_eq!(format_tokens(1_500_000), "1.5M");
+    }
+
     #[test]
     fn compaction_status_and_completion_render_without_token_values() {
         // Given
@@ -793,7 +1438,7 @@ mod tests {
 
         // Then
         let rendered = format!("{}", terminal.backend());
-        assert!(rendered.contains("整理上下文"));
+        assert!(rendered.contains("Compacting"));
         assert!(!rendered.contains("98765"));
 
         // When
@@ -814,7 +1459,7 @@ mod tests {
 
         // Then
         let rendered = format!("{}", terminal.backend());
-        assert!(rendered.contains("上下文已整理"));
+        assert!(rendered.contains("Context compacted"));
         assert!(!rendered.contains("98765"));
         assert!(!rendered.contains("12345"));
     }

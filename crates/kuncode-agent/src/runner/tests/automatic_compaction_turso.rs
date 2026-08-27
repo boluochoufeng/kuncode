@@ -12,10 +12,15 @@ use super::support::{
 // These scenarios distinguish journal-backed active messages from the final
 // request-only runtime envelope and verify commit-before-install ordering.
 
+use std::path::Path;
+
+use kuncode_core::completion::{ToolResult, ToolResultContent};
+
 use crate::session_store::{
     Checkpoint, CommittedArtifact, CommittedCompaction, JournalEntry, NewCheckpoint,
     NewCompactionCommit, NewJournalEntry, NewToolArtifact, SessionStoreError,
 };
+use crate::tool::{FileStamp, ReadState};
 use tokio::sync::Notify;
 
 const MALICIOUS_SUMMARY_TEXT: &str =
@@ -184,6 +189,104 @@ async fn enabled_runner_commits_turso_compaction_before_sending_reduced_request(
             "model_start",
             "assistant",
         ]
+    );
+}
+
+/// One closed read exchange: the assistant's call and the result answering it.
+fn read_exchange(call_id: &str, path: &str) -> [Message; 2] {
+    [
+        Message::Assistant {
+            id: None,
+            content: NonEmptyVec::new(AssistantContent::tool_call(
+                call_id,
+                "read_file",
+                serde_json::json!({ "path": path }),
+            )),
+        },
+        Message::User {
+            content: NonEmptyVec::new(UserContent::ToolResult(ToolResult {
+                id: call_id.to_string(),
+                call_id: None,
+                content: NonEmptyVec::new(ToolResultContent::text("contents of the file")),
+            })),
+        },
+    ]
+}
+
+#[tokio::test]
+async fn compaction_evicts_sightings_whose_reads_left_the_active_context() {
+    // Given: an old read exchange headed for the summary and a recent one that
+    // the protected tail keeps, each with a ledger sighting bound to its call
+    // id the way the runner binds one before executing the call.
+    let root = TestDir::new();
+    let store = Arc::new(
+        TursoSessionStore::open(root.path().join("sessions.db"))
+            .await
+            .expect("store should open"),
+    );
+    let session_id = store
+        .create_session(NewSession::new(root.path().to_path_buf()))
+        .await
+        .expect("session should be created");
+    let mut session = AgentSession::new();
+    session
+        .attach_session_id(session_id.clone())
+        .expect("fresh session should attach");
+    let [old_call, old_result] = read_exchange("read-old", "old.txt");
+    let [new_call, new_result] = read_exchange("read-new", "new.txt");
+    for (message, human) in [
+        (Message::user("fix the old failure"), true),
+        (old_call, false),
+        (old_result, false),
+        (new_call, false),
+        (new_result, false),
+    ] {
+        let seq = store
+            .append(
+                &session_id,
+                NewJournalEntry::message(&message).expect("history should encode"),
+            )
+            .await
+            .expect("history should persist");
+        if human {
+            session.push_human_with_journal_seq(message, Some(seq));
+        } else {
+            session.push_with_journal_seq(message, Some(seq));
+        }
+    }
+    let ledger = session.read_ledger();
+    ledger
+        .witnessed_by("read-old")
+        .record(Path::new("/w/old.txt"), FileStamp::default());
+    ledger
+        .witnessed_by("read-new")
+        .record(Path::new("/w/new.txt"), FileStamp::default());
+    let model = FakeModel::new([
+        response(AssistantContent::text(summary_json())),
+        response(AssistantContent::text("continued from compacted context")),
+    ]);
+    let mut runner =
+        configured_runner(model.clone(), CompactionMode::Enabled).with_session_store(store.clone());
+    runner.token_estimator = Arc::new(RequestShapeEstimator::default());
+    runner.group_estimator = Arc::new(FixedRunnerGroupEstimator(100));
+
+    // When
+    runner
+        .run_turn(&mut session, "implement the next change")
+        .await
+        .expect("durable pressure should compact and continue");
+
+    // Then: old.txt's reading went out with the summary, so its sighting no
+    // longer licenses a whole-file write; new.txt's result survived in the
+    // protected tail, so its licence stands.
+    let ledger = session.read_ledger();
+    assert_eq!(
+        ledger.state(Path::new("/w/old.txt"), FileStamp::default()),
+        ReadState::Evicted
+    );
+    assert_eq!(
+        ledger.state(Path::new("/w/new.txt"), FileStamp::default()),
+        ReadState::Current
     );
 }
 
@@ -410,6 +513,14 @@ impl CommitGateStore {
 impl SessionStore for CommitGateStore {
     async fn create_session(&self, session: NewSession) -> Result<SessionId, SessionStoreError> {
         self.inner.create_session(session).await
+    }
+
+    async fn list_sessions(
+        &self,
+        project_root: &std::path::Path,
+        limit: usize,
+    ) -> Result<Vec<crate::session_store::SessionSummary>, SessionStoreError> {
+        self.inner.list_sessions(project_root, limit).await
     }
 
     async fn append(

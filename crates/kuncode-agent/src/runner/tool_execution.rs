@@ -4,7 +4,8 @@ use std::time::Instant;
 
 use kuncode_core::{
     completion::{
-        AssistantContent, CompletionModel, Message, ToolResult, ToolResultContent, UserContent,
+        AssistantContent, CompletionModel, Message, ToolResult, ToolResultContent, Usage,
+        UserContent,
     },
     non_empty_vec::NonEmptyVec,
 };
@@ -18,30 +19,50 @@ use crate::{
     tool::{ToolContext, ToolErrorKind, ToolOutput, ToolResultRetention},
 };
 
-use super::{AgentRunner, CallOutcome, PendingToolCall, cancellation::cancellable};
+use super::{
+    AgentRunner, CallOutcome, PendingToolCall, cancellation::cancellable,
+    subagent::SubagentUsageMeter,
+};
 
 impl<M> AgentRunner<M>
 where
     M: CompletionModel,
 {
+    /// Executes one batch of tool calls, returning the provider usage consumed
+    /// by subagent runs the batch delegated (zero when none ran). On an
+    /// unwinding error that usage is lost, like the rest of a failed turn's
+    /// accounting.
     pub(super) async fn execute_tool_calls(
         &self,
         session: &mut AgentSession,
         tool_calls: Vec<PendingToolCall>,
         iteration: usize,
         cancel: &CancellationToken,
-    ) -> Result<(), AgentError> {
+    ) -> Result<Usage, AgentError> {
         // `PostToolUse` feedback is buffered and flushed only after the whole
         // batch's tool_results are written: a tool_call's results must stay
         // contiguous in the next user content, so a feedback message must not be
         // interleaved between two tool_results (providers reject that).
         let mut feedback = Vec::new();
+        let subagent_usage = SubagentUsageMeter::default();
 
         for index in 0..tool_calls.len() {
-            let ctx = ToolContext::with_cancel(cancel.clone())
-                .with_todos(session.todo_handle())
-                .with_reads(session.read_ledger());
             let id = tool_calls[index].id.clone();
+            // The ledger handle is bound to this call's id, so a file sighting
+            // it records can later be matched against the tool results still in
+            // the active context — and evicted when compaction drops this one.
+            let mut ctx = ToolContext::with_cancel(cancel.clone())
+                .with_todos(session.todo_handle())
+                .with_reads(session.read_ledger().witnessed_by(&id));
+            // Snapshotted per call, not per batch, so a session grant approved
+            // by an earlier call in this batch already reaches the next
+            // delegation's inherited overlay — and a `fork` snapshot includes
+            // results recorded earlier in this batch.
+            if let Some(driver) =
+                self.turn_subagent_driver(session, &subagent_usage, &tool_calls[index])
+            {
+                ctx = ctx.with_subagents(driver);
+            }
             let call_id = tool_calls[index].call_id.clone();
             let name = tool_calls[index].name.clone();
             let arguments = tool_calls[index].arguments.clone();
@@ -177,7 +198,7 @@ where
             self.push_user_message(session, text).await;
         }
 
-        Ok(())
+        Ok(super::subagent::accrued_usage(&subagent_usage))
     }
 
     /// Pairs every still-unexecuted tool_call with a synthetic interrupted

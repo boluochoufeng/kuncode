@@ -18,7 +18,7 @@ const DEFAULT_LEVEL: &str = "info";
 /// Every target the crates actually emit on. The filter is `off` plus these, so
 /// a target missing here is discarded outright — keep it in step with the
 /// `target:` names in the source, not with module paths.
-const PROJECT_TARGETS: [&str; 9] = [
+const PROJECT_TARGETS: [&str; 11] = [
     "kuncode::agent",
     "kuncode::authorization",
     "kuncode::compaction",
@@ -27,6 +27,8 @@ const PROJECT_TARGETS: [&str; 9] = [
     "kuncode::persistence",
     "kuncode::provider",
     "kuncode::runtime",
+    "kuncode::skill",
+    "kuncode::subagent",
     "kuncode::tool",
 ];
 const LOG_DIRECTORY: &str = ".kuncode/logs";
@@ -508,6 +510,19 @@ impl AgentObserver for LoggingObserver {
                 error_kind = %kind,
                 diagnostic_chars = message.chars().count(),
                 "agent turn failed",
+            ),
+            // The nested run's own pipeline already logs through tracing
+            // (kuncode::agent / kuncode::tool fire globally from the sub
+            // loop), so the envelope only records the relay attribution.
+            EventKind::Subagent {
+                parent_tool_call_id,
+                event,
+            } => tracing::debug!(
+                target: "kuncode::subagent",
+                seq,
+                parent_tool_call_id = %parent_tool_call_id,
+                inner_seq = event.seq,
+                "subagent event relayed",
             ),
             EventKind::TodoUpdate { todos } => tracing::debug!(
                 target: "kuncode::agent",

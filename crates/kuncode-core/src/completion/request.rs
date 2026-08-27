@@ -170,7 +170,13 @@ impl AddAssign for Usage {
 /// `Response` is the provider's native response payload; it must be
 /// serializable so callers can persist or replay it. `Client` is the
 /// provider-specific HTTP/SDK client used to construct model instances.
-pub trait CompletionModel: Clone + Send + Sync {
+///
+/// `'static` is part of the contract: model handles own their data (clients
+/// hold shared pools, not borrows), and consumers erase runner snapshots into
+/// trait objects (e.g. the subagent driver), which trait objects require.
+/// Declaring it here keeps that single fact from being re-stated as a
+/// `+ 'static` bound on every impl block that touches such a seam.
+pub trait CompletionModel: Clone + Send + Sync + 'static {
     /// Provider-native response payload retained in [`CompletionResponse`].
     type Response: Send + Sync + Serialize + DeserializeOwned;
     /// Provider-specific client type used to construct model handles.

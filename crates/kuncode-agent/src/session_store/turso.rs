@@ -12,9 +12,9 @@ use chrono::{SecondsFormat, Utc};
 use tokio::sync::Mutex;
 
 use super::{
-    Checkpoint, CommittedArtifact, CommittedCompaction, JournalEntry, JournalSnapshot,
+    Checkpoint, CommittedArtifact, CommittedCompaction, JournalEntry, JournalKind, JournalSnapshot,
     NewCheckpoint, NewCompactionCommit, NewJournalEntry, NewSession, NewToolArtifact, Seq,
-    SessionId, SessionStore, SessionStoreError,
+    SessionId, SessionStore, SessionStoreError, SessionSummary, dto,
 };
 
 mod artifact;
@@ -167,6 +167,64 @@ impl SessionStore for TursoSessionStore {
             )
             .await?;
         Ok(id)
+    }
+
+    async fn list_sessions(
+        &self,
+        project_root: &Path,
+        limit: usize,
+    ) -> Result<Vec<SessionSummary>, SessionStoreError> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let connection = self.connection.lock().await;
+        // Message-less sessions are excluded in the query, not post-filtered:
+        // dropping rows after LIMIT would under-fill the page even when more
+        // resumable sessions exist.
+        let mut rows = connection
+            .query(
+                r#"
+                SELECT id, title, created_at, updated_at
+                FROM sessions
+                WHERE project_root = ?1
+                  AND EXISTS (
+                    SELECT 1 FROM journal_entries
+                    WHERE session_id = sessions.id AND kind = ?2
+                  )
+                ORDER BY updated_at DESC, id DESC
+                LIMIT ?3
+                "#,
+                (
+                    project_root.to_string_lossy().as_ref(),
+                    JournalKind::Message.as_str(),
+                    limit,
+                ),
+            )
+            .await?;
+        let mut headers = Vec::new();
+        while let Some(row) = rows.next().await? {
+            headers.push((
+                SessionId::new(row.get::<String>(0)?),
+                row.get::<Option<String>>(1)?,
+                row.get::<String>(2)?,
+                row.get::<String>(3)?,
+            ));
+        }
+
+        // One follow-up query pair per row instead of correlated subqueries in
+        // the projection; the row count is already bounded by `limit`.
+        let mut summaries = Vec::with_capacity(headers.len());
+        for (id, title, created_at, updated_at) in headers {
+            let message_count = message_count(&connection, &id).await?;
+            let preview = first_message_preview(&connection, &id).await?;
+            summaries.push(SessionSummary {
+                id,
+                title,
+                created_at,
+                updated_at,
+                message_count,
+                preview,
+            });
+        }
+        Ok(summaries)
     }
 
     async fn append(
@@ -395,6 +453,80 @@ async fn snapshot(
             Err(error)
         }
     }
+}
+
+/// Longest preview retained per session row; display layers may trim further.
+const PREVIEW_MAX_CHARS: usize = 120;
+
+async fn message_count(
+    connection: &Connection,
+    session: &SessionId,
+) -> Result<u64, SessionStoreError> {
+    let mut rows = connection
+        .query(
+            "SELECT COUNT(*) FROM journal_entries WHERE session_id = ?1 AND kind = ?2",
+            (session.as_str(), JournalKind::Message.as_str()),
+        )
+        .await?;
+    let row = rows
+        .next()
+        .await?
+        .ok_or(::turso::Error::QueryReturnedNoRows)?;
+    let count = row
+        .get::<i64>(0)
+        .map_err(|error| journal_integrity(session, error.to_string()))?;
+    u64::try_from(count).map_err(|_| {
+        journal_integrity(
+            session,
+            format!("message count must be non-negative: {count}"),
+        )
+    })
+}
+
+/// Reads the earliest journaled message and projects its first text line.
+///
+/// Listing tolerates undecodable payloads (`None` preview) so one corrupt or
+/// future-versioned session cannot make the whole picker unavailable.
+async fn first_message_preview(
+    connection: &Connection,
+    session: &SessionId,
+) -> Result<Option<String>, SessionStoreError> {
+    let mut rows = connection
+        .query(
+            r#"
+            SELECT payload_json
+            FROM journal_entries
+            WHERE session_id = ?1 AND kind = ?2
+            ORDER BY seq ASC
+            LIMIT 1
+            "#,
+            (session.as_str(), JournalKind::Message.as_str()),
+        )
+        .await?;
+    let Some(row) = rows.next().await? else {
+        return Ok(None);
+    };
+    let payload = row.get::<String>(0)?;
+    let preview = serde_json::from_str(&payload)
+        .map_err(SessionStoreError::from)
+        .and_then(dto::message_from_value)
+        .ok()
+        .and_then(|message| message_preview_text(&message));
+    Ok(preview)
+}
+
+fn message_preview_text(message: &kuncode_core::completion::Message) -> Option<String> {
+    use kuncode_core::completion::{Message, UserContent};
+
+    let text = match message {
+        Message::User { content } => content.iter().find_map(|block| match block {
+            UserContent::Text(text) => Some(text.text_ref()),
+            UserContent::ToolResult(_) => None,
+        }),
+        Message::System { .. } | Message::Assistant { .. } => None,
+    }?;
+    let line = text.lines().map(str::trim).find(|line| !line.is_empty())?;
+    Some(line.chars().take(PREVIEW_MAX_CHARS).collect())
 }
 
 fn journal_integrity(session: &SessionId, message: String) -> SessionStoreError {

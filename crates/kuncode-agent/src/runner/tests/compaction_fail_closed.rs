@@ -32,6 +32,15 @@ impl SessionStore for AmbiguousStore {
         self.inner.create_session(session).await
     }
 
+    async fn list_sessions(
+        &self,
+        project_root: &std::path::Path,
+        limit: usize,
+    ) -> Result<Vec<crate::session_store::SessionSummary>, crate::session_store::SessionStoreError>
+    {
+        self.inner.list_sessions(project_root, limit).await
+    }
+
     async fn append(
         &self,
         session: &SessionId,

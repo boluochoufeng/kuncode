@@ -1,7 +1,4 @@
-//! Atomic checkpoint persistence reserved for future active-context resume.
-//!
-//! Version 1 writes these records, but the runtime does not read them to resume
-//! sessions yet.
+//! Atomic checkpoint persistence backing active-context resume.
 
 use ::turso::{Connection, Row, transaction::TransactionBehavior};
 use tokio::sync::Mutex;

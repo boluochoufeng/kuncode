@@ -293,11 +293,15 @@ fn mode_contribution(
         },
         PermissionMode::Plan => match check.target() {
             PermissionTarget::Read(_) | PermissionTarget::TodoWrite => return Ok(None),
+            // TaskWrite is denied unlike TodoWrite: the task store is a
+            // cross-session disk side effect, and a plan turn must leave no
+            // trace outside the conversation.
             PermissionTarget::Edit(_)
             | PermissionTarget::Bash(_)
             | PermissionTarget::WebFetch(_)
             | PermissionTarget::Mcp(_)
             | PermissionTarget::Agent(_)
+            | PermissionTarget::TaskWrite
             | PermissionTarget::ExactTool(_) => PolicyEffect::Deny,
         },
         PermissionMode::BypassPermissions => PolicyEffect::Allow,
@@ -415,6 +419,26 @@ mod tests {
             .expect("policy resolves");
         assert_eq!(plan.effect(), super::super::AuthorizationEffect::Deny);
         assert_eq!(accept.effect(), super::super::AuthorizationEffect::Allow);
+    }
+
+    #[test]
+    fn plan_denies_task_write_even_with_an_allowing_profile() {
+        let request = typed_request(
+            PermissionTarget::TaskWrite,
+            super::super::ProfileDefault::Allow,
+        );
+        let policy = PolicySet::new(root());
+
+        let plan = policy
+            .resolve(&request, &[], PermissionMode::Plan, &[])
+            .expect("policy resolves");
+        let default = policy
+            .resolve(&request, &[], PermissionMode::Default, &[])
+            .expect("policy resolves");
+        // Unlike TodoWrite, the durable store is a disk side effect a plan
+        // turn must not leave behind; outside Plan the Allow profile stands.
+        assert_eq!(plan.effect(), super::super::AuthorizationEffect::Deny);
+        assert_eq!(default.effect(), super::super::AuthorizationEffect::Allow);
     }
 
     #[test]

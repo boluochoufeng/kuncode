@@ -20,6 +20,8 @@ use crate::non_empty_vec::NonEmptyVec;
 struct StreamChunk<U> {
     #[serde(default)]
     choices: Vec<ChunkChoice>,
+    /// Model id the provider reports as serving this frame.
+    model: Option<String>,
     /// Present only on the final frame when `stream_options.include_usage` is set.
     usage: Option<U>,
     /// Set when the endpoint reports a failure *mid-stream* as a data frame
@@ -145,6 +147,8 @@ struct StreamAssembler {
     tool_calls: Vec<PartialToolCall>,
     finish_reason: Option<String>,
     usage: Option<Usage>,
+    /// Last provider-reported served-model id seen across the frames.
+    model: Option<String>,
 }
 
 impl StreamAssembler {
@@ -157,6 +161,9 @@ impl StreamAssembler {
     {
         if let Some(usage) = chunk.usage {
             self.usage = Some(usage.into());
+        }
+        if let Some(model) = chunk.model {
+            self.model = Some(model);
         }
         let mut events = Vec::new();
         for choice in chunk.choices {
@@ -263,6 +270,7 @@ impl StreamAssembler {
             content,
             usage: self.usage.unwrap_or_default(),
             finish_reason: map_finish_reason(self.finish_reason.as_deref()),
+            model: self.model,
         })
     }
 }
@@ -317,7 +325,14 @@ pub(crate) fn validate_stream_content_type(
 /// [`StreamAssembler`], yielding render deltas as they arrive and a final
 /// [`StreamEvent::Completed`] once the body ends or `[DONE]` is seen. Dropping
 /// the returned stream closes the HTTP response and halts generation.
-pub(crate) fn stream_events<U>(mut response: reqwest::Response) -> CompletionStream
+///
+/// `requested_model` is the model id the request named; the terminal event's
+/// provider-reported served model is checked against it (see
+/// [`check_served_model`](super::check_served_model)).
+pub(crate) fn stream_events<U>(
+    mut response: reqwest::Response,
+    requested_model: String,
+) -> CompletionStream
 where
     U: DeserializeOwned + Into<Usage> + Send + 'static,
 {
@@ -343,7 +358,11 @@ where
                 }
             }
         }
-        yield assembler.finish()?;
+        let completed = assembler.finish()?;
+        if let StreamEvent::Completed { model, .. } = &completed {
+            super::check_served_model(&requested_model, model.as_deref());
+        }
+        yield completed;
     })
 }
 
@@ -415,6 +434,37 @@ data: [DONE]
         let (content, finish) = completed(events);
         assert_eq!(finish, FinishReason::Stop);
         assert!(matches!(content.first(), AssistantContent::Text(t) if t.text_ref() == "Hello"));
+    }
+
+    #[test]
+    fn served_model_is_captured_from_the_frames() {
+        // Real chunk frames carry `model` on every frame; the last one wins.
+        let sse = "\
+data: {\"model\":\"deepseek-v4-pro\",\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"finish_reason\":null}]}
+
+data: {\"model\":\"deepseek-v4-pro\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}
+
+data: [DONE]
+
+";
+        let events = run(sse, 4096);
+        match events.into_iter().next_back().expect("Completed") {
+            StreamEvent::Completed { model, .. } => {
+                assert_eq!(model.as_deref(), Some("deepseek-v4-pro"));
+            }
+            other => panic!("last event was not Completed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn served_model_is_none_when_frames_omit_it() {
+        // TEXT_STREAM's frames carry no `model` field: absence must surface as
+        // None (no claim), never as a fabricated id.
+        let events = run(TEXT_STREAM, 4096);
+        match events.into_iter().next_back().expect("Completed") {
+            StreamEvent::Completed { model, .. } => assert_eq!(model, None),
+            other => panic!("last event was not Completed: {other:?}"),
+        }
     }
 
     #[test]

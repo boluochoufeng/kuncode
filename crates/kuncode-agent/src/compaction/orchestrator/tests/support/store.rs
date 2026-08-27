@@ -34,6 +34,14 @@ impl SessionStore for UnknownCommitStore {
         self.inner.create_session(session).await
     }
 
+    async fn list_sessions(
+        &self,
+        project_root: &std::path::Path,
+        limit: usize,
+    ) -> Result<Vec<crate::session_store::SessionSummary>, SessionStoreError> {
+        self.inner.list_sessions(project_root, limit).await
+    }
+
     async fn append(
         &self,
         session: &SessionId,
@@ -87,6 +95,14 @@ impl SessionStore for UnknownCommitStore {
 impl SessionStore for RejectedReceiptStore {
     async fn create_session(&self, session: NewSession) -> Result<SessionId, SessionStoreError> {
         self.inner.create_session(session).await
+    }
+
+    async fn list_sessions(
+        &self,
+        project_root: &std::path::Path,
+        limit: usize,
+    ) -> Result<Vec<crate::session_store::SessionSummary>, SessionStoreError> {
+        self.inner.list_sessions(project_root, limit).await
     }
 
     async fn append(

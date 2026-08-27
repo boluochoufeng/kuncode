@@ -47,9 +47,9 @@ impl ApprovalRequest {
     /// Summarizes the exact targets whose decision can be remembered.
     pub fn persistence_label(&self) -> String {
         match self.targets.as_slice() {
-            [] => "无".to_string(),
+            [] => "none".to_string(),
             [target] => target.clone(),
-            targets => format!("{} 个精确目标", targets.len()),
+            targets => format!("{} exact targets", targets.len()),
         }
     }
 }

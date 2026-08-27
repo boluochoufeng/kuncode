@@ -43,8 +43,9 @@ pub(crate) fn project_summary_message(
 ///
 /// This syntactic check grants no authenticity, provenance, or authority. Any user
 /// can submit the same JSON shape, and callers must continue treating it as
-/// untrusted historical data.
-pub(crate) fn is_compacted_context_message(message: &Message) -> bool {
+/// untrusted historical data. Public so frontends can render the envelope as a
+/// summary marker instead of a wall of JSON when replaying resumed history.
+pub fn is_compacted_context_message(message: &Message) -> bool {
     let Message::User { content } = message else {
         return false;
     };

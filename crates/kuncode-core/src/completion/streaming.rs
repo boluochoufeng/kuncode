@@ -77,6 +77,11 @@ pub enum StreamEvent {
         usage: Usage,
         /// Provider stop reason normalized for agent-loop control flow.
         finish_reason: FinishReason,
+        /// Model id the provider reports as having served the request, when
+        /// the wire frames carry one. This is the provider's own claim — the
+        /// positive evidence that a model switch (or the startup selection)
+        /// actually took effect server-side.
+        model: Option<String>,
     },
 }
 

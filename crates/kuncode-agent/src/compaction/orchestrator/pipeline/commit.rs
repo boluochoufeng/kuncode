@@ -10,7 +10,7 @@ use super::super::{
     candidate::CandidateState,
     types::{
         CompactionDependencies, CompactionError, CompactionOutcome, CompactionPass,
-        CompactionReport,
+        CompactionReport, CompactionTrigger,
     },
 };
 use crate::{
@@ -83,10 +83,17 @@ pub(super) async fn commit_and_install(
         .map(persisted_pass)
         .collect::<Vec<_>>();
     durable_passes.push(CompactionPassKind::AtomicCommit);
-    let reason = match plan.before.level(input.config) {
-        BudgetLevel::Soft => CompactionReason::SoftThreshold,
-        BudgetLevel::Hard => CompactionReason::HardThreshold,
-        BudgetLevel::Normal => return Err(CompactionError::InvalidThresholds),
+    // A manual request is recorded as such: it legitimately commits below every
+    // threshold, so folding it into the pressure reasons would make the audit
+    // record claim a threshold that was never crossed. Normal pressure remains
+    // impossible for the automatic path.
+    let reason = match (input.trigger, plan.before.level(input.config)) {
+        (CompactionTrigger::Manual, _) => CompactionReason::Manual,
+        (CompactionTrigger::Automatic, BudgetLevel::Soft) => CompactionReason::SoftThreshold,
+        (CompactionTrigger::Automatic, BudgetLevel::Hard) => CompactionReason::HardThreshold,
+        (CompactionTrigger::Automatic, BudgetLevel::Normal) => {
+            return Err(CompactionError::InvalidThresholds);
+        }
     };
     let mut metadata = CompactionMetadata::new(reason, durable_passes);
     if let Some(usage) = plan.summary_usage {

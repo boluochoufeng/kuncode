@@ -55,6 +55,7 @@ pub(crate) trait GroupTokenEstimator: Send + Sync {
 /// changing any collaborator mid-attempt would invalidate token comparisons.
 pub(crate) struct CompactionDependencies<'a> {
     pub(crate) config: &'a CompactionConfig,
+    pub(crate) trigger: CompactionTrigger,
     pub(crate) measured_before: ContextBudget,
     pub(crate) session: &'a mut AgentSession,
     pub(crate) store: &'a dyn SessionStore,
@@ -64,6 +65,19 @@ pub(crate) struct CompactionDependencies<'a> {
     pub(crate) artifact_counter: &'a dyn ArtifactTokenCounter,
     pub(crate) summarizer: &'a dyn ContextSummarizer,
     pub(crate) summary_model: &'a str,
+}
+
+/// Why a compaction is running, which decides whether budget pressure is a
+/// precondition for doing any work.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum CompactionTrigger {
+    /// Budget pressure at a request boundary. Below the soft threshold there is
+    /// nothing to do, so the pipeline stops before touching the session.
+    #[default]
+    Automatic,
+    /// The user asked for it, so pressure is not a precondition. Every safety
+    /// gate downstream still applies unchanged.
+    Manual,
 }
 
 /// Passes that materially contributed to an installed candidate.

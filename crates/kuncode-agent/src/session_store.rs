@@ -22,7 +22,7 @@ pub use error::SessionStoreError;
 pub use model::{
     Checkpoint, CommittedCompaction, CompactionEvent, CompactionMetadata, CompactionPassKind,
     CompactionReason, JournalEntry, JournalKind, JournalSnapshot, NewCheckpoint,
-    NewCompactionCommit, NewJournalEntry, NewSession, Seq, SessionId,
+    NewCompactionCommit, NewJournalEntry, NewSession, Seq, SessionId, SessionSummary,
 };
 
 /// Persists the complete session journal and manages active-context checkpoints.
@@ -36,6 +36,22 @@ pub trait SessionStore: Send + Sync {
     /// # Errors
     /// Returns the underlying storage error when session metadata cannot be written.
     async fn create_session(&self, session: NewSession) -> Result<SessionId, SessionStoreError>;
+
+    /// Lists this project's sessions, most recently updated first.
+    ///
+    /// The project is identified by the exact root path given to
+    /// [`NewSession::new`]. `limit` bounds the returned rows. Sessions with no
+    /// journaled messages are omitted: they are not resumable histories, only
+    /// rows a run left behind before journaling anything (session creation is
+    /// normally deferred until the first message, so such rows are rare).
+    ///
+    /// # Errors
+    /// Returns the underlying storage error when the listing query fails.
+    async fn list_sessions(
+        &self,
+        project_root: &Path,
+        limit: usize,
+    ) -> Result<Vec<SessionSummary>, SessionStoreError>;
 
     /// Appends an immutable fact to the specified session journal.
     ///

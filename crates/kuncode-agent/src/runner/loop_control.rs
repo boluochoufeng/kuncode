@@ -106,7 +106,10 @@ where
                 });
             }
 
-            self.execute_tool_calls(session, iteration_result.tool_calls, iteration, cancel)
+            // Subagent runs happen inside tool calls; their model usage comes
+            // back from the batch so the turn's accounting stays complete.
+            usage += self
+                .execute_tool_calls(session, iteration_result.tool_calls, iteration, cancel)
                 .await
                 .map_err(|error| (Some(iteration), error))?;
         }

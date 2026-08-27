@@ -7,7 +7,9 @@ use std::time::Duration;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use kuncode_agent::observer::EventKind;
 use kuncode_agent::permission::{ApprovalResolution, PermissionMode};
+use kuncode_agent::session_store::{SessionId, SessionSummary};
 use kuncode_agent::todo::TodoItem;
+use kuncode_core::completion::Usage;
 
 use super::bridge::ApprovalRequest;
 use crate::view::{ToolOutcome, ViewEffect, view};
@@ -29,6 +31,25 @@ pub enum ToolState {
     Denied(String),
 }
 
+/// One tool call inside a subagent run, rendered as a nested row under the
+/// delegating `task` entry. Same lifecycle as a parent call, one level down.
+pub struct SubCall {
+    pub id: String,
+    pub name: String,
+    pub summary: String,
+    pub state: ToolState,
+}
+
+/// Maps a closed call's outcome onto the display lifecycle — shared by parent
+/// rows and nested subagent rows so the two cannot drift.
+fn tool_state_from(outcome: ToolOutcome) -> ToolState {
+    match outcome {
+        ToolOutcome::Ok { truncated } => ToolState::Ok { truncated },
+        ToolOutcome::Denied(message) => ToolState::Denied(message),
+        ToolOutcome::Failed(message) => ToolState::Failed(message),
+    }
+}
+
 /// One rendered entry in the conversation log.
 ///
 /// Built from the agent's event stream plus the turn's final answer. Tool output
@@ -43,6 +64,9 @@ pub enum Item {
         name: String,
         summary: String,
         state: ToolState,
+        /// Nested subagent activity, populated only for `task` rows whose run
+        /// relays events. Rendered indented under the row, in arrival order.
+        children: Vec<SubCall>,
     },
     Error(String),
     /// A presentation-only marker; it never enters the agent transcript.
@@ -50,6 +74,32 @@ pub enum Item {
     /// A non-fatal harness notice (e.g. session persistence degraded);
     /// rendered apart from [`Error`](Self::Error) — the turn kept going.
     Warning(String),
+    /// Frontend-originated informational text (slash-command echo and output).
+    /// Never enters the agent transcript; rendered muted so it cannot be
+    /// mistaken for user or assistant dialog.
+    Notice(String),
+}
+
+/// The `/model` selection dialog: a snapshot of the candidate list taken when
+/// the picker opened. Unlike the completion menu (recomputed from the input
+/// each frame), the options are fixed for the dialog's lifetime, so `selected`
+/// stays in bounds by construction.
+pub struct ModelPicker {
+    pub options: Vec<String>,
+    pub selected: usize,
+}
+
+/// The `/resume` selection dialog: this project's stored sessions, newest
+/// first, snapshotted when the picker opened. Never empty —
+/// [`open_session_picker`](App::open_session_picker) refuses an empty list —
+/// so `selected` stays in bounds by construction.
+pub struct SessionPicker {
+    pub sessions: Vec<SessionSummary>,
+    pub selected: usize,
+    /// Index of the session this process is currently running, when listed.
+    /// Re-picking it closes the dialog instead of reloading: a rebuild would
+    /// drop non-persisted state such as session-scoped permission grants.
+    pub current: Option<usize>,
 }
 
 /// Mutable state driving the terminal UI.
@@ -98,6 +148,24 @@ pub struct App {
     /// scroll-up clears it; scrolling back to the bottom restores it.
     pub follow: bool,
     pub should_quit: bool,
+    /// Highlighted row of the slash-command completion menu. The menu itself
+    /// (whether it shows, which rows) derives from [`input`](Self::input) each
+    /// frame, so this index may go stale as typing narrows the matches —
+    /// readers clamp it to the current list instead of resetting on every edit.
+    pub menu_selection: usize,
+    /// Candidate models for the `/model` picker, seeded at startup from the
+    /// active provider's built-ins. The active model is added at open time.
+    pub available_models: Vec<String>,
+    /// Open model-selection dialog; while present it captures Up/Down, Enter,
+    /// and Esc at idle instead of the composer.
+    pub model_picker: Option<ModelPicker>,
+    /// Open `/resume` session dialog, modal exactly like
+    /// [`model_picker`](Self::model_picker); the two never show together.
+    pub session_picker: Option<SessionPicker>,
+    /// Provider usage accumulated across this process run, for the exit report.
+    /// Fed from each completed turn's aggregate plus compaction summary calls;
+    /// usage of turns that unwind before returning is not recoverable here.
+    pub session_usage: Usage,
     colors_enabled: bool,
     animation_frame: usize,
 }
@@ -120,9 +188,19 @@ impl App {
             scroll: 0,
             follow: true,
             should_quit: false,
+            menu_selection: 0,
+            available_models: Vec::new(),
+            model_picker: None,
+            session_picker: None,
+            session_usage: Usage::default(),
             colors_enabled: std::env::var_os("NO_COLOR").is_none(),
             animation_frame: 0,
         }
+    }
+
+    /// Adds one turn's aggregated provider usage to the session total.
+    pub fn add_usage(&mut self, usage: Usage) {
+        self.session_usage += usage;
     }
 
     /// Whether semantic terminal colors are enabled for this process.
@@ -220,6 +298,46 @@ impl App {
         }
     }
 
+    pub fn push_notice(&mut self, text: String) {
+        self.conversation.push(Item::Notice(text));
+    }
+
+    /// Opens the model picker over the candidate list, highlighting the
+    /// active model. The active model is always listed — first when it is not
+    /// among the candidates — so the picker is never empty.
+    pub fn open_model_picker(&mut self) {
+        let mut options = self.available_models.clone();
+        if !options.contains(&self.model_name) {
+            options.insert(0, self.model_name.clone());
+        }
+        let selected = options
+            .iter()
+            .position(|name| *name == self.model_name)
+            .unwrap_or(0);
+        self.model_picker = Some(ModelPicker { options, selected });
+    }
+
+    /// Opens the session picker over this project's stored sessions, starting
+    /// on the active session when it is listed. An empty list never opens a
+    /// dialog — a notice explains instead — which keeps
+    /// [`SessionPicker::selected`] in bounds for the picker's lifetime.
+    pub fn open_session_picker(
+        &mut self,
+        sessions: Vec<SessionSummary>,
+        active: Option<&SessionId>,
+    ) {
+        if sessions.is_empty() {
+            self.push_notice("no resumable sessions in this project".to_string());
+            return;
+        }
+        let current = active.and_then(|id| sessions.iter().position(|session| session.id == *id));
+        self.session_picker = Some(SessionPicker {
+            sessions,
+            selected: current.unwrap_or(0),
+            current,
+        });
+    }
+
     pub fn push_error(&mut self, text: String) {
         // A turn that errored/cancelled mid-stream drops its live preview.
         self.clear_stream_preview();
@@ -296,13 +414,22 @@ impl App {
                 self.status = Status::Compacting;
                 return;
             }
-            EventKind::CompactionCompleted { .. } => {
+            EventKind::CompactionCompleted { summary_usage, .. } => {
                 self.status = Status::Running;
+                // Summary calls bill the provider like any other request, so
+                // the exit report must include them.
+                if let Some(usage) = summary_usage {
+                    self.session_usage += *usage;
+                }
                 self.conversation.push(Item::Compaction);
                 return;
             }
-            EventKind::CompactionFailed { .. } => {
+            EventKind::CompactionFailed { summary_usage, .. } => {
                 self.status = Status::Running;
+                // A rejected summary still consumed tokens.
+                if let Some(usage) = summary_usage {
+                    self.session_usage += *usage;
+                }
                 return;
             }
             EventKind::TextDelta { text } => {
@@ -335,14 +462,11 @@ impl App {
                     name: tool,
                     summary,
                     state: ToolState::Running,
+                    children: Vec::new(),
                 });
             }
             ViewEffect::ToolClosed { id, tool, outcome } => {
-                let state = match outcome {
-                    ToolOutcome::Ok { truncated } => ToolState::Ok { truncated },
-                    ToolOutcome::Denied(message) => ToolState::Denied(message),
-                    ToolOutcome::Failed(message) => ToolState::Failed(message),
-                };
+                let state = tool_state_from(outcome);
                 if let Some(existing) = self.tool_state_mut(&id) {
                     *existing = state;
                 } else {
@@ -354,9 +478,47 @@ impl App {
                         name: tool,
                         summary: String::new(),
                         state,
+                        children: Vec::new(),
                     });
                 }
             }
+            ViewEffect::Nested { parent_id, effect } => match *effect {
+                ViewEffect::ToolOpened { id, tool, summary } => {
+                    // No parent row means the delegating `task` call never
+                    // opened here (shouldn't happen); dropping beats drawing
+                    // an orphan row at top level as if the parent ran it.
+                    if let Some(children) = self.tool_children_mut(&parent_id) {
+                        children.push(SubCall {
+                            id,
+                            name: tool,
+                            summary,
+                            state: ToolState::Running,
+                        });
+                    }
+                }
+                ViewEffect::ToolClosed { id, tool, outcome } => {
+                    let state = tool_state_from(outcome);
+                    if let Some(children) = self.tool_children_mut(&parent_id) {
+                        if let Some(child) = children.iter_mut().rev().find(|child| child.id == id)
+                        {
+                            child.state = state;
+                        } else {
+                            // Same close-without-open contract as parent rows.
+                            children.push(SubCall {
+                                id,
+                                name: tool,
+                                summary: String::new(),
+                                state,
+                            });
+                        }
+                    }
+                }
+                // A subagent warning is a harness notice like any other; the
+                // conversation log is flat for those.
+                ViewEffect::Warning(text) => self.conversation.push(Item::Warning(text)),
+                // `nested_view` admits only the three effects above.
+                _ => {}
+            },
             ViewEffect::Plan(todos) => {
                 // The plan is a sticky panel, not a log entry, so a wholesale
                 // replace keeps it pinned below the latest activity regardless of
@@ -375,6 +537,20 @@ impl App {
             .rev()
             .find_map(|item| match item {
                 Item::Tool { id: tid, state, .. } if tid == id => Some(state),
+                _ => None,
+            })
+    }
+
+    /// Nested-call list of the most recent tool entry with `id`, the dual of
+    /// [`tool_state_mut`](Self::tool_state_mut) for subagent envelopes.
+    fn tool_children_mut(&mut self, id: &str) -> Option<&mut Vec<SubCall>> {
+        self.conversation
+            .iter_mut()
+            .rev()
+            .find_map(|item| match item {
+                Item::Tool {
+                    id: tid, children, ..
+                } if tid == id => Some(children),
                 _ => None,
             })
     }
@@ -410,6 +586,23 @@ pub fn mode_label(mode: PermissionMode) -> &'static str {
     }
 }
 
+/// The next mode in the Shift+Tab ring.
+///
+/// The ring is deliberately the three *safe* modes — `default` →
+/// `accept-edits` → `plan` — even though [`PermissionMode`] has five.
+/// `bypass` and `dont-ask` change what happens when nobody is watching, so
+/// they stay a startup decision (`--mode`) that cannot be reached by one
+/// mistyped keystroke. A session started in one of them enters the ring at
+/// `default` on the first press, which is stricter than where it was.
+pub fn next_mode(mode: PermissionMode) -> PermissionMode {
+    match mode {
+        PermissionMode::Default => PermissionMode::AcceptEdits,
+        PermissionMode::AcceptEdits => PermissionMode::Plan,
+        PermissionMode::Plan => PermissionMode::Default,
+        PermissionMode::BypassPermissions | PermissionMode::DontAsk => PermissionMode::Default,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,6 +620,94 @@ mod tests {
             tool: "bash".to_string(),
             summary: "run ls".to_string(),
         }
+    }
+
+    #[test]
+    fn open_model_picker_highlights_the_active_model() {
+        let mut app = app();
+        app.available_models = vec!["other".to_string(), "model".to_string()];
+
+        app.open_model_picker();
+
+        let picker = app.model_picker.as_ref().expect("picker should be open");
+        assert_eq!(picker.options, vec!["other", "model"]);
+        assert_eq!(picker.selected, 1, "the active model starts highlighted");
+    }
+
+    #[test]
+    fn open_model_picker_lists_an_unknown_active_model_first() {
+        // e.g. started with `--model custom-name`: the active model is not in
+        // the provider's built-in table but must still show as current.
+        let mut app = app();
+        app.available_models = vec!["other".to_string()];
+
+        app.open_model_picker();
+
+        let picker = app.model_picker.as_ref().expect("picker should be open");
+        assert_eq!(picker.options, vec!["model", "other"]);
+        assert_eq!(picker.selected, 0);
+    }
+
+    #[test]
+    fn open_model_picker_with_no_candidates_still_offers_the_active_model() {
+        // e.g. the OpenAI provider has no built-in table; the picker degrades
+        // to a one-row list instead of an empty dialog.
+        let mut app = app();
+
+        app.open_model_picker();
+
+        let picker = app.model_picker.as_ref().expect("picker should be open");
+        assert_eq!(picker.options, vec!["model"]);
+        assert_eq!(picker.selected, 0);
+    }
+
+    fn summary(id: &str) -> SessionSummary {
+        SessionSummary {
+            id: SessionId::new(id),
+            title: None,
+            created_at: "2026-08-10T00:00:00.000Z".to_string(),
+            updated_at: "2026-08-10T00:00:00.000Z".to_string(),
+            message_count: 0,
+            preview: None,
+        }
+    }
+
+    #[test]
+    fn open_session_picker_starts_on_the_active_session() {
+        let mut app = app();
+        let active = SessionId::new("s2");
+
+        app.open_session_picker(vec![summary("s1"), summary("s2")], Some(&active));
+
+        let picker = app.session_picker.as_ref().expect("picker should be open");
+        assert_eq!(picker.selected, 1);
+        assert_eq!(picker.current, Some(1));
+    }
+
+    #[test]
+    fn open_session_picker_without_the_active_session_starts_at_the_top() {
+        // e.g. persistence degraded (no durable id) or the active session fell
+        // off the listing: no row is "current", the newest starts highlighted.
+        let mut app = app();
+
+        app.open_session_picker(vec![summary("s1"), summary("s2")], None);
+
+        let picker = app.session_picker.as_ref().expect("picker should be open");
+        assert_eq!(picker.selected, 0);
+        assert_eq!(picker.current, None);
+    }
+
+    #[test]
+    fn open_session_picker_with_no_sessions_notices_instead_of_opening() {
+        let mut app = app();
+
+        app.open_session_picker(Vec::new(), None);
+
+        assert!(app.session_picker.is_none());
+        assert!(matches!(
+            app.conversation.as_slice(),
+            [Item::Notice(text)] if text.contains("no resumable sessions")
+        ));
     }
 
     #[test]
@@ -470,6 +751,79 @@ mod tests {
             app.approval.is_none(),
             "Ctrl+C cancels like everywhere else"
         );
+    }
+
+    /// Wraps `kind` the way the runner's subagent relay does.
+    fn sub_event(parent: &str, kind: EventKind) -> EventKind {
+        EventKind::Subagent {
+            parent_tool_call_id: parent.to_string(),
+            event: Box::new(kuncode_agent::observer::AgentEvent {
+                seq: 1,
+                iteration: Some(0),
+                kind,
+            }),
+        }
+    }
+
+    #[test]
+    fn nested_events_grow_children_under_their_task_row() {
+        let mut app = app();
+        app.apply_event(tool_start("task_1"));
+        app.apply_event(sub_event(
+            "task_1",
+            EventKind::ToolStart {
+                tool_call_id: "sub_1".to_string(),
+                tool: "grep".to_string(),
+                summary: "grep: TODO".to_string(),
+            },
+        ));
+        app.apply_event(sub_event(
+            "task_1",
+            EventKind::ToolEnd {
+                tool_call_id: "sub_1".to_string(),
+                tool: "grep".to_string(),
+                ok: true,
+                truncated: false,
+                error: None,
+            },
+        ));
+
+        match app.conversation.as_slice() {
+            [
+                Item::Tool {
+                    state: ToolState::Running,
+                    children,
+                    ..
+                },
+            ] => {
+                // One child (not two), flipped to Ok, while the parent row
+                // itself is still running.
+                assert_eq!(children.len(), 1);
+                assert_eq!(children[0].name, "grep");
+                assert_eq!(children[0].summary, "grep: TODO");
+                assert!(matches!(
+                    children[0].state,
+                    ToolState::Ok { truncated: false }
+                ));
+            }
+            other => panic!("unexpected log: {} items", other.len()),
+        }
+    }
+
+    #[test]
+    fn nested_events_without_their_parent_row_are_dropped() {
+        let mut app = app();
+        app.apply_event(sub_event(
+            "missing_task",
+            EventKind::ToolStart {
+                tool_call_id: "sub_1".to_string(),
+                tool: "grep".to_string(),
+                summary: "grep: TODO".to_string(),
+            },
+        ));
+
+        // No orphan top-level row pretending the parent ran it.
+        assert!(app.conversation.is_empty());
     }
 
     #[test]
@@ -777,10 +1131,55 @@ mod tests {
 
         // When
         app.apply_event(compaction_started());
-        app.push_error("已取消".to_string());
+        app.push_error("cancelled".to_string());
 
         // Then
         assert_eq!(app.status, Status::Running);
+    }
+
+    #[test]
+    fn session_usage_accumulates_turns_and_summary_calls() {
+        let mut app = app();
+        app.add_usage(Usage {
+            input_tokens: 100,
+            output_tokens: 20,
+            total_tokens: 120,
+            ..Usage::default()
+        });
+
+        // Both compaction outcomes bill their summary call; a rejected summary
+        // still consumed tokens.
+        let summary = Usage {
+            input_tokens: 30,
+            output_tokens: 5,
+            total_tokens: 35,
+            ..Usage::default()
+        };
+        app.apply_event(EventKind::CompactionCompleted {
+            before_tokens: 42_000,
+            after_tokens: 18_000,
+            target_reached: true,
+            passes: vec!["semantic_summary".to_string()],
+            source_seq_start: 1,
+            source_seq_end: 10,
+            checkpoint_seq: 11,
+            artifact_count: 0,
+            summary_usage: Some(summary),
+            summary_latency_ms: Some(50),
+            latency_ms: 80,
+        });
+        app.apply_event(EventKind::CompactionFailed {
+            stage: "validation".to_string(),
+            error: "no_safe_boundary".to_string(),
+            recoverable: true,
+            before_tokens: 42_000,
+            summary_usage: Some(summary),
+            latency_ms: 10,
+        });
+
+        assert_eq!(app.session_usage.input_tokens, 160);
+        assert_eq!(app.session_usage.output_tokens, 30);
+        assert_eq!(app.session_usage.total_tokens, 190);
     }
 
     fn compaction_started() -> EventKind {

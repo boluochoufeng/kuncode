@@ -215,6 +215,13 @@ async fn refuse_blind_overwrite<D>(reads: &ReadLedger, path: &Path) -> Option<To
             "this file changed on disk after it was read, so writing it now \
              would discard those changes; read it again first",
         )),
+        ReadState::Evicted => Some(ToolOutput::failure(
+            "evicted_read",
+            "this file was read, but that reading was since compacted out of \
+             the conversation, so its contents are no longer in view; \
+             read_file it again before replacing the whole file, or use \
+             edit_file to change part of it without replacing the rest",
+        )),
     }
 }
 
@@ -312,6 +319,61 @@ mod tests {
             fs::read_to_string(tmp.path().join("a.txt")).expect("file should be readable"),
             "replacement"
         );
+    }
+
+    #[tokio::test]
+    async fn an_evicted_read_no_longer_licenses_the_overwrite() {
+        let tmp = TestDir::new();
+        fs::write(tmp.path().join("a.txt"), "original\n").expect("file should be written");
+        let workspace = tmp.workspace().await;
+        let ledger = crate::tool::ReadLedger::default();
+
+        // Read through a witnessed handle, the way the runner binds one.
+        let read_ctx = ToolContext::new().with_reads(ledger.witnessed_by("read-1"));
+        assert!(
+            read(
+                &workspace,
+                &read_ctx,
+                serde_json::json!({ "path": "a.txt" })
+            )
+            .await
+            .ok
+        );
+        // What installing a compacted context does once the read's tool result
+        // is no longer among the active messages.
+        ledger.evict_unwitnessed(&std::collections::HashSet::new());
+
+        let ctx = ToolContext::new().with_reads(ledger.clone());
+        let refused = write(
+            &workspace,
+            &ctx,
+            serde_json::json!({ "path": "a.txt", "content": "replacement" }),
+        )
+        .await;
+
+        assert!(!refused.ok);
+        assert_eq!(
+            refused.error.expect("error present").kind.as_str(),
+            "evicted_read"
+        );
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("a.txt")).expect("file should be readable"),
+            "original\n"
+        );
+
+        // Re-reading is the move the refusal asks for, and it satisfies it.
+        assert!(
+            read(&workspace, &ctx, serde_json::json!({ "path": "a.txt" }))
+                .await
+                .ok
+        );
+        let output = write(
+            &workspace,
+            &ctx,
+            serde_json::json!({ "path": "a.txt", "content": "replacement" }),
+        )
+        .await;
+        assert!(output.ok, "error: {:?}", output.error);
     }
 
     #[tokio::test]

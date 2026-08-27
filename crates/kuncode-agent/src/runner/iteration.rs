@@ -147,7 +147,24 @@ where
                 // The "calling X" hint is surfaced by `ToolStart` after the turn
                 // completes and the call is gated; ignore the earlier signal.
                 StreamEvent::ToolCallStart { .. } => {}
-                StreamEvent::Completed { content, usage, .. } => return Ok((content, usage)),
+                StreamEvent::Completed {
+                    content,
+                    usage,
+                    model,
+                    ..
+                } => {
+                    // served_model is the provider's own claim of what ran —
+                    // the durable positive evidence that a `/model` switch (or
+                    // startup selection) took effect on the wire.
+                    tracing::info!(
+                        target: "kuncode::provider",
+                        iteration,
+                        served_model = model.as_deref().unwrap_or("<unreported>"),
+                        latency_ms = elapsed_ms(request_started),
+                        "model stream completed",
+                    );
+                    return Ok((content, usage));
+                }
             }
         }
         Err(

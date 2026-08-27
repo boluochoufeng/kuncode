@@ -18,7 +18,7 @@ use crate::{
     },
     registry::ToolRegistry,
     session::AgentSession,
-    session_store::{NewJournalEntry, SessionStore},
+    session_store::{NewJournalEntry, SessionId, SessionStore},
     system_prompt::SystemPrompt,
     tool::ToolResultRetention,
 };
@@ -102,6 +102,7 @@ where
             session_store: None,
             group_estimator: Arc::new(RequestGroupEstimator::new(token_estimator.clone())),
             token_estimator,
+            subagent_models: Arc::new(std::collections::HashMap::new()),
         }
     }
 
@@ -162,12 +163,48 @@ where
         self
     }
 
+    /// Replaces the model used for ordinary turn completions (e.g. a
+    /// mid-session `/model` switch).
+    ///
+    /// The summary model is untouched; pair with
+    /// [`with_summary_model`](Self::with_summary_model) when both must move.
+    pub fn with_model(mut self, model: M) -> Self {
+        self.model = model;
+        self
+    }
+
+    /// Replaces the loop configuration wholesale.
+    ///
+    /// Nothing in the runner is derived from the config at build time, so no
+    /// other state needs recomputing. Invariant: when `config.compaction` is
+    /// present, its model id is checkpoint provenance and must name the active
+    /// summary model — a mismatch silently mislabels checkpoints.
+    pub fn with_agent_config(mut self, config: AgentConfig) -> Self {
+        self.config = config;
+        self
+    }
+
     /// Replaces the model used only for semantic context summaries.
     ///
     /// Summary calls still use the active turn's cancellation and durable commit
     /// boundaries; replacing the model does not create a separate session path.
     pub fn with_summary_model(mut self, model: M) -> Self {
         self.summary_model = model;
+        self
+    }
+
+    /// Installs per-agent-type model overrides, keyed by type name.
+    ///
+    /// A `task` delegation to a listed type runs on that entry's model and
+    /// output budget instead of the turn model; every other type — and every
+    /// name absent here — inherits the turn model. Resolving type definitions
+    /// to models (and rejecting unknown names) is the caller's job; by this
+    /// point every entry is already a working model.
+    pub fn with_subagent_models(
+        mut self,
+        models: std::collections::HashMap<String, super::SubagentModel<M>>,
+    ) -> Self {
+        self.subagent_models = Arc::new(models);
         self
     }
 
@@ -237,11 +274,39 @@ where
         session.push_tool_result_with_journal_seq(message, journal_seq, retention);
     }
 
+    /// Creates a deferred durable session right before its first journaled
+    /// message, so sessions that never exchange one are never persisted.
+    ///
+    /// Creation failure poisons persistence exactly like an append failure:
+    /// the caller scheduled durability, so its silent absence must not pass
+    /// for health.
+    async fn materialize_deferred_session(&self, session: &mut AgentSession) {
+        let Some(new_session) = session.take_deferred_durable_session() else {
+            return;
+        };
+        let Some(store) = &self.session_store else {
+            session.mark_persistence_failed("deferred session store is unavailable");
+            return;
+        };
+        match session
+            .start_durable_session(store.as_ref(), new_session)
+            .await
+        {
+            Ok(()) => tracing::info!(
+                target: "kuncode::persistence",
+                session_id = session.session_id().map_or("-", SessionId::as_str),
+                "durable session started",
+            ),
+            Err(error) => session.mark_persistence_failed(error.to_string()),
+        }
+    }
+
     async fn persist_message(
         &self,
         session: &mut AgentSession,
         message: &Message,
     ) -> Option<crate::session_store::Seq> {
+        self.materialize_deferred_session(session).await;
         let session_id = session.session_id().cloned();
         let mut journal_seq = None;
         if let Some(session_id) = session_id

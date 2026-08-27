@@ -15,7 +15,10 @@ mod validation;
 
 use super::{
     candidate::{CandidateState, deterministic_candidate, semantic_candidate},
-    types::{CompactionDependencies, CompactionError, CompactionOutcome, CompactionPass},
+    types::{
+        CompactionDependencies, CompactionError, CompactionOutcome, CompactionPass,
+        CompactionTrigger,
+    },
 };
 use crate::{
     compaction::{
@@ -54,7 +57,11 @@ pub(crate) async fn compact_context(
     if input.config.mode() == CompactionMode::Shadow {
         return Ok(CompactionOutcome::Observed(before));
     }
-    if before.level(input.config) == BudgetLevel::Normal {
+    // Pressure gates the automatic path only; a manual request has already
+    // decided that now is the time. Everything past this point is identical.
+    if input.trigger == CompactionTrigger::Automatic
+        && before.level(input.config) == BudgetLevel::Normal
+    {
         return Ok(CompactionOutcome::NotNeeded(before));
     }
     if !input.session.is_durable() {

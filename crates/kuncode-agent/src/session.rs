@@ -9,13 +9,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(test)]
 use crate::compaction::summary::ContinuitySummary;
 use crate::permission::{PermissionMode, SessionPolicyOverlay};
-use crate::session_store::{Seq, SessionId};
+use crate::session_store::{NewSession, Seq, SessionId};
 use crate::todo::{TodoHandle, TodoItem};
 use crate::tool::{ReadLedger, ToolResultRetention};
 
 mod compaction;
 mod lineage;
 mod persistence;
+mod resume;
 
 pub(crate) use compaction::SummarySourceBinding;
 pub use compaction::SummarySourceError;
@@ -24,6 +25,7 @@ pub(crate) use persistence::DurableSessionContext;
 #[cfg(test)]
 use persistence::SessionMutationError;
 pub use persistence::{SessionAppendError, SessionAttachError, SessionStartError};
+pub use resume::SessionResumeError;
 
 /// Active conversation context owned by the caller between agent turns.
 ///
@@ -55,6 +57,10 @@ pub struct AgentSession {
     reads: ReadLedger,
     session_id: Option<SessionId>,
     last_durable_seq: Option<Seq>,
+    /// Durable identity scheduled but not yet created. The runner materializes
+    /// it right before the first journaled message, so a session that never
+    /// exchanges one leaves no store row behind.
+    deferred_durable: Option<NewSession>,
     persistence_error: Option<String>,
     non_durable: bool,
 }
@@ -81,6 +87,7 @@ impl Clone for AgentSession {
             reads: self.reads.deep_clone(),
             session_id: None,
             last_durable_seq: None,
+            deferred_durable: None,
             persistence_error: None,
             non_durable: false,
         }
@@ -103,9 +110,9 @@ impl AgentSession {
 
     /// Starts a session from an existing active context in the default mode.
     ///
-    /// The messages remain non-durable in the first release, and every role is
-    /// assigned untrusted lineage. Resume must later reconstruct both messages
-    /// and lineage through a dedicated store path; [`Self::start_durable_session`]
+    /// The messages are non-durable and every role is assigned untrusted
+    /// lineage. Rebuilding a stored session with proven lineage is
+    /// [`Self::resume_durable_session`]; [`Self::start_durable_session`]
     /// intentionally rejects this non-empty state.
     pub fn from_messages(messages: Vec<Message>) -> Self {
         Self {
@@ -370,6 +377,70 @@ mod tests {
         assert_eq!(session.durable_seq(), Some(Seq::ZERO));
         assert!(session.messages().is_empty());
         assert!(session.is_durable());
+    }
+
+    #[test]
+    fn defer_schedules_without_installing_an_identity() {
+        let mut session = AgentSession::new();
+
+        session
+            .defer_durable_session(crate::session_store::NewSession::new("/p".into()))
+            .expect("fresh session should defer");
+
+        assert!(session.session_id().is_none());
+        assert!(session.durable_seq().is_none());
+        assert!(!session.is_durable());
+        // In-memory pushes stay allowed: nothing is journaled yet, so no
+        // durable receipt exists to demand.
+        session
+            .push_user("hello")
+            .expect("deferred session accepts in-memory messages");
+    }
+
+    #[test]
+    fn defer_rejects_double_scheduling_and_non_pristine_state() {
+        let mut session = AgentSession::new();
+        session
+            .defer_durable_session(crate::session_store::NewSession::new("/p".into()))
+            .expect("fresh session should defer");
+
+        let error = session
+            .defer_durable_session(crate::session_store::NewSession::new("/p".into()))
+            .expect_err("a second deferral must be rejected");
+        assert_eq!(error, SessionAttachError::AlreadyAttached);
+
+        let mut with_history = AgentSession::new();
+        with_history
+            .push_user("hello")
+            .expect("unattached session accepts an in-memory message");
+        let error = with_history
+            .defer_durable_session(crate::session_store::NewSession::new("/p".into()))
+            .expect_err("non-pristine sessions cannot defer");
+        assert_eq!(error, SessionAttachError::NotPristine);
+    }
+
+    #[test]
+    fn attach_after_defer_is_rejected_until_the_deferral_is_taken() {
+        // Materialization takes the descriptor before attaching; any other
+        // attach while a deferral is pending would race that identity.
+        let mut session = AgentSession::new();
+        session
+            .defer_durable_session(crate::session_store::NewSession::new("/p".into()))
+            .expect("fresh session should defer");
+
+        let error = session
+            .attach_session_id(SessionId::new("session-a"))
+            .expect_err("pending deferral blocks a direct attach");
+        assert_eq!(error, SessionAttachError::AlreadyAttached);
+
+        assert!(session.take_deferred_durable_session().is_some());
+        assert!(
+            session.take_deferred_durable_session().is_none(),
+            "the deferral is handed out exactly once"
+        );
+        session
+            .attach_session_id(SessionId::new("session-a"))
+            .expect("attach succeeds once the deferral was taken");
     }
 
     #[test]

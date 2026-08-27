@@ -6,11 +6,12 @@ mod iteration;
 mod loop_control;
 mod request;
 mod setup;
+mod subagent;
 mod tool_authorization;
 mod tool_execution;
 mod turn;
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use kuncode_core::completion::{ReasoningEffort, ToolChoice, Usage};
 
@@ -29,6 +30,7 @@ use crate::{
     tool::{ToolOutput, ToolResultRetention},
 };
 
+pub use self::compaction::ManualCompaction;
 use self::request::final_text_at;
 pub use self::setup::AgentRunnerBuildError;
 
@@ -107,6 +109,11 @@ impl AgentCompactionConfig {
             summary_max_tokens,
         })
     }
+
+    /// The model recorded as summary-checkpoint provenance.
+    pub fn model_id(&self) -> &str {
+        &self.model_id
+    }
 }
 
 /// Invalid automatic-compaction runtime metadata.
@@ -131,7 +138,8 @@ pub enum AgentCompactionConfigError {
 pub struct AgentTurn {
     /// Index of the final assistant message inside the caller-owned transcript.
     pub final_message_index: usize,
-    /// Provider usage aggregated across this turn's model calls.
+    /// Provider usage aggregated across this turn's model calls, including
+    /// calls made inside subagent runs the turn delegated via `task`.
     pub usage: Usage,
     /// Number of model calls performed for this turn.
     pub iterations: usize,
@@ -142,6 +150,18 @@ impl AgentTurn {
     pub fn final_text(&self, session: &AgentSession) -> String {
         final_text_at(session.messages(), self.final_message_index)
     }
+}
+
+/// One agent type's model override: the prebuilt model, its output budget,
+/// and a display name for logs (the model type itself carries no identifier).
+#[derive(Clone)]
+pub struct SubagentModel<M> {
+    /// Model a delegation to this type runs on.
+    pub model: M,
+    /// Output-token budget resolved for that model.
+    pub max_tokens: u64,
+    /// Identifier logged when the override applies.
+    pub model_name: String,
 }
 
 /// Minimal agent loop for model/tool/model interaction.
@@ -165,6 +185,9 @@ pub struct AgentRunner<M> {
     // final-request accounting remain comparable.
     token_estimator: Arc<dyn TokenEstimator>,
     group_estimator: Arc<dyn GroupTokenEstimator>,
+    /// Per-agent-type model overrides, keyed by type name; a type without an
+    /// entry delegates on the turn model.
+    subagent_models: Arc<HashMap<String, SubagentModel<M>>>,
 }
 
 #[derive(Debug)]

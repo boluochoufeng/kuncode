@@ -16,8 +16,13 @@ use crate::todo::TodoHandle;
 
 pub mod bash;
 pub mod filesystem;
+pub mod load_memory;
+pub mod load_skill;
+pub mod task;
+pub mod tasks;
 pub mod todo_write;
 pub mod web_fetch;
+pub mod write_memory;
 
 mod output;
 mod read_ledger;
@@ -209,10 +214,10 @@ pub fn exact_typed_preparation<P>(
 /// their [`Workspace`], so neither is duplicated here. It carries only the
 /// per-session seams a tool genuinely needs at call time: a cancellation token,
 /// and the [`TodoHandle`] for the session plan. Future fields (a
-/// `request_permission` hook for subagents, a `cwd` override) attach here too.
+/// `cwd` override) attach here too.
 ///
 /// [`Workspace`]: crate::workspace::Workspace
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct ToolContext {
     /// Cancelled by the runner (user interrupt / shutdown). A tool may observe
     /// it for cooperative cancellation, but the runner also races `call`
@@ -237,6 +242,25 @@ pub struct ToolContext {
     /// session's handle; the default is standalone, so a tool that ignores it
     /// still gets a valid target.
     pub reads: ReadLedger,
+    /// Runner-provided seam for delegating a subtask to a nested agent loop,
+    /// consumed by the `task` tool. `None` outside a runner turn (tests,
+    /// direct embedders), where `task` reports itself unavailable instead of
+    /// failing at the harness boundary.
+    pub subagents: Option<Arc<dyn task::SubagentDriver>>,
+}
+
+/// Hand-written because [`task::SubagentDriver`] is a non-`Debug` trait object;
+/// the field renders as its presence only.
+impl std::fmt::Debug for ToolContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolContext")
+            .field("cancel", &self.cancel)
+            .field("todos", &self.todos)
+            .field("visibility", &self.visibility)
+            .field("reads", &self.reads)
+            .field("subagents", &self.subagents.is_some())
+            .finish()
+    }
 }
 
 impl ToolContext {
@@ -265,6 +289,13 @@ impl ToolContext {
     /// earlier calls in the same session read rather than a fresh empty ledger.
     pub fn with_reads(mut self, reads: ReadLedger) -> Self {
         self.reads = reads;
+        self
+    }
+
+    /// Attaches the subagent runtime, so a `task` call in this context can
+    /// delegate to a nested agent loop.
+    pub fn with_subagents(mut self, driver: Arc<dyn task::SubagentDriver>) -> Self {
+        self.subagents = Some(driver);
         self
     }
 

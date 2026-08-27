@@ -73,6 +73,11 @@ pub fn model_profile(model_id: &str) -> Option<DeepSeekModelProfile> {
         .find(|profile| profile.model_id == model_id)
 }
 
+/// The built-in model identifiers, in profile-table order.
+pub fn known_model_ids() -> impl Iterator<Item = &'static str> {
+    MODEL_PROFILES.iter().map(|profile| profile.model_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -15,6 +15,8 @@ pub enum CompactionReason {
     SoftThreshold,
     /// Automatic compaction was triggered at the hard budget threshold.
     HardThreshold,
+    /// A user requested compaction outside any budget threshold.
+    Manual,
     /// Reserved durable value for an emergency trigger outside normal budget thresholds.
     Emergency,
 }
@@ -25,6 +27,7 @@ impl CompactionReason {
         match self {
             Self::SoftThreshold => "soft_threshold",
             Self::HardThreshold => "hard_threshold",
+            Self::Manual => "manual",
             Self::Emergency => "emergency",
         }
     }
