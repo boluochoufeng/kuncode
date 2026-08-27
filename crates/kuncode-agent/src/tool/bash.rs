@@ -1,6 +1,7 @@
 //! Executes approved shell commands with bounded output and descendant cleanup.
 
 use std::{
+    collections::VecDeque,
     num::NonZeroU64,
     process::Stdio,
     sync::{Arc, Mutex},
@@ -31,6 +32,8 @@ use crate::{
 };
 
 const OUTPUT_LIMIT_BYTES: usize = 20_000;
+const OUTPUT_HEAD_BYTES: usize = OUTPUT_LIMIT_BYTES / 2;
+const OUTPUT_TAIL_BYTES: usize = OUTPUT_LIMIT_BYTES - OUTPUT_HEAD_BYTES;
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
 const MAX_TIMEOUT_SECS: u64 = 600;
 /// How long to keep reading after the command ends before abandoning a stream
@@ -297,22 +300,49 @@ fn effective_timeout(timeout_secs: Option<NonZeroU64>) -> Duration {
     }))
 }
 
-/// What a [`Pump`] captured from one stream: the retained head, the total byte
-/// count, and whether the stream actually closed.
+/// What a [`Pump`] captured from one stream: bounded head and tail windows, the
+/// total byte count, and whether the stream actually closed.
 #[derive(Debug, Default)]
 struct StreamCapture {
     head: Vec<u8>,
+    tail: VecDeque<u8>,
     total: usize,
     closed: bool,
 }
 
+impl StreamCapture {
+    fn push(&mut self, bytes: &[u8]) {
+        self.total += bytes.len();
+
+        let head_bytes = bytes
+            .len()
+            .min(OUTPUT_HEAD_BYTES.saturating_sub(self.head.len()));
+        self.head.extend_from_slice(&bytes[..head_bytes]);
+        let tail_bytes = &bytes[head_bytes..];
+        if tail_bytes.len() >= OUTPUT_TAIL_BYTES {
+            self.tail.clear();
+            self.tail
+                .extend(&tail_bytes[tail_bytes.len() - OUTPUT_TAIL_BYTES..]);
+            return;
+        }
+
+        let overflow = self
+            .tail
+            .len()
+            .saturating_add(tail_bytes.len())
+            .saturating_sub(OUTPUT_TAIL_BYTES);
+        self.tail.drain(..overflow);
+        self.tail.extend(tail_bytes);
+    }
+}
+
 /// Background reader for one output stream.
 ///
-/// Bytes past `OUTPUT_LIMIT_BYTES` are counted and dropped as they arrive, so
-/// the pipe never backpressures the child and memory stays bounded no matter
-/// how much a command prints. The capture lives behind a shared handle rather
-/// than in the task, so whatever arrived stays reachable even when the reader
-/// has to be abandoned.
+/// The first and last halves of `OUTPUT_LIMIT_BYTES` are retained while the
+/// middle is discarded, so diagnostics at either end stay visible without
+/// backpressuring the child or growing memory with command output. The capture
+/// lives behind a shared handle rather than in the task, so whatever arrived
+/// stays reachable even when the reader has to be abandoned.
 struct Pump {
     capture: Arc<Mutex<StreamCapture>>,
     task: Option<tokio::task::JoinHandle<()>>,
@@ -330,9 +360,7 @@ impl Pump {
                         Ok(0) | Err(_) => break,
                         Ok(read) => {
                             let mut capture = capture.lock().expect("pump mutex");
-                            capture.total += read;
-                            let room = OUTPUT_LIMIT_BYTES.saturating_sub(capture.head.len());
-                            capture.head.extend_from_slice(&chunk[..read.min(room)]);
+                            capture.push(&chunk[..read]);
                         }
                     }
                 }
@@ -364,28 +392,42 @@ impl Pump {
 /// alone would misrepresent. Bash output may not be valid UTF-8, so decoding is
 /// intentionally lossy (`from_utf8_lossy`).
 ///
-/// Two conditions earn a marker. Bytes past `OUTPUT_LIMIT_BYTES` were dropped
-/// as they arrived — the marker names the stream and the byte scale, so the
-/// model knows it holds only the head and must not assume it saw everything;
-/// how to get the rest (filter, redirect, re-run) is left to the model — bash
-/// is a general shell. And a stream that never closed means some process the
-/// kill could not reach may still be writing — the marker says the text is only
-/// what had arrived by the time the pump was abandoned.
+/// Two conditions earn a marker. When the middle was dropped, the marker names
+/// the exact retained byte ranges and observed total. A stream that never
+/// closed gets a separate marker because a surviving process may still have
+/// produced more output after the pump was abandoned.
 fn output_text(stream: &str, capture: StreamCapture) -> (String, bool) {
-    // The head is cut at an arbitrary byte index, which never splits a `char`
-    // (that is a `str` concern); `from_utf8_lossy` turns any partial trailing
-    // sequence into U+FFFD, so the result is always valid UTF-8.
-    let mut text = String::from_utf8_lossy(&capture.head).into_owned();
-    let mut truncated = false;
-    if capture.total > capture.head.len() {
+    let StreamCapture {
+        head,
+        tail,
+        total,
+        closed,
+    } = capture;
+    let tail = tail.into_iter().collect::<Vec<_>>();
+    let head_end = head.len();
+    let tail_start = total - tail.len();
+    let retained = head.len() + tail.len();
+    let omitted = total.saturating_sub(retained);
+    let mut truncated = omitted > 0;
+    let mut text = if truncated {
+        // Each retained window can end inside a code point. Lossy decoding
+        // keeps the result valid UTF-8 without weakening the byte budget.
+        String::from_utf8_lossy(&head).into_owned()
+    } else {
+        // Decode the contiguous stream once so a code point crossing the
+        // internal head/tail boundary is preserved when nothing was omitted.
+        let mut bytes = head;
+        bytes.extend_from_slice(&tail);
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+    if truncated {
         text.push_str(&format!(
-            "\n…⟨kuncode: {stream} truncated — showed first {shown} of {total} bytes⟩",
-            shown = capture.head.len(),
-            total = capture.total,
+            "\n…⟨kuncode: {stream} truncated — retained byte ranges [0, {head_end}) and \
+             [{tail_start}, {total}) of {total} bytes; omitted {omitted} bytes⟩\n",
         ));
-        truncated = true;
+        text.push_str(&String::from_utf8_lossy(&tail));
     }
-    if !capture.closed {
+    if !closed {
         text.push_str(&format!(
             "\n…⟨kuncode: {stream} did not close — a surviving process may still \
              be holding it; shown is what had arrived so far⟩"
@@ -546,7 +588,10 @@ mod tests {
     #[cfg(unix)]
     use std::time::Duration;
 
-    use super::{Bash, simple_command_chain};
+    use super::{
+        Bash, OUTPUT_HEAD_BYTES, OUTPUT_LIMIT_BYTES, StreamCapture, output_text,
+        simple_command_chain,
+    };
     #[cfg(unix)]
     use crate::test_support::TestDir;
     use crate::{
@@ -615,14 +660,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn truncates_oversized_output_with_a_visible_marker() {
+    async fn oversized_streams_retain_independent_heads_and_diagnostic_tails() {
         let workspace = Workspace::new(std::env::current_dir().expect("current directory exists"))
             .await
             .expect("workspace should be valid");
-        // Emit well over OUTPUT_LIMIT_BYTES of pure `x` on stdout.
         let out = execute_for_test(
             Arc::new(Bash::new(workspace)),
-            serde_json::json!({ "cmd": "printf 'x%.0s' {1..30000}" }),
+            serde_json::json!({
+                "cmd": "printf 'h%.0s' {1..10000}; printf 'm%.0s' {1..10000}; \
+                        printf 't%.0s' {1..9990}; printf TAIL_ERROR; \
+                        printf 'a%.0s' {1..10000} >&2; \
+                        printf 'b%.0s' {1..14988} >&2; printf STDERR_ERROR >&2"
+            }),
             &ToolContext::new(),
         )
         .await
@@ -630,13 +679,42 @@ mod tests {
 
         assert!(out.ok);
         assert!(out.truncated);
-        let stdout = out.data.expect("data present")["stdout"]
+        let data = out.data.expect("data present");
+        let stdout = data["stdout"]
             .as_str()
             .expect("stdout is a string")
             .to_string();
-        // The capped prefix is preserved and a marker names the stream + scale.
-        assert!(stdout.starts_with(&"x".repeat(super::OUTPUT_LIMIT_BYTES)));
-        assert!(stdout.contains("stdout truncated"));
+        let stderr = data["stderr"]
+            .as_str()
+            .expect("stderr is a string")
+            .to_string();
+
+        assert!(stdout.starts_with(&"h".repeat(OUTPUT_HEAD_BYTES)));
+        assert!(stdout.contains("retained byte ranges [0, 10000) and [20000, 30000)"));
+        assert!(stdout.contains("omitted 10000 bytes"));
+        assert!(stdout.ends_with("TAIL_ERROR"));
+        assert!(!stdout.contains(&"m".repeat(100)));
+
+        assert!(stderr.starts_with(&"a".repeat(OUTPUT_HEAD_BYTES)));
+        assert!(stderr.contains("retained byte ranges [0, 10000) and [15000, 25000)"));
+        assert!(stderr.contains("omitted 5000 bytes"));
+        assert!(stderr.ends_with("STDERR_ERROR"));
+    }
+
+    #[test]
+    fn exact_budget_preserves_utf8_across_the_internal_window_boundary() {
+        let prefix = "x".repeat(OUTPUT_HEAD_BYTES - 1);
+        let suffix = "y".repeat(OUTPUT_LIMIT_BYTES - prefix.len() - "🙂".len());
+        let expected = format!("{prefix}🙂{suffix}");
+        let mut capture = StreamCapture::default();
+        capture.push(&expected.as_bytes()[..OUTPUT_HEAD_BYTES - 1]);
+        capture.push(&expected.as_bytes()[OUTPUT_HEAD_BYTES - 1..]);
+        capture.closed = true;
+
+        let (text, truncated) = output_text("stdout", capture);
+
+        assert!(!truncated);
+        assert_eq!(text, expected);
     }
 
     #[cfg(unix)]
@@ -658,10 +736,12 @@ mod tests {
         let data = out.data.expect("data present");
         let stdout = data["stdout"].as_str().expect("stdout is a string");
         let stderr = data["stderr"].as_str().expect("stderr is a string");
-        assert!(stdout.starts_with(&"o".repeat(super::OUTPUT_LIMIT_BYTES)));
-        assert!(stdout.contains("of 2000000 bytes"));
-        assert!(stderr.starts_with(&"e".repeat(super::OUTPUT_LIMIT_BYTES)));
-        assert!(stderr.contains("of 2000000 bytes"));
+        assert!(stdout.starts_with(&"o".repeat(OUTPUT_HEAD_BYTES)));
+        assert!(stdout.ends_with(&"o".repeat(super::OUTPUT_TAIL_BYTES)));
+        assert!(stdout.contains("retained byte ranges [0, 10000) and [1990000, 2000000)"));
+        assert!(stderr.starts_with(&"e".repeat(OUTPUT_HEAD_BYTES)));
+        assert!(stderr.ends_with(&"e".repeat(super::OUTPUT_TAIL_BYTES)));
+        assert!(stderr.contains("retained byte ranges [0, 10000) and [1990000, 2000000)"));
     }
 
     #[tokio::test]
