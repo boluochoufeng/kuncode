@@ -41,6 +41,14 @@ pub struct ReadFileArgs {
     /// Maximum number of lines to return.
     #[serde(default)]
     limit: Option<usize>,
+    /// Byte offset within `start_line` at which to resume reading that single
+    /// line. Feed back the `resume_offset` from a `truncated_lines` entry
+    /// (with `start_line` set to that entry's `line`). The call then returns
+    /// up to 50 000 bytes of that one line and nothing else, reporting a
+    /// further `resume_offset` while a tail remains. Offsets count bytes of
+    /// line content (no terminator) and must fall on a UTF-8 char boundary.
+    #[serde(default)]
+    line_offset: Option<usize>,
 }
 
 /// Text content read from a workspace file.
@@ -53,6 +61,11 @@ pub struct ReadFileOutput {
     /// One-based line number of the first returned line; `0` when nothing was
     /// returned (e.g. `start_line` is past the end of the file).
     pub start_line: usize,
+    /// Byte offset within [`Self::start_line`] at which [`Self::content`]
+    /// begins. Present only on a `line_offset` continuation read, whose
+    /// content is a fragment of that single line rather than whole lines.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line_offset: Option<usize>,
     /// Number of lines returned in [`Self::content`].
     pub returned_lines: usize,
     /// `true` when more *lines* follow the returned range. This is the vertical
@@ -66,14 +79,30 @@ pub struct ReadFileOutput {
     /// where this call left off. Present only when [`Self::has_more`] is `true`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_line: Option<usize>,
-    /// One-based *file* line numbers (the same numbering as [`Self::start_line`])
-    /// whose tail was dropped to fit `MAX_LINE_BYTES`. These lines are
-    /// INCOMPLETE: the elided tail is not in `content` and — unlike
-    /// [`Self::has_more`] — is *not* reachable via [`Self::next_line`], which
-    /// only advances by whole lines. Recover it another way (e.g. `grep`).
-    /// Omitted when every returned line is intact.
+    /// Returned lines whose tail was elided to fit the per-call byte caps.
+    /// These lines are INCOMPLETE in [`Self::content`], and — unlike
+    /// [`Self::has_more`] — the elided tail is *not* reachable via
+    /// [`Self::next_line`], which only advances by whole lines. Each entry
+    /// instead carries the [`resume_offset`](TruncatedLine::resume_offset) to
+    /// feed back as `line_offset` to keep reading that single line
+    /// losslessly. Omitted when every returned line is intact.
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub truncated_lines: Vec<usize>,
+    pub truncated_lines: Vec<TruncatedLine>,
+}
+
+/// A returned line whose tail was elided, and where to resume reading it.
+#[derive(Debug, Serialize)]
+pub struct TruncatedLine {
+    /// One-based *file* line number, in the same numbering as
+    /// [`ReadFileOutput::start_line`].
+    pub line: usize,
+    /// Byte offset into the line where the elided tail begins. Pass it back as
+    /// `line_offset` with `start_line` set to [`Self::line`] to read on; it
+    /// always falls on a UTF-8 character boundary, so repeated continuations
+    /// reassemble the line without splitting a code point.
+    pub resume_offset: usize,
+    /// Bytes of the line not yet returned, excluding any line terminator.
+    pub remaining_bytes: usize,
 }
 
 /// Canonical read target paired with validated pagination arguments.
@@ -98,8 +127,10 @@ impl ReadFile {
                 "read_file",
                 "Read a UTF-8 workspace file as numbered lines. A file too long \
                  for one reply is paginated rather than silently cut, so a \
-                 result reports how to read on. Use grep to find which file to \
-                 read, and prefer this over cat, head, or tail through bash.",
+                 result reports how to read on — including an over-long single \
+                 line, whose clipped tail is fetched by passing back \
+                 `line_offset`. Use grep to find which file to read, and prefer \
+                 this over cat, head, or tail through bash.",
             ),
             workspace,
         }
@@ -152,6 +183,7 @@ impl TypedTool for ReadFile {
             "path": canonical_path.as_str(),
             "start_line": start_line,
             "limit": args.limit,
+            "line_offset": args.line_offset,
         }));
         Ok(TypedPreparation::new(
             PreparedReadFile {
@@ -194,7 +226,7 @@ impl TypedTool for ReadFile {
         // proportional to `start_line`, not file size; nothing past the
         // requested window is read.
         for _ in 0..(start_line - 1) {
-            match read_bounded_line(&mut lines, 0).await {
+            match read_bounded_line(&mut lines, 0, 0).await {
                 Ok(Some(_)) => {}
                 // `start_line` is past EOF: there is simply nothing to return.
                 Ok(None) => break,
@@ -204,67 +236,135 @@ impl TypedTool for ReadFile {
 
         let mut collected = Vec::new();
         let mut used_bytes = 0usize;
-        // The *horizontal* truncation axis: one-based file line numbers (same
-        // numbering as `start_line`) whose tail we dropped to fit
-        // `MAX_LINE_BYTES`. Lossy and — unlike `has_more` / `next_line` — NOT
-        // recoverable by paginating.
-        let mut truncated_lines: Vec<usize> = Vec::new();
+        // The *horizontal* truncation axis: returned lines whose tail we
+        // dropped to fit the byte caps. Unlike `has_more` / `next_line` it is
+        // not recovered by paginating — each entry instead names the
+        // `line_offset` that reads the same line on.
+        let mut truncated_lines: Vec<TruncatedLine> = Vec::new();
         let mut has_more = false;
 
-        loop {
-            // Stop once the line budget is met, peeking one line ahead so the
-            // caller learns whether more lines remain. This is the *vertical*
-            // axis: lossless, the next read at `next_line` resumes here.
-            if args.limit.is_some_and(|limit| collected.len() >= limit) {
-                // A read error while peeking is a real failure (e.g. invalid
-                // UTF-8 on the next line), not EOF — surface it like every other
-                // read instead of reporting a false end-of-file via `has_more`.
-                has_more = match read_bounded_line(&mut lines, 0).await {
-                    Ok(Some(_)) => true,
-                    Ok(None) => false,
-                    Err(err) => return io_error("read", &resolved, err, &self.workspace),
-                };
-                break;
-            }
-
-            let raw = match read_bounded_line(&mut lines, MAX_LINE_BYTES).await {
+        if let Some(offset) = args.line_offset {
+            // Continuation of a single over-long line: return the next bounded
+            // window of `start_line` beginning at `offset`, instead of whole
+            // lines. The line is still drained and validated end to end, so
+            // memory stays capped and a following line can be peeked at.
+            let raw = match read_bounded_line(&mut lines, offset, READ_LIMIT_BYTES).await {
                 Ok(Some(line)) => line,
-                Ok(None) => break,
+                Ok(None) => {
+                    return ToolOutput::failure(
+                        "invalid_arguments",
+                        format!(
+                            "`start_line` {start_line} is past the end of the file, \
+                             so `line_offset` has no line to continue"
+                        ),
+                    );
+                }
+                // `InvalidInput` is reserved for a misaligned `line_offset`;
+                // everything else is a real read failure.
+                Err(err) if err.kind() == io::ErrorKind::InvalidInput => {
+                    return ToolOutput::failure("invalid_arguments", err.to_string());
+                }
                 Err(err) => return io_error("read", &resolved, err, &self.workspace),
             };
-
-            let raw_bytes = raw.total_bytes;
-            let mut line = raw.text;
-            let line_truncated = raw_bytes > line.len();
-
-            // Honor the total byte budget, but always return at least one line
-            // so a single over-long line still yields its (capped) prefix.
-            // Spilling a whole line to the next page is lossless, so it counts as
-            // vertical pagination (`has_more`), never as truncation.
-            if !collected.is_empty() && used_bytes + line.len() > READ_LIMIT_BYTES {
-                has_more = true;
-                break;
+            if offset > raw.total_bytes {
+                return ToolOutput::failure(
+                    "invalid_arguments",
+                    format!(
+                        "`line_offset` {offset} is past the end of line {start_line} \
+                         ({} bytes)",
+                        raw.total_bytes
+                    ),
+                );
             }
 
-            // A line cut by `MAX_LINE_BYTES` gets a visible, located marker so the
-            // model can see *which* line lost its tail and that re-reading will
-            // not bring it back. The marker is metadata, not file content.
-            //
-            // Lossy-and-unpaginable is deliberate, and industry-wide: mainstream
-            // agent CLIs all drop overlong tails the same way and point the model
-            // at grep. The one lossless precedent (DeepAgents' continuation
-            // sub-lines `41.1`, `41.2`) recovers tails — near-always minified
-            // output — at the price of line numbers that don't exist in the
-            // file. Not worth it. The cap is bytes, not chars, on purpose: it
-            // bounds token cost uniformly across scripts and stays on the same
-            // axis as `READ_LIMIT_BYTES`.
-            if line_truncated {
-                truncated_lines.push(start_line + collected.len());
-                line.push_str(&line_truncated_marker(raw_bytes - line.len()));
+            let mut fragment = raw.text;
+            let resume_offset = offset + fragment.len();
+            let remaining_bytes = raw.total_bytes - resume_offset;
+            if remaining_bytes > 0 {
+                truncated_lines.push(TruncatedLine {
+                    line: start_line,
+                    resume_offset,
+                    remaining_bytes,
+                });
+                fragment.push_str(&line_truncated_marker(
+                    start_line,
+                    resume_offset,
+                    remaining_bytes,
+                ));
             }
+            collected.push(fragment);
 
-            used_bytes += line.len();
-            collected.push(line);
+            // Both axes are reported independently: an unfinished line above
+            // does not hide that a next whole line exists.
+            has_more = match read_bounded_line(&mut lines, 0, 0).await {
+                Ok(Some(_)) => true,
+                Ok(None) => false,
+                Err(err) => return io_error("read", &resolved, err, &self.workspace),
+            };
+        } else {
+            loop {
+                // Stop once the line budget is met, peeking one line ahead so
+                // the caller learns whether more lines remain. This is the
+                // *vertical* axis: lossless, the next read at `next_line`
+                // resumes here.
+                if args.limit.is_some_and(|limit| collected.len() >= limit) {
+                    // A read error while peeking is a real failure (e.g.
+                    // invalid UTF-8 on the next line), not EOF — surface it
+                    // like every other read instead of reporting a false
+                    // end-of-file via `has_more`.
+                    has_more = match read_bounded_line(&mut lines, 0, 0).await {
+                        Ok(Some(_)) => true,
+                        Ok(None) => false,
+                        Err(err) => return io_error("read", &resolved, err, &self.workspace),
+                    };
+                    break;
+                }
+
+                let raw = match read_bounded_line(&mut lines, 0, MAX_LINE_BYTES).await {
+                    Ok(Some(line)) => line,
+                    Ok(None) => break,
+                    Err(err) => return io_error("read", &resolved, err, &self.workspace),
+                };
+
+                let raw_bytes = raw.total_bytes;
+                let mut line = raw.text;
+                let line_truncated = raw_bytes > line.len();
+
+                // Honor the total byte budget, but always return at least one
+                // line so a single over-long line still yields its (capped)
+                // prefix. Spilling a whole line to the next page is lossless,
+                // so it counts as vertical pagination (`has_more`), never as
+                // truncation.
+                if !collected.is_empty() && used_bytes + line.len() > READ_LIMIT_BYTES {
+                    has_more = true;
+                    break;
+                }
+
+                // A line cut by `MAX_LINE_BYTES` gets a visible, located marker
+                // plus a structured entry naming where a continuation read
+                // resumes it. The marker is metadata, not file content. The cap
+                // is bytes, not chars, on purpose: it bounds token cost
+                // uniformly across scripts and stays on the same axis as
+                // `READ_LIMIT_BYTES`.
+                if line_truncated {
+                    let line_number = start_line + collected.len();
+                    let resume_offset = line.len();
+                    let remaining_bytes = raw_bytes - resume_offset;
+                    truncated_lines.push(TruncatedLine {
+                        line: line_number,
+                        resume_offset,
+                        remaining_bytes,
+                    });
+                    line.push_str(&line_truncated_marker(
+                        line_number,
+                        resume_offset,
+                        remaining_bytes,
+                    ));
+                }
+
+                used_bytes += line.len();
+                collected.push(line);
+            }
         }
 
         let returned_lines = collected.len();
@@ -280,6 +380,7 @@ impl TypedTool for ReadFile {
             path: self.workspace.relative_display(&resolved),
             content: collected.join("\n"),
             start_line: if returned_lines == 0 { 0 } else { start_line },
+            line_offset: args.line_offset,
             returned_lines,
             has_more,
             next_line,
@@ -308,17 +409,18 @@ struct BoundedLine {
     total_bytes: usize,
 }
 
-// Reads and validates one UTF-8 line while retaining only its bounded prefix.
-// The discarded tail is still drained and validated so it cannot hide invalid
-// UTF-8 or leave the reader in the middle of a line.
+// Reads and validates one UTF-8 line while retaining only the window of it
+// that starts `skip` bytes in and holds at most `retain_limit` bytes. Bytes
+// outside the window are still drained and validated, so they cannot hide
+// invalid UTF-8 or leave the reader in the middle of a line.
 async fn read_bounded_line<R>(
     reader: &mut R,
+    skip: usize,
     retain_limit: usize,
 ) -> io::Result<Option<BoundedLine>>
 where
     R: AsyncBufRead + Unpin,
 {
-    let retain_limit = retain_limit.min(MAX_LINE_BYTES);
     let mut retained = Vec::with_capacity(retain_limit);
     let mut validator = Utf8Validator::default();
     let mut total_bytes = 0usize;
@@ -336,6 +438,7 @@ where
         let content = &available[..content_end];
 
         validator.push(content)?;
+        let chunk_start = total_bytes;
         total_bytes = total_bytes.checked_add(content.len()).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "line length exceeds usize")
         })?;
@@ -343,8 +446,14 @@ where
             last_byte = Some(*byte);
         }
 
-        let remaining = retain_limit.saturating_sub(retained.len());
-        retained.extend_from_slice(&content[..content.len().min(remaining)]);
+        // Intersect this chunk with the retained window, which spans line
+        // bytes `[skip, skip + retain_limit)`.
+        let begin = skip.saturating_sub(chunk_start).min(content.len());
+        let end = skip
+            .saturating_add(retain_limit)
+            .saturating_sub(chunk_start)
+            .min(content.len());
+        retained.extend_from_slice(&content[begin..end]);
 
         let consumed = content_end + usize::from(newline.is_some());
         terminated = newline.is_some();
@@ -361,15 +470,30 @@ where
 
     // Match `AsyncBufReadExt::lines`: strip a carriage return only when it is
     // immediately before a newline, after validating it as part of the input.
+    // The window covers line bytes `[skip, skip + retained.len())`, so it holds
+    // the `\r` exactly when it reaches the unstripped end.
     if terminated && last_byte == Some(b'\r') {
         let unstripped_bytes = total_bytes;
         total_bytes -= 1;
-        if retained.len() == unstripped_bytes {
+        if skip + retained.len() == unstripped_bytes {
             retained.pop();
         }
     }
 
-    // A bounded prefix may end midway through an otherwise valid code point.
+    // With the whole stream validated above, a window that starts on a
+    // continuation byte means `skip` landed inside a code point — the caller's
+    // offset is wrong, not the file. `InvalidInput` keeps that distinguishable
+    // from the `InvalidData` raised for a genuinely invalid file.
+    if let Some(first) = retained.first()
+        && (*first & 0b1100_0000) == 0b1000_0000
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "`line_offset` does not fall on a UTF-8 character boundary",
+        ));
+    }
+
+    // A bounded window may end midway through an otherwise valid code point.
     // Back up to the last complete boundary, matching `truncate_utf8` semantics.
     let valid_prefix_len = match std::str::from_utf8(&retained) {
         Ok(_) => retained.len(),
@@ -440,13 +564,14 @@ fn invalid_utf8_error() -> io::Error {
     )
 }
 
-/// Inline marker appended to a line whose tail was dropped to fit
-/// `MAX_LINE_BYTES`. Deliberately explicit: the elided tail is neither in the
-/// returned content nor reachable via `next_line` (which advances by whole
-/// lines), so the model is told to recover it another way rather than re-read.
-fn line_truncated_marker(elided_bytes: usize) -> String {
+/// Inline marker appended to a line whose tail was elided by a byte cap.
+/// Deliberately explicit: the elided tail is neither in the returned content
+/// nor reachable via `next_line` (which advances by whole lines), so the
+/// marker spells out the exact continuation call that does return it.
+fn line_truncated_marker(line: usize, resume_offset: usize, elided_bytes: usize) -> String {
     format!(
-        "…⟨kuncode: line truncated, {elided_bytes} more bytes — re-reading won't return them; use grep⟩"
+        "…⟨kuncode: line truncated, {elided_bytes} more bytes — pass start_line={line}, \
+         line_offset={resume_offset} to read on⟩"
     )
 }
 
@@ -456,7 +581,7 @@ mod tests {
 
     use tokio::io::BufReader;
 
-    use super::{MAX_LINE_BYTES, ReadFile, read_bounded_line};
+    use super::{MAX_LINE_BYTES, READ_LIMIT_BYTES, ReadFile, read_bounded_line};
     use crate::test_support::TestDir;
     use crate::tool::{ToolContext, ToolOutput, execute_for_test};
 
@@ -568,8 +693,16 @@ mod tests {
         assert!(content.contains("line truncated"));
         assert_eq!(data["returned_lines"], 1);
         assert_eq!(data["has_more"], false);
-        // The cut is reported on the horizontal axis, located to line 1.
-        assert_eq!(data["truncated_lines"], serde_json::json!([1]));
+        // The cut is reported on the horizontal axis, located to line 1 and
+        // carrying the offset a continuation read resumes at.
+        assert_eq!(
+            data["truncated_lines"],
+            serde_json::json!([{
+                "line": 1,
+                "resume_offset": MAX_LINE_BYTES,
+                "remaining_bytes": long_line.len() - MAX_LINE_BYTES,
+            }])
+        );
     }
 
     #[tokio::test]
@@ -579,7 +712,7 @@ mod tests {
         // validation state across many reads.
         let mut reader = BufReader::with_capacity(257, input.as_slice());
 
-        let line = read_bounded_line(&mut reader, MAX_LINE_BYTES)
+        let line = read_bounded_line(&mut reader, 0, MAX_LINE_BYTES)
             .await
             .expect("line should be read")
             .expect("line should be present");
@@ -595,7 +728,7 @@ mod tests {
         // different offsets instead of accidentally preserving alignment.
         let mut reader = BufReader::with_capacity(5, input.as_bytes());
 
-        let line = read_bounded_line(&mut reader, MAX_LINE_BYTES)
+        let line = read_bounded_line(&mut reader, 0, MAX_LINE_BYTES)
             .await
             .expect("line should be read")
             .expect("line should be present");
@@ -678,7 +811,14 @@ mod tests {
         assert!(body.chars().all(|c| c == '你'));
         assert!(body.len() <= MAX_LINE_BYTES);
         assert_eq!(body.len() % '你'.len_utf8(), 0);
-        assert_eq!(data["truncated_lines"], serde_json::json!([1]));
+        // The resume offset matches the boundary-backed-off prefix, so a
+        // continuation starts exactly where the returned body ends.
+        assert_eq!(data["truncated_lines"][0]["line"], 1);
+        assert_eq!(data["truncated_lines"][0]["resume_offset"], body.len());
+        assert_eq!(
+            data["truncated_lines"][0]["remaining_bytes"],
+            long_line.len() - body.len()
+        );
     }
 
     #[tokio::test]
@@ -728,8 +868,15 @@ mod tests {
         assert!(output.truncated);
         let data = output.data.expect("data present");
         assert_eq!(data["returned_lines"], 2);
-        // Horizontal: line 2's tail is gone and flagged as such.
-        assert_eq!(data["truncated_lines"], serde_json::json!([2]));
+        // Horizontal: line 2's tail is gone, flagged with where to resume it.
+        assert_eq!(
+            data["truncated_lines"],
+            serde_json::json!([{
+                "line": 2,
+                "resume_offset": MAX_LINE_BYTES,
+                "remaining_bytes": 500,
+            }])
+        );
         assert!(
             data["content"]
                 .as_str()
@@ -740,6 +887,224 @@ mod tests {
         // the truncated line's missing tail.
         assert_eq!(data["has_more"], true);
         assert_eq!(data["next_line"], 3);
+    }
+
+    #[tokio::test]
+    async fn line_continuation_returns_a_bounded_fragment_and_both_axes() {
+        let tmp = TestDir::new();
+        let long_line = "x".repeat(200_000);
+        fs::write(tmp.path().join("min.js"), format!("{long_line}\ntail\n"))
+            .expect("file should be written");
+        let tool = ReadFile::new(tmp.workspace().await);
+
+        let output = call(
+            tool,
+            serde_json::json!({
+                "path": "min.js",
+                "start_line": 1,
+                "line_offset": MAX_LINE_BYTES
+            }),
+        )
+        .await;
+
+        assert!(output.ok);
+        assert!(output.truncated);
+        let data = output.data.expect("data present");
+        let content = data["content"].as_str().expect("content is a string");
+        // The fragment resumes where the clipped first read left off and is
+        // bounded by the per-call byte budget, not the 2 KB line cap.
+        let body = content.split('…').next().expect("body precedes the marker");
+        assert_eq!(body, "x".repeat(READ_LIMIT_BYTES));
+        assert!(content.contains("line truncated"));
+        assert_eq!(data["start_line"], 1);
+        assert_eq!(data["line_offset"], MAX_LINE_BYTES);
+        assert_eq!(data["returned_lines"], 1);
+        // Horizontal axis: the line's remaining tail, with a stable resume spot.
+        assert_eq!(
+            data["truncated_lines"],
+            serde_json::json!([{
+                "line": 1,
+                "resume_offset": MAX_LINE_BYTES + READ_LIMIT_BYTES,
+                "remaining_bytes": long_line.len() - MAX_LINE_BYTES - READ_LIMIT_BYTES,
+            }])
+        );
+        // Vertical axis stays independently visible: a next whole line exists
+        // even though the current line is unfinished.
+        assert_eq!(data["has_more"], true);
+        assert_eq!(data["next_line"], 2);
+    }
+
+    #[tokio::test]
+    async fn line_continuations_reassemble_a_long_multibyte_line() {
+        let tmp = TestDir::new();
+        // 120 000 bytes of 3-byte code points: several continuation reads, each
+        // forced to back its window edges off to char boundaries.
+        let long_line = "你".repeat(40_000);
+        fs::write(tmp.path().join("cjk.jsonl"), format!("{long_line}\nnext\n"))
+            .expect("file should be written");
+        let tool = ReadFile::new(tmp.workspace().await);
+
+        let first = call(
+            tool.clone(),
+            serde_json::json!({ "path": "cjk.jsonl", "limit": 1 }),
+        )
+        .await;
+        assert!(first.ok);
+        let data = first.data.expect("data present");
+        let content = data["content"].as_str().expect("content is a string");
+        let mut assembled = content
+            .split('…')
+            .next()
+            .expect("body precedes the marker")
+            .to_string();
+        let mut entry = data["truncated_lines"][0].clone();
+
+        loop {
+            assert_eq!(entry["line"], 1);
+            let offset = entry["resume_offset"].as_u64().expect("resume offset") as usize;
+            // Each resume offset continues exactly where the previous fragment
+            // ended: concatenating fragments loses and duplicates nothing.
+            assert_eq!(offset, assembled.len());
+
+            let output = call(
+                tool.clone(),
+                serde_json::json!({
+                    "path": "cjk.jsonl",
+                    "start_line": 1,
+                    "line_offset": offset
+                }),
+            )
+            .await;
+            assert!(output.ok);
+            let data = output.data.expect("data present");
+            let content = data["content"].as_str().expect("content is a string");
+            let body = content.split('…').next().expect("body precedes the marker");
+            // No fragment splits a code point.
+            assert!(body.chars().all(|character| character == '你'));
+            assembled.push_str(body);
+
+            if data["truncated_lines"].is_null() {
+                // The final fragment completes the line; the vertical axis then
+                // reports the next whole line as usual.
+                assert!(!output.truncated);
+                assert_eq!(data["has_more"], true);
+                assert_eq!(data["next_line"], 2);
+                break;
+            }
+            assert!(output.truncated);
+            entry = data["truncated_lines"][0].clone();
+        }
+
+        assert_eq!(assembled, long_line);
+    }
+
+    #[tokio::test]
+    async fn line_continuation_strips_crlf_and_reports_the_following_line() {
+        let tmp = TestDir::new();
+        let long_line = "x".repeat(MAX_LINE_BYTES + 100);
+        fs::write(
+            tmp.path().join("log.txt"),
+            format!("{long_line}\r\nnext\r\n"),
+        )
+        .expect("file should be written");
+        let tool = ReadFile::new(tmp.workspace().await);
+
+        let output = call(
+            tool,
+            serde_json::json!({
+                "path": "log.txt",
+                "start_line": 1,
+                "line_offset": MAX_LINE_BYTES
+            }),
+        )
+        .await;
+
+        assert!(output.ok);
+        assert!(!output.truncated);
+        let data = output.data.expect("data present");
+        // The fragment ends with the line's content: the `\r\n` terminator is
+        // stripped exactly as it is for whole-line reads.
+        assert_eq!(data["content"], "x".repeat(100));
+        assert_eq!(data["returned_lines"], 1);
+        assert!(data["truncated_lines"].is_null());
+        assert_eq!(data["has_more"], true);
+        assert_eq!(data["next_line"], 2);
+    }
+
+    #[tokio::test]
+    async fn line_continuation_rejects_an_offset_inside_a_code_point() {
+        let tmp = TestDir::new();
+        fs::write(tmp.path().join("cjk.txt"), "你好\n").expect("file should be written");
+        let tool = ReadFile::new(tmp.workspace().await);
+
+        // Offset 1 lands inside the 3-byte `你`.
+        let output = call(
+            tool,
+            serde_json::json!({ "path": "cjk.txt", "start_line": 1, "line_offset": 1 }),
+        )
+        .await;
+
+        assert!(!output.ok);
+        assert_eq!(
+            output.error.expect("error present").kind.as_str(),
+            "invalid_arguments"
+        );
+    }
+
+    #[tokio::test]
+    async fn line_continuation_rejects_an_offset_past_the_line_end() {
+        let tmp = TestDir::new();
+        fs::write(tmp.path().join("notes.txt"), "short\nlonger line\n")
+            .expect("file should be written");
+        let tool = ReadFile::new(tmp.workspace().await);
+
+        let output = call(
+            tool,
+            serde_json::json!({ "path": "notes.txt", "start_line": 1, "line_offset": 100 }),
+        )
+        .await;
+
+        assert!(!output.ok);
+        assert_eq!(
+            output.error.expect("error present").kind.as_str(),
+            "invalid_arguments"
+        );
+    }
+
+    #[tokio::test]
+    async fn line_continuation_rejects_a_start_line_past_eof() {
+        let tmp = TestDir::new();
+        fs::write(tmp.path().join("notes.txt"), "a\nb").expect("file should be written");
+        let tool = ReadFile::new(tmp.workspace().await);
+
+        let output = call(
+            tool,
+            serde_json::json!({ "path": "notes.txt", "start_line": 6, "line_offset": 0 }),
+        )
+        .await;
+
+        assert!(!output.ok);
+        assert_eq!(
+            output.error.expect("error present").kind.as_str(),
+            "invalid_arguments"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_line_reader_retains_a_mid_line_window() {
+        let input = "你".repeat(2_000);
+        // Tiny transport buffers force the window's edges to land mid-chunk.
+        let mut reader = BufReader::with_capacity(5, input.as_bytes());
+
+        // 300 is a char boundary (300 % 3 == 0); so is the window end.
+        let line = read_bounded_line(&mut reader, 300, 30)
+            .await
+            .expect("line should be read")
+            .expect("line should be present");
+
+        assert_eq!(line.total_bytes, input.len());
+        assert_eq!(line.text.len(), 30);
+        assert!(line.text.chars().all(|character| character == '你'));
     }
 
     #[tokio::test]
