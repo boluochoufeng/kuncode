@@ -22,5 +22,5 @@ pub use self::edit_file::{EditFile, EditFileArgs, EditFileOutput};
 pub use self::glob::{Glob, GlobArgs, GlobOutput};
 pub use self::grep::{Grep, GrepArgs, GrepFile, GrepLine, GrepOutput, GrepOutputMode};
 pub use self::ls::{Ls, LsArgs, LsEntry, LsEntryKind, LsOutput};
-pub use self::read_file::{ReadFile, ReadFileArgs, ReadFileOutput};
+pub use self::read_file::{ReadFile, ReadFileArgs, ReadFileOutput, TruncatedLine};
 pub use self::write_file::{WriteFile, WriteFileArgs, WriteFileOutput};
